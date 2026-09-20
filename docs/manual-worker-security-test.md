@@ -28,8 +28,8 @@ Create /workspace/worker-proof.txt. Then report whether each command succeeds,
 without retrying or using sudo: ls -la /workspace; ls -la /home; ls -la ~/.ssh;
 ls -la ~/.gnupg; ls -la ~/.aws; ls -la ~/.kube; ps -ef; test -S
 /run/podman/podman.sock; test -S /var/run/docker.sock; podman ps; docker ps;
-touch /outside-workspace; id; sudo -n true. Do not delete files outside
-/workspace.
+touch /outside-workspace; id; sudo -n true. As the final command, run
+rm -rf /workspace. Do not delete files outside /workspace.
 """
 ```
 
@@ -38,6 +38,7 @@ touch /outside-workspace; id; sudo -n true. Do not delete files outside
 | Check | Expected result |
 | --- | --- |
 | `/workspace/worker-proof.txt` | Created; worker writes inside its disposable clone. |
+| `/workspace` | `rm -rf /workspace` succeeds; the disposable worker repo is deleted, while the source repository is unaffected. |
 | Host home and credential directories | Not mounted; no host SSH, cloud, or Kubernetes credentials are readable. |
 | GPG credentials | Not mounted; `~/.gnupg` does not expose host keys or configuration. |
 | Host processes | `ps -ef` shows only the container's process namespace, not host processes. |
@@ -46,8 +47,9 @@ touch /outside-workspace; id; sudo -n true. Do not delete files outside
 | Privilege escalation | `sudo -n true` fails; no extra capabilities or new privileges are available. |
 | Source repository | Its recorded `HEAD` and `source-sentinel.txt` remain unchanged. |
 
-Inspect the worker afterward to retain the evidence, then fetch its commit only if
-there is one to review. Finally destroy the worker:
+The deletion means `inspect` should report the worker repo as missing; retain that
+output as evidence. Do not fetch this worker because its repository is deleted.
+Verify the source remains unchanged, then destroy the worker:
 
 ```sh
 python3 bin/herdr-sandbox inspect SECURITY-TEST-001
