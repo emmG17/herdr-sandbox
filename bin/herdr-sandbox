@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Setup and readiness checks for the Herdr sandbox plugin."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import tomllib
+
+
+PLUGIN_ID = "dev.herdr.sandbox"
+DEFAULT_CONFIG = (Path(__file__).resolve().parent.parent / "config.example.toml").read_text()
+
+
+def paths():
+    config = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    state = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    if not config or not state:
+        raise ValueError("Herdr plugin paths are missing. Run this through `herdr plugin action invoke` or set HERDR_PLUGIN_CONFIG_DIR and HERDR_PLUGIN_STATE_DIR.")
+    return Path(config), Path(state)
+
+
+def load_config(config_dir):
+    config_file = config_dir / "config.toml"
+    if not config_file.is_file():
+        raise ValueError(f"Missing {config_file}. Run `herdr plugin action invoke setup --plugin {PLUGIN_ID}`.")
+    with config_file.open("rb") as stream:
+        config = tomllib.load(stream)
+    runtime = config.get("runtime")
+    codex = config.get("codex")
+    if not isinstance(runtime, dict) or not isinstance(codex, dict):
+        raise ValueError(f"Expected [runtime] and [codex] tables in {config_file}.")
+    image = runtime.get("image")
+    home = codex.get("home")
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError(f"Set a nonempty [runtime].image in {config_file}.")
+    if not isinstance(home, str) or home in ("", ".") or Path(home).is_absolute() or ".." in Path(home).parts:
+        raise ValueError(f"Set [codex].home to a relative path inside {config_dir}.")
+    codex_home = (config_dir / home).resolve()
+    if codex_home == config_dir.resolve() or not codex_home.is_relative_to(config_dir.resolve()):
+        raise ValueError(f"Codex home escapes plugin config directory: {codex_home}.")
+    if codex_home == (Path.home() / ".codex").resolve():
+        raise ValueError("The normal user Codex home cannot be used by this plugin.")
+    return image, codex_home
+
+
+def run(*argv):
+    return subprocess.run(argv, capture_output=True, text=True, check=False)
+
+
+def host_errors():
+    errors = []
+    if platform.system() != "Linux":
+        errors.append("Linux is required for the rootless Podman worker.")
+    if shutil.which("git") is None:
+        errors.append("Git is missing. Install git and retry.")
+    if shutil.which("podman") is None:
+        errors.append("Podman is missing. Install and configure rootless Podman.")
+    elif platform.system() == "Linux":
+        result = run("podman", "info", "--format", "{{.Host.Security.Rootless}}")
+        if result.returncode != 0:
+            errors.append(f"Podman is unavailable: {result.stderr.strip() or result.stdout.strip()}. Fix rootless Podman and retry.")
+        elif result.stdout.strip().lower() != "true":
+            errors.append("Podman is running as root. Configure rootless Podman and retry.")
+    return errors
+
+
+def check_source(repo):
+    source = Path(repo).expanduser().resolve()
+    if not source.is_dir():
+        return f"Source repository does not exist: {source}."
+    result = run("git", "-C", str(source), "rev-parse", "--show-toplevel")
+    if result.returncode != 0 or Path(result.stdout.strip()).resolve() != source:
+        return f"Source must be the root of a Git repository: {source}."
+    return None
+
+
+def context_repo():
+    raw = os.environ.get("HERDR_PLUGIN_CONTEXT_JSON")
+    if not raw:
+        return None
+    try:
+        context = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid HERDR_PLUGIN_CONTEXT_JSON: {exc}.") from exc
+    if not isinstance(context, dict):
+        raise ValueError("HERDR_PLUGIN_CONTEXT_JSON must be an object.")
+    repo = context.get("workspace_cwd")
+    if repo is not None and not isinstance(repo, str):
+        raise ValueError("Herdr workspace path must be a string.")
+    return repo
+
+
+def check(repo=None, require_auth=False):
+    errors = host_errors()
+    try:
+        config_dir, state_dir = paths()
+        if not config_dir.is_dir():
+            errors.append(f"Plugin config directory is missing: {config_dir}. Run the setup action.")
+        if not state_dir.is_dir():
+            errors.append(f"Plugin state directory is missing: {state_dir}. Run the setup action.")
+        image, codex_home = load_config(config_dir)
+        if not codex_home.is_dir():
+            errors.append(f"Dedicated Codex home is missing: {codex_home}. Run the setup action.")
+        elif require_auth and not (codex_home / "auth.json").is_file():
+            errors.append(f"Codex authentication is missing in {codex_home}. Run `CODEX_HOME={codex_home} codex login --device-auth`.")
+        if shutil.which("podman") and platform.system() == "Linux":
+            result = run("podman", "image", "exists", image)
+            if result.returncode != 0:
+                errors.append(f"Worker image {image} is missing. Run `herdr plugin action invoke build-image --plugin {PLUGIN_ID}`.")
+    except (ValueError, OSError, tomllib.TOMLDecodeError) as exc:
+        errors.append(str(exc))
+    if repo is not None and shutil.which("git"):
+        source_error = check_source(repo)
+        if source_error:
+            errors.append(source_error)
+    return errors
+
+
+def setup():
+    config_dir, state_dir = paths()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    config_file = config_dir / "config.toml"
+    if not config_file.exists():
+        config_file.write_text(DEFAULT_CONFIG)
+    image, codex_home = load_config(config_dir)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    codex_home.chmod(0o700)
+    print(f"Config: {config_file}\nState: {state_dir}\nCodex home: {codex_home}\nImage: {image}")
+    print(f"Next: `herdr plugin action invoke build-image --plugin {PLUGIN_ID}`")
+    print(f"Authenticate: `CODEX_HOME={codex_home} codex login --device-auth`")
+
+
+def build_image():
+    errors = host_errors()
+    if errors:
+        raise ValueError("\n".join(errors))
+    config_dir, _ = paths()
+    image, _ = load_config(config_dir)
+    root = Path(os.environ.get("HERDR_PLUGIN_ROOT", Path(__file__).resolve().parent.parent))
+    result = subprocess.run(["podman", "build", "--tag", image, "--file", str(root / "Containerfile"), str(root)], check=False)
+    if result.returncode:
+        raise ValueError(f"Image build failed with exit code {result.returncode}.")
+    print(f"Built {image}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("setup")
+    commands.add_parser("build-image")
+    check_parser = commands.add_parser("check")
+    check_parser.add_argument("--repo", help="Also verify a source Git repository")
+    check_parser.add_argument("--execution", action="store_true", help="Also require dedicated Codex authentication")
+    args = parser.parse_args()
+    try:
+        if args.command == "setup":
+            setup()
+        elif args.command == "build-image":
+            build_image()
+        else:
+            errors = check(args.repo or context_repo(), args.execution)
+            if errors:
+                raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
+            print("Sandbox setup is ready.")
+    except (ValueError, OSError, tomllib.TOMLDecodeError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
