@@ -182,7 +182,7 @@ Verified with Herdr 0.9.0: actions are manifest entries with argv commands; `plu
 
 The worker design mounts only a disposable worker repository and this dedicated plugin Codex home. It does not mount your normal `~/.codex`, SSH keys, cloud credentials, or the Podman socket. `danger-full-access` applies inside the container. Rootless Podman is the outer security boundary. Containers share the host Linux kernel and do not provide VM-level isolation.
 
-Before using future worker execution, test a disposable worker by asking it to delete its own workspace, inspect host home and SSH or cloud credentials, reach Podman or Docker, write outside `/workspace`, and escalate privileges. Expected result: it can affect its disposable workspace but cannot reach those host resources.
+Before using worker execution, run the documented [manual disposable-worker security test](docs/manual-worker-security-test.md). It verifies expected workspace access and denied access to host home, credentials, sockets, host processes, privilege escalation, and writes outside `/workspace`.
 
 If readiness fails, follow the reported command or path. A Podman error from `podman info` means rootless Podman itself needs repair before the image can be built or used.
 

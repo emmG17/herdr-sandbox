@@ -70,6 +70,34 @@ class OpenWorkerTests(unittest.TestCase):
         self.assertIn("--memory=3g", command)
         self.assertIn("--pids-limit=99", command)
 
+    def test_runtime_rejects_forbidden_privilege_namespace_network_and_mount_settings(self):
+        forbidden_settings = (
+            'privileged = true',
+            'pid = "host"',
+            'network = "host"',
+            'userns = "host"',
+            'mounts = ["/"]',
+            'mounts = ["/home/tester"]',
+            'mounts = ["/home/tester/.ssh"]',
+            'mounts = ["/home/tester/.gnupg"]',
+            'mounts = ["/home/tester/.aws"]',
+            'mounts = ["/home/tester/.kube"]',
+            'mounts = ["/home/tester/.config"]',
+            'mounts = ["/run/podman/podman.sock"]',
+            'mounts = ["/var/run/docker.sock"]',
+        )
+        for setting in forbidden_settings:
+            with self.subTest(setting=setting):
+                self.config.joinpath("config.toml").write_text(
+                    plugin.DEFAULT_CONFIG.replace('network = "online"', setting)
+                    if setting.startswith("network") else plugin.DEFAULT_CONFIG.replace(
+                        'image = "localhost/herdr-codex-worker:latest"',
+                        'image = "localhost/herdr-codex-worker:latest"\n' + setting,
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "not permitted|network"):
+                    plugin.open_command("TEST-001", ["bash"])
+
     def test_open_worker_checks_readiness_runs_interactively_and_updates_lifecycle(self):
         with patch.object(plugin, "check", return_value=[]) as check, patch.object(plugin.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
             self.assertEqual(plugin.open_worker("TEST-001", ["bash"]), 0)

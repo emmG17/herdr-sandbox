@@ -9,16 +9,14 @@ import tomllib
 import unittest
 from unittest.mock import patch
 
+from tests.helpers import git
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "herdr-sandbox"
 loader = importlib.machinery.SourceFileLoader("herdr_sandbox_fetch", str(SCRIPT))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 plugin = importlib.util.module_from_spec(spec)
 loader.exec_module(plugin)
-
-
-def git(*args):
-    return subprocess.run(["git", *map(str, args)], check=True, capture_output=True, text=True).stdout.strip()
 
 
 class FetchTests(unittest.TestCase):

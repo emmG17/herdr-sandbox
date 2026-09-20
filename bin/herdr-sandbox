@@ -29,6 +29,16 @@ def paths():
     return Path(config), Path(state)
 
 
+def _permitted_settings(table, table_name, permitted):
+    """Reject configuration that could expand the fixed runtime contract."""
+    unexpected = sorted(set(table) - set(permitted))
+    if unexpected:
+        raise ValueError(
+            f"{table_name} setting(s) are not permitted: {', '.join(unexpected)}. "
+            "Worker isolation settings are fixed by PodmanSandboxRuntime."
+        )
+
+
 def load_config(config_dir):
     config_file = config_dir / "config.toml"
     if not config_file.is_file():
@@ -39,6 +49,8 @@ def load_config(config_dir):
     codex = config.get("codex")
     if not isinstance(runtime, dict) or not isinstance(codex, dict):
         raise ValueError(f"Expected [runtime] and [codex] tables in {config_file}.")
+    _permitted_settings(runtime, "[runtime]", {"image", "network"})
+    _permitted_settings(codex, "[codex]", {"home"})
     image = runtime.get("image")
     home = codex.get("home")
     if not isinstance(image, str) or not image.strip():
@@ -62,6 +74,8 @@ def runtime_settings(config_dir):
     resources = config.get("resources")
     if not isinstance(runtime, dict) or not isinstance(resources, dict):
         raise ValueError(f"Expected [runtime] and [resources] tables in {config_file}.")
+    _permitted_settings(runtime, "[runtime]", {"image", "network"})
+    _permitted_settings(resources, "[resources]", {"cpus", "memory", "pids"})
     network = runtime.get("network")
     cpus, memory, pids = resources.get("cpus"), resources.get("memory"), resources.get("pids")
     if network not in {"online", "offline"}:
