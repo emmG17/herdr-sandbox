@@ -262,6 +262,20 @@ def open_options(config_dir):
     return options
 
 
+def execute_options(config_dir):
+    """Read the fixed inputs used by the non-prompting Herdr execute action."""
+    config_file = config_dir / "config.toml"
+    with config_file.open("rb") as stream:
+        config = tomllib.load(stream)
+    options = config.get("execute", {})
+    if not isinstance(options, dict):
+        raise ValueError(f"Expected an [execute] table in {config_file}.")
+    for key in ("id", "prompt"):
+        if key in options and not isinstance(options[key], str):
+            raise ValueError(f"Set [execute].{key} to a string in {config_file}.")
+    return options
+
+
 def _write_worker_status(worker_dir, status):
     metadata_path = worker_dir / "worker.json"
     with metadata_path.open() as stream:
@@ -285,12 +299,10 @@ class PodmanSandboxRuntime:
         self.memory = memory
         self.pids = pids
 
-    def interactive_command(self, command=None):
-        args = list(command or ["bash"])
-        if not args or any(not isinstance(arg, str) or not arg for arg in args):
-            raise ValueError("Interactive command must contain nonempty arguments.")
+    def _base_command(self, interactive=False):
+        """Build the shared hardened Podman invocation for both execution modes."""
         invocation = [
-            "podman", "run", "--rm", "-it", "--name", f"herdr-{self.worker_id}",
+            "podman", "run", "--rm",
             "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
             f"--pids-limit={self.pids}", f"--memory={self.memory}", f"--cpus={self.cpus}",
             "--env", "HOME=/tmp/home", "--env", "CODEX_HOME=/codex", "--env", "XDG_CACHE_HOME=/tmp/cache",
@@ -298,9 +310,24 @@ class PodmanSandboxRuntime:
             "--mount", f"type=bind,src={self.codex_home.resolve()},dst=/codex,rw",
             "--workdir", "/workspace",
         ]
+        if interactive:
+            invocation.insert(3, "-it")
+        invocation.insert(4 if interactive else 3, "--name")
+        invocation.insert(5 if interactive else 4, f"herdr-{self.worker_id}")
         if self.network == "offline":
             invocation.append("--network=none")
-        return invocation + [self.image] + args
+        return invocation
+
+    def interactive_command(self, command=None):
+        args = list(command or ["bash"])
+        if not args or any(not isinstance(arg, str) or not arg for arg in args):
+            raise ValueError("Interactive command must contain nonempty arguments.")
+        return self._base_command(interactive=True) + [self.image] + args
+
+    def noninteractive_command(self, prompt):
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Execution prompt must be a nonempty string.")
+        return self._base_command() + [self.image, "codex", "exec", "--sandbox", "danger-full-access", prompt]
 
 
 def podman_runtime(worker_id):
@@ -323,6 +350,11 @@ def open_command(worker_id, command=None):
     return podman_runtime(worker_id).interactive_command(command)
 
 
+def execute_command(worker_id, prompt):
+    """Build the shared runtime's noninteractive Codex invocation for a worker."""
+    return podman_runtime(worker_id).noninteractive_command(prompt)
+
+
 def open_worker(worker_id, command=None):
     """Open a terminal-attached worker session for Herdr to manage."""
     config_dir, state_dir = paths()
@@ -340,6 +372,54 @@ def open_worker(worker_id, command=None):
         raise
     _write_worker_status(worker_dir, "stopped" if result.returncode == 0 else "failed")
     return result.returncode
+
+
+def execute_worker(worker_id, prompt):
+    """Run one Codex prompt without a TTY or open stdin, preserving worker edits."""
+    _, state_dir = paths()
+    _, worker_dir = worker_storage(worker_id, state_dir)
+    errors = check(require_auth=True)
+    if errors:
+        raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
+    invocation = execute_command(worker_id, prompt)
+    _write_worker_status(worker_dir, "running")
+    try:
+        result = subprocess.run(
+            invocation, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+        )
+    except BaseException:
+        _write_worker_status(worker_dir, "failed")
+        raise
+    _write_worker_status(worker_dir, "completed" if result.returncode == 0 else "failed")
+    repo = worker_dir / "repo"
+    head_code, head, _ = _git_read(repo, "rev-parse", "HEAD")
+    status_code, git_status, _ = _git_read(repo, "status", "--short")
+    return {
+        "worker_id": worker_id,
+        "exit_status": result.returncode,
+        "head": head if head_code == 0 else "unavailable",
+        "git_status": git_status if status_code == 0 else "unavailable",
+        "dirty": bool(git_status) if status_code == 0 else None,
+        "output_location": "Herdr action output (stdout/stderr)",
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def print_execution_result(result):
+    """Print captured Codex output followed by an actionable worker summary."""
+    if result["stdout"]:
+        print(result["stdout"], end="")
+    if result["stderr"]:
+        print(result["stderr"], end="", file=sys.stderr)
+    print(
+        f"Worker: {result['worker_id']}\n"
+        f"Exit status: {result['exit_status']}\n"
+        f"HEAD: {result['head']}\n"
+        f"Dirty: {result['dirty']}\n"
+        f"Git status: {result['git_status'] or 'clean'}\n"
+        f"Codex output: {result['output_location']}"
+    )
 
 
 def _metadata_value(metadata, key, default="-"):
@@ -716,6 +796,11 @@ def main():
     open_parser.add_argument("worker_id", nargs="?", help="Worker ID")
     open_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
     open_parser.add_argument("session_command", nargs=argparse.REMAINDER, help="Command and arguments to run in the worker")
+    execute_parser = commands.add_parser("execute", help="Run one noninteractive Codex task in a sandbox worker")
+    execute_parser.add_argument("worker_id", nargs="?", help="Worker ID")
+    execute_parser.add_argument("prompt", nargs="?", help="Task prompt")
+    execute_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
+    execute_parser.add_argument("--prompt", dest="option_prompt", help="Task prompt (for direct use)")
     workers_parser = commands.add_parser("workers", help=argparse.SUPPRESS)
     workers_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -776,6 +861,21 @@ def main():
                 raise ValueError("Worker ID is required. Pass `open WORKER_ID` or set [open].id in the plugin config.")
             command = args.session_command or ["bash"]
             return open_worker(worker_id, command)
+        elif args.command == "execute":
+            worker_id = args.worker_id or args.option_worker_id
+            prompt = args.prompt or args.option_prompt
+            if not worker_id or not prompt:
+                config_dir, _ = paths()
+                options = execute_options(config_dir)
+                worker_id = worker_id or options.get("id")
+                prompt = prompt or options.get("prompt")
+            if not worker_id:
+                raise ValueError("Worker ID is required. Pass `execute WORKER_ID PROMPT` or set [execute].id in the plugin config.")
+            if not prompt:
+                raise ValueError("Task prompt is required. Pass `execute WORKER_ID PROMPT` or set [execute].prompt in the plugin config.")
+            result = execute_worker(worker_id, prompt)
+            print_execution_result(result)
+            return result["exit_status"]
         else:
             errors = check(args.repo or context_repo(), args.execution)
             if errors:

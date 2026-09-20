@@ -16,6 +16,7 @@ herdr plugin action invoke create --plugin dev.herdr.sandbox
 herdr plugin action invoke list --plugin dev.herdr.sandbox
 herdr plugin action invoke destroy --plugin dev.herdr.sandbox
 herdr plugin action invoke open --plugin dev.herdr.sandbox
+herdr plugin action invoke execute --plugin dev.herdr.sandbox
 ```
 
 The setup action writes `config.toml` and creates a dedicated Codex home inside Herdr's plugin config directory. It leaves an existing config alone. The image build action explicitly builds `Containerfile` as `localhost/herdr-codex-worker:latest`, or the image name in `config.toml`. Local `plugin link` does not run build steps.
@@ -73,6 +74,30 @@ python3 bin/herdr-sandbox open TEST-001 -- codex --model gpt-5
 ```
 
 The shared runtime reads `[runtime].network` (`online` or `offline`) and `[resources]` from `config.toml`. Offline adds `--network=none`; online uses normal rootless Podman networking. It always uses the configured image and limits, `--userns=keep-id`, `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and a read-only container root. The only host bind mounts are the worker repo at `/workspace` and the dedicated Codex home at `/codex`, both read-write. The runtime does not accept privilege, host namespace, socket, home, source repository, or arbitrary host-environment options.
+
+## Execute a task
+
+`execute` runs a supplied Codex prompt noninteractively in an existing worker. It uses the same worker repository, dedicated Codex home, and hardened Podman runtime as `open`, but deliberately allocates no TTY and closes stdin. Configure the fixed action inputs in `config.toml`:
+
+```toml
+[execute]
+id = "TEST-001"
+prompt = "Implement the requested change and run the relevant tests."
+```
+
+Then invoke it through Herdr:
+
+```sh
+herdr plugin action invoke execute --plugin dev.herdr.sandbox
+```
+
+For direct use, pass both inputs explicitly:
+
+```sh
+python3 bin/herdr-sandbox execute TEST-001 "Implement the requested change and run the relevant tests."
+```
+
+The action requires authentication in the dedicated Codex home, preserves edits in the worker clone, streams Codex stdout/stderr to the Herdr action output, and finishes with the exit status, worker ID, Git HEAD, dirty state, and Git status. A nonzero Codex exit code leaves the worker in `failed` state while retaining its files for inspection or recovery.
 
 ## List and inspect workers
 

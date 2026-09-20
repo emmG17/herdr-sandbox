@@ -9,3 +9,8 @@ pids = 1024
 
 [codex]
 home = "codex"
+
+# Configure the fixed inputs used by the noninteractive Execute Task action.
+# [execute]
+# id = "WORKER-001"
+# prompt = "Implement the requested change and run the relevant tests."
