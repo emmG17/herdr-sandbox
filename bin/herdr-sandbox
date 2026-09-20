@@ -6,10 +6,13 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tomllib
+from datetime import datetime, timezone
+from uuid import uuid4
 
 
 PLUGIN_ID = "dev.herdr.sandbox"
@@ -149,6 +152,83 @@ def build_image():
     print(f"Built {image}")
 
 
+def git(*args):
+    result = run("git", *map(str, args))
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or result.stdout.strip() or "Git command failed.")
+    return result.stdout.strip()
+
+
+def create_options(config_dir):
+    config_file = config_dir / "config.toml"
+    with config_file.open("rb") as stream:
+        config = tomllib.load(stream)
+    options = config.get("create", {})
+    if not isinstance(options, dict):
+        raise ValueError(f"Expected a [create] table in {config_file}.")
+    for key in ("id", "source_repo", "base_ref"):
+        if key in options and not isinstance(options[key], str):
+            raise ValueError(f"Set [create].{key} to a string in {config_file}.")
+    return options
+
+
+def create_worker(worker_id, repo=None, base_ref="HEAD"):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", worker_id) or worker_id in (".", "..") or ".." in worker_id:
+        raise ValueError("Worker ID must contain letters, digits, dots, underscores, or hyphens, start with a letter or digit, and contain no '..'.")
+    branch = f"agent/{worker_id}"
+    git("check-ref-format", "--branch", branch)
+    if not base_ref or base_ref.startswith("-") or any(char.isspace() for char in base_ref):
+        raise ValueError("Base ref must be a nonempty Git ref or commit without whitespace or a leading hyphen.")
+    repo = repo or context_repo()
+    if not repo:
+        raise ValueError("Source repository is missing. Pass --repo or invoke from a Herdr Git workspace.")
+    source = Path(repo).expanduser().resolve()
+    if not source.is_dir():
+        raise ValueError(f"Source repository does not exist: {source}.")
+    source_root = Path(git("-C", source, "rev-parse", "--show-toplevel")).resolve()
+    if source_root != source:
+        source = source_root
+    commit = git("-C", source, "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}")
+    errors = check(str(source))
+    if errors:
+        raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
+    _, state_dir = paths()
+    if not state_dir.is_dir():
+        raise ValueError(f"Plugin state directory is missing: {state_dir}. Run the setup action.")
+    state_dir = state_dir.resolve()
+    if state_dir.is_relative_to(source):
+        raise ValueError("Plugin state directory must be outside the source repository.")
+    workers_dir = state_dir / "workers"
+    workers_dir.mkdir(exist_ok=True)
+    if workers_dir.resolve() != workers_dir or not workers_dir.is_dir():
+        raise ValueError("Plugin workers directory must be a real directory inside plugin state.")
+    destination = workers_dir / worker_id
+    try:
+        destination.mkdir()
+    except FileExistsError as exc:
+        raise ValueError(f"Worker already exists: {worker_id}.") from exc
+    try:
+        clone = destination / "repo"
+        git("clone", "--local", "--no-hardlinks", "--no-checkout", source, clone)
+        git("-C", clone, "switch", "--detach", commit)
+        git("-C", clone, "switch", "-c", branch)
+        metadata = {
+            "id": worker_id,
+            "source_repo": str(source),
+            "base_ref": base_ref,
+            "base_commit": commit,
+            "branch": branch,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "runtime": "podman",
+            "status": "created",
+        }
+        (destination / "worker.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    except (ValueError, OSError):
+        shutil.rmtree(destination)
+        raise
+    return destination
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -157,12 +237,25 @@ def main():
     check_parser = commands.add_parser("check")
     check_parser.add_argument("--repo", help="Also verify a source Git repository")
     check_parser.add_argument("--execution", action="store_true", help="Also require dedicated Codex authentication")
+    create_parser = commands.add_parser("create")
+    create_parser.add_argument("--id", help="Worker ID (prompted for in an interactive terminal)")
+    create_parser.add_argument("--repo", help="Source repository (defaults to the Herdr workspace)")
+    create_parser.add_argument("--base", help="Base ref or commit (default: HEAD)")
     args = parser.parse_args()
     try:
         if args.command == "setup":
             setup()
         elif args.command == "build-image":
             build_image()
+        elif args.command == "create":
+            config_dir, _ = paths()
+            options = create_options(config_dir)
+            worker_id = args.id or options.get("id")
+            if not worker_id and sys.stdin.isatty():
+                worker_id = input("Worker ID: ").strip()
+            if not worker_id:
+                worker_id = f"worker-{uuid4().hex[:12]}"
+            print(create_worker(worker_id, args.repo or options.get("source_repo"), args.base or options.get("base_ref") or "HEAD"))
         else:
             errors = check(args.repo or context_repo(), args.execution)
             if errors:

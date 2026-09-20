@@ -22,3 +22,9 @@ id = "check"
 title = "Sandbox: Check Readiness"
 description = "Check host tools, image, and plugin-owned paths"
 command = ["python3", "bin/herdr-sandbox", "check"]
+
+[[actions]]
+id = "create"
+title = "Sandbox: Create Worker"
+description = "Create an isolated worker clone from the current Git workspace"
+command = ["python3", "bin/herdr-sandbox", "create"]
