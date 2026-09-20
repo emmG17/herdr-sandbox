@@ -1,0 +1,24 @@
+id = "dev.herdr.sandbox"
+name = "Sandbox Workers"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Isolated Codex workers using rootless Podman"
+platforms = ["linux"]
+
+[[actions]]
+id = "setup"
+title = "Sandbox: Set Up"
+description = "Create plugin configuration and a dedicated Codex home"
+command = ["python3", "bin/herdr-sandbox", "setup"]
+
+[[actions]]
+id = "build-image"
+title = "Sandbox: Build Image"
+description = "Build the Codex worker image with rootless Podman"
+command = ["python3", "bin/herdr-sandbox", "build-image"]
+
+[[actions]]
+id = "check"
+title = "Sandbox: Check Readiness"
+description = "Check host tools, image, and plugin-owned paths"
+command = ["python3", "bin/herdr-sandbox", "check"]

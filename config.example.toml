@@ -1,0 +1,5 @@
+[runtime]
+image = "localhost/herdr-codex-worker:latest"
+
+[codex]
+home = "codex"

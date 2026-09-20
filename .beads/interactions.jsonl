@@ -1,0 +1,1 @@
+{"id":"int-9730e4bec87f0b0df1fe6e49c1479b26","kind":"field_change","created_at":"2026-09-20T02:25:23.938410775Z","actor":"Emmanuel Gonzalez","issue_id":"herdr-sandbox-not","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Plugin linked, image built, readiness checks and tests passed."}}
