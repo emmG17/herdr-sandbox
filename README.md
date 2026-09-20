@@ -14,6 +14,7 @@ herdr plugin action invoke build-image --plugin dev.herdr.sandbox
 herdr plugin action invoke check --plugin dev.herdr.sandbox
 herdr plugin action invoke create --plugin dev.herdr.sandbox
 herdr plugin action invoke list --plugin dev.herdr.sandbox
+herdr plugin action invoke fetch --plugin dev.herdr.sandbox
 herdr plugin action invoke destroy --plugin dev.herdr.sandbox
 herdr plugin action invoke open --plugin dev.herdr.sandbox
 herdr plugin action invoke execute --plugin dev.herdr.sandbox
@@ -123,6 +124,21 @@ id = "TEST-001"
 ```
 
 Then run `herdr plugin action invoke inspect --plugin dev.herdr.sandbox`. The worker state remains the source of the display, while the filesystem, Git, and Podman checks identify stale or missing reality.
+
+## Fetch a worker commit for review
+
+Fetching is an explicit, fetch-only integration step: it writes the worker branch to the source repository's `FETCH_HEAD`, reports the fetched commit, changed files, and diff stat, and does not merge or cherry-pick it. Configure the worker ID before invoking the fixed action:
+
+```toml
+[fetch]
+id = "TEST-001"
+```
+
+```sh
+herdr plugin action invoke fetch --plugin dev.herdr.sandbox
+```
+
+The fetched commit remains available through `FETCH_HEAD` after the disposable worker is destroyed; deciding whether to integrate it is a later, deliberate action.
 
 ## Destroy a worker
 

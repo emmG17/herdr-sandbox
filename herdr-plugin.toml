@@ -48,6 +48,12 @@ description = "Stop and remove a worker container and its disposable state"
 command = ["python3", "bin/herdr-sandbox", "destroy"]
 
 [[actions]]
+id = "fetch"
+title = "Sandbox: Fetch Worker for Review"
+description = "Fetch a worker commit into FETCH_HEAD without integrating it"
+command = ["python3", "bin/herdr-sandbox", "fetch"]
+
+[[actions]]
 id = "open"
 title = "Sandbox: Open Worker"
 description = "Open an interactive Podman session in a Herdr-managed pane"
