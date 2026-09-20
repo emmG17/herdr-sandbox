@@ -1,6 +1,6 @@
 # Herdr Sandbox Workers
 
-This plugin provides setup, image build, readiness, and worker creation actions. Other worker lifecycle actions are tracked in separate Beads issues.
+This plugin provides setup, image build, readiness, worker creation, listing, inspection, and safe destruction actions. Other worker lifecycle actions are tracked in separate Beads issues.
 
 ## Requirements and setup
 
@@ -13,6 +13,8 @@ herdr plugin action invoke setup --plugin dev.herdr.sandbox
 herdr plugin action invoke build-image --plugin dev.herdr.sandbox
 herdr plugin action invoke check --plugin dev.herdr.sandbox
 herdr plugin action invoke create --plugin dev.herdr.sandbox
+herdr plugin action invoke list --plugin dev.herdr.sandbox
+herdr plugin action invoke destroy --plugin dev.herdr.sandbox
 ```
 
 The setup action writes `config.toml` and creates a dedicated Codex home inside Herdr's plugin config directory. It leaves an existing config alone. The image build action explicitly builds `Containerfile` as `localhost/herdr-codex-worker:latest`, or the image name in `config.toml`. Local `plugin link` does not run build steps.
@@ -53,6 +55,52 @@ python3 bin/herdr-sandbox create --id TEST-001 --repo /path/to/source-repo --bas
 ```
 
 The worker lives at `$HERDR_PLUGIN_STATE_DIR/workers/TEST-001/`, with an independent `repo/.git` and `worker.json` recording its source, base commit, branch, and creation time. The new branch is `agent/TEST-001`. IDs and base refs are checked before the clone is created; a duplicate ID is rejected. Creation requires the same setup readiness checks as `check`, including the rootless Podman image, but does not start a container.
+
+## List and inspect workers
+
+The `list` action reads every persisted worker directory after a restart and combines `worker.json` with the current worker clone's Git HEAD, branch, dirty state, and the `herdr-WORKER_ID` Podman container state. It reports missing metadata, missing repositories, missing source repositories, and stale lifecycle state instead of silently dropping an entry:
+
+```sh
+HERDR_PLUGIN_CONFIG_DIR=/path/from/HERDR_PLUGIN_CONFIG_DIR \
+HERDR_PLUGIN_STATE_DIR=/path/from/HERDR_PLUGIN_STATE_DIR \
+python3 bin/herdr-sandbox list
+```
+
+For machine-readable output, add `--json`. The same option is available on `inspect`:
+
+```sh
+python3 bin/herdr-sandbox inspect TEST-001
+```
+
+The inspect output includes ordinary `git log`, `git status`, and `git diff BASE...HEAD` output. Since Herdr actions do not prompt for arbitrary arguments, configure an inspection target in the plugin config when invoking the action:
+
+```toml
+[inspect]
+id = "TEST-001"
+```
+
+Then run `herdr plugin action invoke inspect --plugin dev.herdr.sandbox`. The worker state remains the source of the display, while the filesystem, Git, and Podman checks identify stale or missing reality.
+
+## Destroy a worker
+
+Destroying a worker first runs `podman rm -f herdr-WORKER_ID`, which stops and removes its container, and only then removes that worker's disposable directory under `$HERDR_PLUGIN_STATE_DIR/workers/`. A missing container or already-removed worker is harmless; an unknown Podman failure stops cleanup so the worker files remain available for recovery. The command never reads from or modifies the source repository.
+
+For a direct, deliberate destroy command, pass the worker ID explicitly:
+
+```sh
+HERDR_PLUGIN_CONFIG_DIR=/path/from/HERDR_PLUGIN_CONFIG_DIR \
+HERDR_PLUGIN_STATE_DIR=/path/from/HERDR_PLUGIN_STATE_DIR \
+python3 bin/herdr-sandbox destroy --id TEST-001
+```
+
+To invoke the Herdr action without interactive input, configure the target in the plugin config:
+
+```toml
+[destroy]
+id = "TEST-001"
+```
+
+Then run `herdr plugin action invoke destroy --plugin dev.herdr.sandbox`. Worker IDs are validated before any container or filesystem operation, and symlinked worker storage is rejected so cleanup cannot escape the plugin's worker directory.
 
 ## Herdr API notes
 

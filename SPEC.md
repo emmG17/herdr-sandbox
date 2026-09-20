@@ -352,6 +352,11 @@ Do not use Git worktrees in v1.
 
 ## 10. Interactive worker
 
+Interactive is the default worker session mode. Opening a worker from Herdr
+should open a Herdr-managed terminal pane attached to the sandbox, with a shell
+or Codex session that accepts input and displays progress. This default applies
+when a user opens a worker; it does not make plugin actions prompt for input.
+
 Expose an action/pane allowing:
 
 ```text
@@ -393,6 +398,11 @@ The container root filesystem is read-only.
 Interactive mode SHOULD be opened as a Herdr-managed plugin pane so that it remains visible and controllable through Herdr.
 
 ## 11. Noninteractive execution
+
+Noninteractive is an explicit task execution mode for a supplied prompt. It
+uses the same worker repository, dedicated Codex home, and Podman security
+settings as interactive mode. Both modes operate on the same worker rather
+than creating separate classes of workers.
 
 Expose an action equivalent to:
 
@@ -716,6 +726,11 @@ Sandbox: Destroy Worker
 ```
 
 Interactive worker sessions should preferably appear as normal Herdr-managed terminal panes.
+
+The primary worker action is **Open Worker** (interactive). **Execute Task**
+selects noninteractive execution explicitly. Herdr plugin actions themselves
+are fixed, non-prompting commands, so the mode is selected by the action or
+entrypoint rather than by trying to read from an action's stdin.
 
 The plugin should feel like Herdr gained a new worker capability, not like another orchestration product was embedded inside it.
 
@@ -1135,4 +1150,3 @@ Before writing implementation code:
 8. Then implement Milestone 1.
 
 Do not modify the existing prototype scripts during Milestone 1.
-

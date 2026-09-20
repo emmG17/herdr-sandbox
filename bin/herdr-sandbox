@@ -16,6 +16,8 @@ from uuid import uuid4
 
 
 PLUGIN_ID = "dev.herdr.sandbox"
+WORKER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+LIFECYCLE_STATES = {"created", "running", "stopped", "completed", "failed"}
 DEFAULT_CONFIG = (Path(__file__).resolve().parent.parent / "config.example.toml").read_text()
 
 
@@ -159,6 +161,337 @@ def git(*args):
     return result.stdout.strip()
 
 
+def validate_worker_id(worker_id):
+    """Validate an ID before it is used as a worker path or container name."""
+    if not isinstance(worker_id, str) or not WORKER_ID_RE.fullmatch(worker_id) or ".." in worker_id:
+        raise ValueError("Worker ID must contain letters, digits, dots, underscores, or hyphens, start with a letter or digit, and contain no '..'.")
+    return worker_id
+
+
+def state_workers_dir(state_dir=None):
+    """Return the plugin-owned worker directory without requiring setup config."""
+    if state_dir is None:
+        _, state_dir = paths()
+    return Path(state_dir).expanduser().resolve() / "workers"
+
+
+def worker_dir_for(worker_id, state_dir=None):
+    validate_worker_id(worker_id)
+    return state_workers_dir(state_dir) / worker_id
+
+
+def worker_storage(worker_id, state_dir=None):
+    """Resolve a worker path without following an escape through worker state."""
+    workers_dir = state_workers_dir(state_dir)
+    state_root = workers_dir.parent
+    if state_root.exists() and not state_root.is_dir():
+        raise ValueError(f"Plugin state path is not a directory: {state_root}.")
+    if workers_dir.is_symlink() or (workers_dir.exists() and not workers_dir.is_dir()):
+        raise ValueError(f"Worker state directory is not a real directory: {workers_dir}")
+
+    worker_dir = worker_dir_for(worker_id, state_dir)
+    if worker_dir.is_symlink():
+        raise ValueError(f"Worker path is not a real directory inside plugin workers: {worker_dir}")
+    if not worker_dir.resolve().is_relative_to(workers_dir.resolve()):
+        raise ValueError(f"Worker path escapes plugin workers directory: {worker_dir}")
+    if worker_dir.exists() and not worker_dir.is_dir():
+        raise ValueError(f"Worker path is not a directory: {worker_dir}")
+    return workers_dir, worker_dir
+
+
+def _container_missing(result):
+    detail = f"{result.stderr}\n{result.stdout}".lower()
+    return (
+        "no such container" in detail
+        or "no container with name or id" in detail
+        or bool(re.search(r"container[^\n]*(?:does not exist|not found)", detail))
+    )
+
+
+def remove_worker_container(worker_id):
+    """Force-remove a worker container, tolerating an already absent container."""
+    validate_worker_id(worker_id)
+    result = run("podman", "rm", "-f", f"herdr-{worker_id}")
+    if result.returncode and not _container_missing(result):
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown Podman error"
+        raise ValueError(f"Unable to remove worker container herdr-{worker_id}: {detail}.")
+
+
+def destroy_worker(worker_id, state_dir=None):
+    """Stop/remove a worker container, then remove only that worker's storage."""
+    _, worker_dir = worker_storage(worker_id, state_dir)
+    remove_worker_container(worker_id)
+    if not worker_dir.exists():
+        return False
+    shutil.rmtree(worker_dir)
+    return True
+
+
+def _metadata_value(metadata, key, default="-"):
+    value = metadata.get(key, default)
+    return value if isinstance(value, str) and value else default
+
+
+def _git_read(repo, *args):
+    """Read Git output without turning missing/stale worker state into a crash."""
+    result = run("git", "-C", str(repo), *map(str, args))
+    output = (result.stdout or "").strip()
+    error = (result.stderr or "").strip()
+    return result.returncode, output, error
+
+
+def container_status(worker_id):
+    """Return Podman reality for a worker's conventional container name."""
+    try:
+        validate_worker_id(worker_id)
+    except ValueError:
+        return "invalid-id"
+    if shutil.which("podman") is None:
+        return "unavailable"
+    result = run("podman", "inspect", "--format", "{{.State.Status}}", f"herdr-{worker_id}")
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "podman inspect failed").strip()
+        lowered = detail.lower()
+        if any(marker in lowered for marker in ("no such object", "no such container", "does not exist", "not found")):
+            return "not-found"
+        return f"error: {detail}"
+    status = (result.stdout or "").strip().lower()
+    return status or "present"
+
+
+def _base_commit(repo, metadata):
+    """Resolve the persisted base safely for the ordinary three-dot diff."""
+    candidate = metadata.get("base_commit")
+    if isinstance(candidate, str) and re.fullmatch(r"[0-9a-fA-F]{40}", candidate):
+        return candidate
+    base_ref = metadata.get("base_ref")
+    if not isinstance(base_ref, str) or not base_ref or base_ref.startswith("-") or any(char.isspace() for char in base_ref):
+        return None
+    code, output, _ = _git_read(repo, "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}")
+    return output if code == 0 else None
+
+
+def _git_reality(repo, metadata):
+    reality = {
+        "head": None,
+        "branch": None,
+        "dirty": None,
+        "git_log": "",
+        "git_status": "",
+        "git_diff": "",
+        "base_commit": _metadata_value(metadata, "base_commit"),
+        "issues": [],
+    }
+    if repo.is_symlink() or not repo.is_dir():
+        reality["issues"].append(f"Worker repository is missing: {repo}")
+        return reality
+    git_dir = repo / ".git"
+    if not git_dir.exists():
+        reality["issues"].append(f"Worker repository is not a Git repository: {repo}")
+        return reality
+
+    code, output, error = _git_read(repo, "rev-parse", "HEAD")
+    if code:
+        reality["issues"].append(f"Unable to read worker HEAD: {error or 'Git failed'}")
+    else:
+        reality["head"] = output
+
+    code, output, error = _git_read(repo, "branch", "--show-current")
+    if code:
+        reality["issues"].append(f"Unable to read worker branch: {error or 'Git failed'}")
+    else:
+        reality["branch"] = output or "(detached)"
+
+    code, output, error = _git_read(repo, "status", "--porcelain", "--untracked-files=all")
+    if code:
+        reality["issues"].append(f"Unable to read worker status: {error or 'Git failed'}")
+    else:
+        reality["dirty"] = bool(output)
+
+    code, output, error = _git_read(repo, "log", "--oneline", "--decorate", "-n", "20")
+    reality["git_log"] = output if not code else f"(unavailable: {error or 'Git failed'})"
+    code, output, error = _git_read(repo, "status", "--short", "--branch")
+    reality["git_status"] = output if not code else f"(unavailable: {error or 'Git failed'})"
+
+    base_commit = _base_commit(repo, metadata)
+    if base_commit:
+        reality["base_commit"] = base_commit
+        code, output, error = _git_read(repo, "diff", "--no-ext-diff", f"{base_commit}...HEAD")
+        reality["git_diff"] = output if not code else f"(unavailable: {error or 'Git failed'})"
+    else:
+        reality["git_diff"] = "(unavailable: persisted base ref cannot be resolved)"
+        reality["issues"].append("Persisted base ref cannot be resolved in the worker repository")
+    return reality
+
+
+def _worker_record(worker_dir):
+    """Build a recoverable view by combining worker.json and live reality."""
+    worker_id = worker_dir.name
+    record = {
+        "id": worker_id,
+        "worker_dir": str(worker_dir),
+        "repository": str(worker_dir / "repo"),
+        "source_repo": "-",
+        "base_ref": "-",
+        "branch": "-",
+        "metadata_branch": "-",
+        "created_at": "-",
+        "runtime": "-",
+        "network": "-",
+        "metadata_status": "unknown",
+        "status": "invalid",
+        "container": "not-checked",
+        "head": None,
+        "dirty": None,
+        "git_log": "",
+        "git_status": "",
+        "git_diff": "",
+        "issues": [],
+    }
+    if worker_dir.is_symlink() or not worker_dir.is_dir():
+        record["issues"].append("Worker state entry is not a real directory")
+        return record
+
+    metadata_path = worker_dir / "worker.json"
+    metadata = {}
+    if not metadata_path.is_file():
+        record["issues"].append(f"Missing worker metadata: {metadata_path}")
+    else:
+        try:
+            with metadata_path.open() as stream:
+                metadata = json.load(stream)
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata must be a JSON object")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            record["issues"].append(f"Invalid worker metadata {metadata_path}: {exc}")
+            metadata = {}
+
+    record["source_repo"] = _metadata_value(metadata, "source_repo")
+    record["base_ref"] = _metadata_value(metadata, "base_ref")
+    record["branch"] = _metadata_value(metadata, "branch")
+    record["metadata_branch"] = record["branch"]
+    record["created_at"] = _metadata_value(metadata, "created_at")
+    record["runtime"] = _metadata_value(metadata, "runtime")
+    record["network"] = _metadata_value(metadata, "network")
+    record["metadata_status"] = _metadata_value(metadata, "status", "unknown")
+    if record["metadata_status"] not in LIFECYCLE_STATES and record["metadata_status"] != "unknown":
+        record["issues"].append(f"Unknown persisted lifecycle status: {record['metadata_status']}")
+    if metadata and metadata.get("id") != worker_id:
+        record["issues"].append(f"Metadata ID does not match state directory ({metadata.get('id', '-')})")
+
+    source = Path(record["source_repo"]).expanduser() if record["source_repo"] != "-" else None
+    if source is not None and not source.is_dir():
+        record["issues"].append(f"Source repository is missing: {source}")
+
+    reality = _git_reality(worker_dir / "repo", metadata)
+    record.update({key: reality[key] for key in ("head", "dirty", "git_log", "git_status", "git_diff")})
+    record["issues"].extend(reality["issues"])
+    if reality["branch"]:
+        actual_branch = reality["branch"]
+        if record["metadata_branch"] != "-" and record["metadata_branch"] != actual_branch:
+            record["issues"].append(f"Branch differs from metadata ({record['metadata_branch']} vs {actual_branch})")
+        record["branch"] = actual_branch
+        record["actual_branch"] = actual_branch
+    else:
+        record["actual_branch"] = None
+
+    record["container"] = container_status(worker_id)
+    if record["container"] == "unavailable":
+        record["issues"].append("Podman is unavailable; container state could not be checked")
+    elif record["container"].startswith("error:"):
+        record["issues"].append(f"Unable to inspect worker container: {record['container'][len('error: '):]}")
+    if record["container"] == "running":
+        record["status"] = "running"
+    elif record["metadata_status"] == "running" and record["container"] == "not-found":
+        record["status"] = "stale"
+        record["issues"].append("Metadata says running but no corresponding container exists")
+    elif record["metadata_status"] == "running" and (record["container"] == "unavailable" or record["container"].startswith("error:")):
+        record["status"] = "unknown"
+        record["issues"].append("Persisted lifecycle says running, but live container state is unavailable")
+    elif record["container"] in {"exited", "stopped", "created", "paused", "unknown"} and record["metadata_status"] == "running":
+        record["status"] = "stopped"
+    elif record["metadata_status"] in LIFECYCLE_STATES:
+        record["status"] = record["metadata_status"]
+    else:
+        record["status"] = "invalid" if record["issues"] else "unknown"
+    if any(issue.startswith("Worker repository") for issue in record["issues"]):
+        record["status"] = "missing-repo"
+    if metadata and not record["issues"] and record["status"] == "invalid":
+        record["status"] = "unknown"
+    return record
+
+
+def list_workers(state_dir=None):
+    """List persisted workers, including entries whose state has gone stale."""
+    workers_dir = state_workers_dir(state_dir)
+    if not workers_dir.exists():
+        return []
+    if workers_dir.is_symlink() or not workers_dir.is_dir():
+        raise ValueError(f"Worker state directory is not a real directory: {workers_dir}")
+    return [_worker_record(entry) for entry in sorted(workers_dir.iterdir(), key=lambda path: path.name) if entry.name not in {".", ".."}]
+
+
+def inspect_worker(worker_id, state_dir=None):
+    """Inspect one worker and expose ordinary Git commands and output."""
+    worker_dir = worker_dir_for(worker_id, state_dir)
+    if not worker_dir.exists() or worker_dir.is_symlink():
+        raise ValueError(f"Worker not found: {worker_id}")
+    return _worker_record(worker_dir)
+
+
+def _display(value, missing="-"):
+    if value is None:
+        return missing
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def format_workers(records):
+    columns = ("ID", "REPOSITORY", "BASE", "BRANCH", "STATUS", "CREATED", "HEAD", "DIRTY", "CONTAINER")
+    rows = [columns]
+    for record in records:
+        rows.append((
+            record["id"], record["repository"], record["base_ref"], record["branch"], record["status"],
+            record["created_at"], (record["head"] or "-")[:12], _display(record["dirty"]), record["container"],
+        ))
+    if len(rows) == 1:
+        return "No sandbox workers found."
+    widths = [max(len(str(row[index])) for row in rows) for index in range(len(columns))]
+    return "\n".join("  ".join(str(value).ljust(widths[index]) for index, value in enumerate(row)).rstrip() for row in rows)
+
+
+def format_worker(record):
+    lines = [
+        f"Worker: {record['id']}",
+        f"Repository: {record['repository']}",
+        f"Source: {record['source_repo']}",
+        f"Base: {record['base_ref']}",
+        f"Branch: {record['branch']}",
+        f"Runtime: {record['runtime']}",
+        f"Network: {record['network']}",
+        f"Container: {record['container']}",
+        f"Status: {record['status']}",
+        f"Created: {record['created_at']}",
+        f"HEAD: {record['head'] or '-'}",
+        f"Dirty: {_display(record['dirty'])}",
+    ]
+    if record["issues"]:
+        lines.extend(["Issues:"] + [f"- {issue}" for issue in record["issues"]])
+    lines.extend([
+        "",
+        "Git log:",
+        record["git_log"] or "(no commits)",
+        "",
+        "Git status:",
+        record["git_status"] or "(clean)",
+        "",
+        f"Git diff {record['base_ref']}...HEAD:",
+        record["git_diff"] or "(no changes)",
+    ])
+    return "\n".join(lines)
+
+
 def create_options(config_dir):
     config_file = config_dir / "config.toml"
     with config_file.open("rb") as stream:
@@ -172,9 +505,23 @@ def create_options(config_dir):
     return options
 
 
+def destroy_options(config_dir):
+    """Read the optional worker ID used by the noninteractive destroy action."""
+    config_file = config_dir / "config.toml"
+    if not config_file.is_file():
+        return {}
+    with config_file.open("rb") as stream:
+        config = tomllib.load(stream)
+    options = config.get("destroy", {})
+    if not isinstance(options, dict):
+        raise ValueError(f"Expected a [destroy] table in {config_file}.")
+    if "id" in options and not isinstance(options["id"], str):
+        raise ValueError(f"Set [destroy].id to a string in {config_file}.")
+    return options
+
+
 def create_worker(worker_id, repo=None, base_ref="HEAD"):
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", worker_id) or worker_id in (".", "..") or ".." in worker_id:
-        raise ValueError("Worker ID must contain letters, digits, dots, underscores, or hyphens, start with a letter or digit, and contain no '..'.")
+    validate_worker_id(worker_id)
     branch = f"agent/{worker_id}"
     git("check-ref-format", "--branch", branch)
     if not base_ref or base_ref.startswith("-") or any(char.isspace() for char in base_ref):
@@ -220,6 +567,7 @@ def create_worker(worker_id, repo=None, base_ref="HEAD"):
             "branch": branch,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "runtime": "podman",
+            "network": "online",
             "status": "created",
         }
         (destination / "worker.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -241,6 +589,16 @@ def main():
     create_parser.add_argument("--id", help="Worker ID (prompted for in an interactive terminal)")
     create_parser.add_argument("--repo", help="Source repository (defaults to the Herdr workspace)")
     create_parser.add_argument("--base", help="Base ref or commit (default: HEAD)")
+    destroy_parser = commands.add_parser("destroy", help="Destroy one sandbox worker")
+    destroy_parser.add_argument("--id", help="Worker ID (or configure [destroy].id)")
+    list_parser = commands.add_parser("list", help="List persisted sandbox workers")
+    list_parser.add_argument("--json", action="store_true", help="Print structured JSON")
+    inspect_parser = commands.add_parser("inspect", help="Inspect one sandbox worker")
+    inspect_parser.add_argument("worker_id", nargs="?", help="Worker ID")
+    inspect_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
+    inspect_parser.add_argument("--json", action="store_true", help="Print structured JSON")
+    workers_parser = commands.add_parser("workers", help=argparse.SUPPRESS)
+    workers_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
         if args.command == "setup":
@@ -256,6 +614,40 @@ def main():
             if not worker_id:
                 worker_id = f"worker-{uuid4().hex[:12]}"
             print(create_worker(worker_id, args.repo or options.get("source_repo"), args.base or options.get("base_ref") or "HEAD"))
+        elif args.command == "destroy":
+            worker_id = args.id
+            if worker_id is None:
+                config_dir, _ = paths()
+                worker_id = destroy_options(config_dir).get("id")
+            if not worker_id:
+                raise ValueError("Worker ID is required. Pass `destroy --id WORKER_ID` or set [destroy].id in the plugin config.")
+            removed = destroy_worker(worker_id)
+            print(f"Destroyed worker: {worker_id}" if removed else f"Worker already absent: {worker_id}")
+        elif args.command in {"list", "workers"}:
+            records = list_workers()
+            if args.json:
+                print(json.dumps(records, indent=2))
+            else:
+                print(format_workers(records))
+        elif args.command == "inspect":
+            worker_id = args.worker_id or args.option_worker_id
+            if not worker_id:
+                config_dir, _ = paths()
+                with (config_dir / "config.toml").open("rb") as stream:
+                    config = tomllib.load(stream)
+                inspect_options = config.get("inspect", {})
+                if not isinstance(inspect_options, dict):
+                    raise ValueError(f"Expected an [inspect] table in {config_dir / 'config.toml'}.")
+                worker_id = inspect_options.get("id")
+                if worker_id is not None and not isinstance(worker_id, str):
+                    raise ValueError(f"Set [inspect].id to a string in {config_dir / 'config.toml'}.")
+            if not worker_id:
+                raise ValueError("Worker ID is required. Pass `inspect WORKER_ID` or set [inspect].id in the plugin config.")
+            record = inspect_worker(worker_id)
+            if args.json:
+                print(json.dumps(record, indent=2))
+            else:
+                print(format_worker(record))
         else:
             errors = check(args.repo or context_repo(), args.execution)
             if errors:
