@@ -53,6 +53,28 @@ def load_config(config_dir):
     return image, codex_home
 
 
+def runtime_settings(config_dir):
+    """Load the fixed Podman settings shared by every worker entrypoint."""
+    config_file = config_dir / "config.toml"
+    with config_file.open("rb") as stream:
+        config = tomllib.load(stream)
+    runtime = config.get("runtime")
+    resources = config.get("resources")
+    if not isinstance(runtime, dict) or not isinstance(resources, dict):
+        raise ValueError(f"Expected [runtime] and [resources] tables in {config_file}.")
+    network = runtime.get("network")
+    cpus, memory, pids = resources.get("cpus"), resources.get("memory"), resources.get("pids")
+    if network not in {"online", "offline"}:
+        raise ValueError(f"Set [runtime].network to 'online' or 'offline' in {config_file}.")
+    if not isinstance(cpus, (int, float)) or isinstance(cpus, bool) or cpus <= 0:
+        raise ValueError(f"Set [resources].cpus to a positive number in {config_file}.")
+    if not isinstance(memory, str) or not re.fullmatch(r"[1-9][0-9]*(?:[kKmMgGtT][iI]?[bB]?|[bB])?", memory):
+        raise ValueError(f"Set [resources].memory to a positive Podman memory value in {config_file}.")
+    if not isinstance(pids, int) or isinstance(pids, bool) or pids <= 0:
+        raise ValueError(f"Set [resources].pids to a positive integer in {config_file}.")
+    return network, cpus, memory, pids
+
+
 def run(*argv):
     return subprocess.run(argv, capture_output=True, text=True, check=False)
 
@@ -225,6 +247,99 @@ def destroy_worker(worker_id, state_dir=None):
         return False
     shutil.rmtree(worker_dir)
     return True
+
+
+def open_options(config_dir):
+    """Read the fixed worker chosen by the non-prompting Herdr open action."""
+    config_file = config_dir / "config.toml"
+    with config_file.open("rb") as stream:
+        config = tomllib.load(stream)
+    options = config.get("open", {})
+    if not isinstance(options, dict):
+        raise ValueError(f"Expected an [open] table in {config_file}.")
+    if "id" in options and not isinstance(options["id"], str):
+        raise ValueError(f"Set [open].id to a string in {config_file}.")
+    return options
+
+
+def _write_worker_status(worker_dir, status):
+    metadata_path = worker_dir / "worker.json"
+    with metadata_path.open() as stream:
+        metadata = json.load(stream)
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Invalid worker metadata: {metadata_path}")
+    metadata["status"] = status
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+
+
+class PodmanSandboxRuntime:
+    """The single owner of the Podman worker isolation contract."""
+
+    def __init__(self, worker_id, image, repo, codex_home, network, cpus, memory, pids):
+        self.worker_id = worker_id
+        self.image = image
+        self.repo = repo
+        self.codex_home = codex_home
+        self.network = network
+        self.cpus = cpus
+        self.memory = memory
+        self.pids = pids
+
+    def interactive_command(self, command=None):
+        args = list(command or ["bash"])
+        if not args or any(not isinstance(arg, str) or not arg for arg in args):
+            raise ValueError("Interactive command must contain nonempty arguments.")
+        invocation = [
+            "podman", "run", "--rm", "-it", "--name", f"herdr-{self.worker_id}",
+            "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+            f"--pids-limit={self.pids}", f"--memory={self.memory}", f"--cpus={self.cpus}",
+            "--env", "HOME=/tmp/home", "--env", "CODEX_HOME=/codex", "--env", "XDG_CACHE_HOME=/tmp/cache",
+            "--mount", f"type=bind,src={self.repo.resolve()},dst=/workspace,rw",
+            "--mount", f"type=bind,src={self.codex_home.resolve()},dst=/codex,rw",
+            "--workdir", "/workspace",
+        ]
+        if self.network == "offline":
+            invocation.append("--network=none")
+        return invocation + [self.image] + args
+
+
+def podman_runtime(worker_id):
+    """Create the configured runtime only after validating its permitted paths."""
+    validate_worker_id(worker_id)
+    config_dir, state_dir = paths()
+    image, codex_home = load_config(config_dir)
+    network, cpus, memory, pids = runtime_settings(config_dir)
+    _, worker_dir = worker_storage(worker_id, state_dir)
+    repo = worker_dir / "repo"
+    if not repo.is_dir() or repo.is_symlink() or not (repo / ".git").exists():
+        raise ValueError(f"Worker repository does not exist: {repo}")
+    if not codex_home.is_dir() or codex_home.is_symlink():
+        raise ValueError(f"Dedicated Codex home does not exist: {codex_home}")
+    return PodmanSandboxRuntime(worker_id, image, repo, codex_home, network, cpus, memory, pids)
+
+
+def open_command(worker_id, command=None):
+    """Build the central runtime's interactive invocation for a worker."""
+    return podman_runtime(worker_id).interactive_command(command)
+
+
+def open_worker(worker_id, command=None):
+    """Open a terminal-attached worker session for Herdr to manage."""
+    config_dir, state_dir = paths()
+    _, worker_dir = worker_storage(worker_id, state_dir)
+    command = list(command or ["bash"])
+    errors = check(require_auth=command[0] == "codex")
+    if errors:
+        raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
+    invocation = open_command(worker_id, command)
+    _write_worker_status(worker_dir, "running")
+    try:
+        result = subprocess.run(invocation, check=False)
+    except BaseException:
+        _write_worker_status(worker_dir, "failed")
+        raise
+    _write_worker_status(worker_dir, "stopped" if result.returncode == 0 else "failed")
+    return result.returncode
 
 
 def _metadata_value(metadata, key, default="-"):
@@ -597,6 +712,10 @@ def main():
     inspect_parser.add_argument("worker_id", nargs="?", help="Worker ID")
     inspect_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
     inspect_parser.add_argument("--json", action="store_true", help="Print structured JSON")
+    open_parser = commands.add_parser("open", help="Open an interactive sandbox worker")
+    open_parser.add_argument("worker_id", nargs="?", help="Worker ID")
+    open_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
+    open_parser.add_argument("session_command", nargs=argparse.REMAINDER, help="Command and arguments to run in the worker")
     workers_parser = commands.add_parser("workers", help=argparse.SUPPRESS)
     workers_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -648,6 +767,15 @@ def main():
                 print(json.dumps(record, indent=2))
             else:
                 print(format_worker(record))
+        elif args.command == "open":
+            worker_id = args.worker_id or args.option_worker_id
+            if not worker_id:
+                config_dir, _ = paths()
+                worker_id = open_options(config_dir).get("id")
+            if not worker_id:
+                raise ValueError("Worker ID is required. Pass `open WORKER_ID` or set [open].id in the plugin config.")
+            command = args.session_command or ["bash"]
+            return open_worker(worker_id, command)
         else:
             errors = check(args.repo or context_repo(), args.execution)
             if errors:

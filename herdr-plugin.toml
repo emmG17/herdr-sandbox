@@ -46,3 +46,9 @@ id = "destroy"
 title = "Sandbox: Destroy Worker"
 description = "Stop and remove a worker container and its disposable state"
 command = ["python3", "bin/herdr-sandbox", "destroy"]
+
+[[actions]]
+id = "open"
+title = "Sandbox: Open Worker"
+description = "Open an interactive Podman session in a Herdr-managed pane"
+command = ["python3", "bin/herdr-sandbox", "open"]

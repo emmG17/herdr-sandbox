@@ -1,5 +1,11 @@
 [runtime]
 image = "localhost/herdr-codex-worker:latest"
+network = "online"
+
+[resources]
+cpus = 4
+memory = "8g"
+pids = 1024
 
 [codex]
 home = "codex"

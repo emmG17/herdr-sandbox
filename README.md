@@ -15,6 +15,7 @@ herdr plugin action invoke check --plugin dev.herdr.sandbox
 herdr plugin action invoke create --plugin dev.herdr.sandbox
 herdr plugin action invoke list --plugin dev.herdr.sandbox
 herdr plugin action invoke destroy --plugin dev.herdr.sandbox
+herdr plugin action invoke open --plugin dev.herdr.sandbox
 ```
 
 The setup action writes `config.toml` and creates a dedicated Codex home inside Herdr's plugin config directory. It leaves an existing config alone. The image build action explicitly builds `Containerfile` as `localhost/herdr-codex-worker:latest`, or the image name in `config.toml`. Local `plugin link` does not run build steps.
@@ -55,6 +56,23 @@ python3 bin/herdr-sandbox create --id TEST-001 --repo /path/to/source-repo --bas
 ```
 
 The worker lives at `$HERDR_PLUGIN_STATE_DIR/workers/TEST-001/`, with an independent `repo/.git` and `worker.json` recording its source, base commit, branch, and creation time. The new branch is `agent/TEST-001`. IDs and base refs are checked before the clone is created; a duplicate ID is rejected. Creation requires the same setup readiness checks as `check`, including the rootless Podman image, but does not start a container.
+
+## Open a worker
+
+`open` starts the default interactive worker session in the pane Herdr creates for the action. Configure the target because plugin actions are fixed commands and do not read an interactive prompt:
+
+```toml
+[open]
+id = "TEST-001"
+```
+
+Then invoke `herdr plugin action invoke open --plugin dev.herdr.sandbox`. The pane attaches to `podman run -it`, so its shell or Codex session accepts input and remains visible through Herdr. Direct use supports an explicit command and Codex arguments:
+
+```sh
+python3 bin/herdr-sandbox open TEST-001 -- codex --model gpt-5
+```
+
+The shared runtime reads `[runtime].network` (`online` or `offline`) and `[resources]` from `config.toml`. Offline adds `--network=none`; online uses normal rootless Podman networking. It always uses the configured image and limits, `--userns=keep-id`, `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and a read-only container root. The only host bind mounts are the worker repo at `/workspace` and the dedicated Codex home at `/codex`, both read-write. The runtime does not accept privilege, host namespace, socket, home, source repository, or arbitrary host-environment options.
 
 ## List and inspect workers
 
