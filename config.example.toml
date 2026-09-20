@@ -14,3 +14,8 @@ home = "codex"
 # [execute]
 # id = "WORKER-001"
 # prompt = "Implement the requested change and run the relevant tests."
+
+# Explicitly select a fetched, reviewed worker commit before integration.
+# [cherry_pick]
+# id = "WORKER-001"
+# commit = "0123456789abcdef0123456789abcdef01234567"

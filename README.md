@@ -15,6 +15,7 @@ herdr plugin action invoke check --plugin dev.herdr.sandbox
 herdr plugin action invoke create --plugin dev.herdr.sandbox
 herdr plugin action invoke list --plugin dev.herdr.sandbox
 herdr plugin action invoke fetch --plugin dev.herdr.sandbox
+herdr plugin action invoke cherry-pick --plugin dev.herdr.sandbox
 herdr plugin action invoke destroy --plugin dev.herdr.sandbox
 herdr plugin action invoke open --plugin dev.herdr.sandbox
 herdr plugin action invoke execute --plugin dev.herdr.sandbox
@@ -139,6 +140,18 @@ herdr plugin action invoke fetch --plugin dev.herdr.sandbox
 ```
 
 The fetched commit remains available through `FETCH_HEAD` after the disposable worker is destroyed; deciding whether to integrate it is a later, deliberate action.
+
+## Cherry-pick a reviewed worker commit
+
+Cherry-picking is separate from fetching and is never automatic. After reviewing a fetched commit, configure both the worker and its full 40-character commit SHA:
+
+```toml
+[cherry_pick]
+id = "TEST-001"
+commit = "0123456789abcdef0123456789abcdef01234567"
+```
+
+Then run `herdr plugin action invoke cherry-pick --plugin dev.herdr.sandbox`. The action only accepts a commit in the fetched worker change range and refuses a dirty source repository. On a conflict it leaves Git's cherry-pick state intact and prints the exact `git cherry-pick --continue` and `git cherry-pick --abort` recovery commands.
 
 ## Destroy a worker
 

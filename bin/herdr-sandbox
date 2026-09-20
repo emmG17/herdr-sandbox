@@ -300,6 +300,76 @@ def format_fetch_result(result):
     return f"Commit: {result['commit']}\nChanged files:\n{files}\nDiff stat:\n{stat}"
 
 
+def cherry_pick_options(config_dir):
+    """Read the fixed worker and reviewed commit used by the Herdr action."""
+    config_file = config_dir / "config.toml"
+    with config_file.open("rb") as stream:
+        config = tomllib.load(stream)
+    options = config.get("cherry_pick", {})
+    if not isinstance(options, dict):
+        raise ValueError(f"Expected a [cherry_pick] table in {config_file}.")
+    for name in ("id", "commit"):
+        if name in options and not isinstance(options[name], str):
+            raise ValueError(f"Set [cherry_pick].{name} to a string in {config_file}.")
+    return options
+
+
+def cherry_pick_worker(worker_id, commit, state_dir=None):
+    """Deliberately cherry-pick one reviewed worker commit into its source repo."""
+    validate_worker_id(worker_id)
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+        raise ValueError("Commit must be the full 40-character SHA reported by fetch.")
+
+    _, worker_dir = worker_storage(worker_id, state_dir)
+    repo = worker_dir / "repo"
+    metadata_path = worker_dir / "worker.json"
+    if not repo.is_dir() or repo.is_symlink():
+        raise ValueError(f"Worker repository is missing: {repo}")
+    try:
+        with metadata_path.open() as stream:
+            metadata = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid worker metadata: {metadata_path}") from exc
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("source_repo"), str):
+        raise ValueError(f"Invalid worker metadata: {metadata_path}")
+    base_commit = metadata.get("base_commit")
+    if not isinstance(base_commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", base_commit):
+        raise ValueError(f"Worker metadata has no valid base commit: {metadata_path}")
+
+    source = Path(metadata["source_repo"]).expanduser().resolve()
+    source_error = check_source(source)
+    if source_error:
+        raise ValueError(source_error)
+    source = Path(git("-C", source, "rev-parse", "--show-toplevel")).resolve()
+    fetched = run("git", "-C", str(source), "rev-parse", "--verify", "FETCH_HEAD^{commit}")
+    if fetched.returncode:
+        raise ValueError(f"No fetched worker commit is available in {source}. Run fetch for {worker_id}, review it, then retry.")
+    in_range = run("git", "-C", str(source), "merge-base", "--is-ancestor", commit, "FETCH_HEAD")
+    branch = f"refs/heads/agent/{worker_id}"
+    in_worker_branch = run("git", "-C", str(repo), "merge-base", "--is-ancestor", commit, branch)
+    after_base = run("git", "-C", str(repo), "merge-base", "--is-ancestor", base_commit, commit)
+    if in_range.returncode or in_worker_branch.returncode or after_base.returncode or commit.lower() == base_commit.lower():
+        raise ValueError(f"Commit {commit} is not a reviewed change from worker {worker_id}. Fetch and review that worker before cherry-picking.")
+    if git("-C", source, "status", "--porcelain"):
+        raise ValueError(f"Source repository has uncommitted changes: {source}. Commit or stash them before cherry-picking.")
+
+    result = run("git", "-C", str(source), "cherry-pick", "--no-edit", commit)
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "Git cherry-pick failed."
+        raise ValueError(
+            f"Cherry-pick failed for {commit}: {detail}\n"
+            f"Resolve conflicts in {source}, then run `git -C {source} cherry-pick --continue`; "
+            f"or run `git -C {source} cherry-pick --abort` to recover."
+        )
+    integrated_commit = git("-C", source, "rev-parse", "HEAD")
+    return {"commit": commit, "integrated_commit": integrated_commit, "source": str(source)}
+
+
+def format_cherry_pick_result(result):
+    """Format a completed explicit integration without implying future actions."""
+    return f"Cherry-picked: {result['commit']}\nIntegrated commit: {result['integrated_commit']}\nSource: {result['source']}"
+
+
 def open_options(config_dir):
     """Read the fixed worker chosen by the non-prompting Herdr open action."""
     config_file = config_dir / "config.toml"
@@ -837,6 +907,9 @@ def main():
     create_parser.add_argument("--base", help="Base ref or commit (default: HEAD)")
     fetch_parser = commands.add_parser("fetch", help="Fetch one worker commit for review")
     fetch_parser.add_argument("--id", help="Worker ID (or configure [fetch].id)")
+    cherry_pick_parser = commands.add_parser("cherry-pick", help="Cherry-pick one reviewed worker commit")
+    cherry_pick_parser.add_argument("--id", help="Worker ID (or configure [cherry_pick].id)")
+    cherry_pick_parser.add_argument("--commit", help="Full reviewed commit SHA (or configure [cherry_pick].commit)")
     destroy_parser = commands.add_parser("destroy", help="Destroy one sandbox worker")
     destroy_parser.add_argument("--id", help="Worker ID (or configure [destroy].id)")
     list_parser = commands.add_parser("list", help="List persisted sandbox workers")
@@ -888,6 +961,18 @@ def main():
             if not worker_id:
                 raise ValueError("Worker ID is required. Pass `fetch --id WORKER_ID` or set [fetch].id in the plugin config.")
             print(format_fetch_result(fetch_worker(worker_id)))
+        elif args.command == "cherry-pick":
+            worker_id, commit = args.id, args.commit
+            if worker_id is None or commit is None:
+                config_dir, _ = paths()
+                options = cherry_pick_options(config_dir)
+                worker_id = worker_id or options.get("id")
+                commit = commit or options.get("commit")
+            if not worker_id:
+                raise ValueError("Worker ID is required. Pass `cherry-pick --id WORKER_ID --commit COMMIT` or set [cherry_pick].id in the plugin config.")
+            if not commit:
+                raise ValueError("Commit is required. Pass `cherry-pick --id WORKER_ID --commit COMMIT` or set [cherry_pick].commit in the plugin config.")
+            print(format_cherry_pick_result(cherry_pick_worker(worker_id, commit)))
         elif args.command in {"list", "workers"}:
             records = list_workers()
             if args.json:
