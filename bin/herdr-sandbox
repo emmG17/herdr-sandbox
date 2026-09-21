@@ -19,6 +19,7 @@ PLUGIN_ID = "dev.herdr.sandbox"
 WORKER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 LIFECYCLE_STATES = {"created", "running", "stopped", "completed", "failed"}
 DEFAULT_CONFIG = (Path(__file__).resolve().parent.parent / "config.example.toml").read_text()
+DEFAULT_BASE_IMAGE = "node:22-bookworm-slim"
 
 
 def paths():
@@ -87,6 +88,21 @@ def runtime_settings(config_dir):
     if not isinstance(pids, int) or isinstance(pids, bool) or pids <= 0:
         raise ValueError(f"Set [resources].pids to a positive integer in {config_file}.")
     return network, cpus, memory, pids
+
+
+def build_settings(config_dir):
+    """Load the user-selectable base image for the editable boilerplate."""
+    config_file = config_dir / "config.toml"
+    with config_file.open("rb") as stream:
+        config = tomllib.load(stream)
+    build = config.get("build", {})
+    if not isinstance(build, dict):
+        raise ValueError(f"Expected a [build] table in {config_file}.")
+    _permitted_settings(build, "[build]", {"base_image"})
+    base_image = build.get("base_image", DEFAULT_BASE_IMAGE)
+    if not isinstance(base_image, str) or not base_image.strip() or any(char.isspace() for char in base_image):
+        raise ValueError(f"Set [build].base_image to a nonempty image reference without whitespace in {config_file}.")
+    return base_image
 
 
 def run(*argv):
@@ -169,12 +185,34 @@ def setup():
     config_file = config_dir / "config.toml"
     if not config_file.exists():
         config_file.write_text(DEFAULT_CONFIG)
+    image_dir = config_dir / "image"
+    image_dir.mkdir(exist_ok=True)
+    boilerplate = image_dir / "Containerfile"
+    if not boilerplate.exists():
+        root = Path(os.environ.get("HERDR_PLUGIN_ROOT", Path(__file__).resolve().parent.parent))
+        boilerplate.write_text((root / "Containerfile").read_text())
     image, codex_home = load_config(config_dir)
     codex_home.mkdir(parents=True, exist_ok=True)
     codex_home.chmod(0o700)
-    print(f"Config: {config_file}\nState: {state_dir}\nCodex home: {codex_home}\nImage: {image}")
+    print(f"Config: {config_file}\nImage boilerplate: {boilerplate}\nState: {state_dir}\nCodex home: {codex_home}\nImage: {image}")
     print(f"Next: `herdr plugin action invoke build-image --plugin {PLUGIN_ID}`")
     print(f"Authenticate: `CODEX_HOME={codex_home} codex login --device-auth`")
+
+
+def bootstrap():
+    """Prepare the plugin for first use without requiring config-file edits."""
+    setup()
+    build_image()
+    config_dir, _ = paths()
+    _, codex_home = load_config(config_dir)
+    errors = check(require_auth=True)
+    remaining = [error for error in errors if "Codex authentication is missing" not in error]
+    if remaining:
+        raise ValueError("Readiness checks failed:\n- " + "\n- ".join(remaining))
+    if errors:
+        print(f"Almost ready. Authenticate once:\n  CODEX_HOME={codex_home} codex login --device-auth")
+    else:
+        print("Sandbox setup is ready. Create a worker with the Create Worker action, then use Start Codex.")
 
 
 def build_image():
@@ -183,8 +221,15 @@ def build_image():
         raise ValueError("\n".join(errors))
     config_dir, _ = paths()
     image, _ = load_config(config_dir)
-    root = Path(os.environ.get("HERDR_PLUGIN_ROOT", Path(__file__).resolve().parent.parent))
-    result = subprocess.run(["podman", "build", "--tag", image, "--file", str(root / "Containerfile"), str(root)], check=False)
+    base_image = build_settings(config_dir)
+    image_dir = config_dir / "image"
+    boilerplate = image_dir / "Containerfile"
+    if not boilerplate.is_file() or boilerplate.is_symlink():
+        raise ValueError(f"Worker image boilerplate is missing: {boilerplate}. Run the setup action.")
+    result = subprocess.run([
+        "podman", "build", "--tag", image, "--build-arg", f"BASE_IMAGE={base_image}",
+        "--file", str(boilerplate), str(image_dir),
+    ], check=False)
     if result.returncode:
         raise ValueError(f"Image build failed with exit code {result.returncode}.")
     print(f"Built {image}")
@@ -274,6 +319,35 @@ def fetch_options(config_dir):
     if "id" in options and not isinstance(options["id"], str):
         raise ValueError(f"Set [fetch].id to a string in {config_file}.")
     return options
+
+
+def sole_worker_id(state_dir=None):
+    """Return the only persisted worker, or None when selection is ambiguous."""
+    workers_dir = state_workers_dir(state_dir)
+    if not workers_dir.is_dir() or workers_dir.is_symlink():
+        return None
+    worker_ids = sorted(
+        entry.name for entry in workers_dir.iterdir()
+        if entry.is_dir() and not entry.is_symlink() and WORKER_ID_RE.fullmatch(entry.name)
+    )
+    return worker_ids[0] if len(worker_ids) == 1 else None
+
+
+def configured_or_sole_worker(worker_id, config_dir, option_loader, action):
+    """Prefer explicit/configured selection; make the one-worker path config-free."""
+    if worker_id:
+        return worker_id
+    configured = option_loader(config_dir).get("id")
+    if configured:
+        return configured
+    _, state_dir = paths()
+    selected = sole_worker_id(state_dir)
+    if selected:
+        return selected
+    raise ValueError(
+        f"Worker ID is required when there is not exactly one worker. "
+        f"Pass `{action} --id WORKER_ID` or set the action's id in the plugin config."
+    )
 
 
 def fetch_worker(worker_id, state_dir=None):
@@ -911,6 +985,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("setup")
+    commands.add_parser("bootstrap", help="Set up the plugin and build the worker image")
     commands.add_parser("build-image")
     check_parser = commands.add_parser("check")
     check_parser.add_argument("--repo", help="Also verify a source Git repository")
@@ -935,6 +1010,7 @@ def main():
     open_parser = commands.add_parser("open", help="Open an interactive sandbox worker")
     open_parser.add_argument("worker_id", nargs="?", help="Worker ID")
     open_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
+    open_parser.add_argument("--codex", action="store_true", help="Start Codex instead of the default shell")
     open_parser.add_argument("session_command", nargs=argparse.REMAINDER, help="Command and arguments to run in the worker")
     execute_parser = commands.add_parser("execute", help="Run one noninteractive Codex task in a sandbox worker")
     execute_parser.add_argument("worker_id", nargs="?", help="Worker ID")
@@ -947,6 +1023,8 @@ def main():
     try:
         if args.command == "setup":
             setup()
+        elif args.command == "bootstrap":
+            bootstrap()
         elif args.command == "build-image":
             build_image()
         elif args.command == "create":
@@ -968,12 +1046,8 @@ def main():
             removed = destroy_worker(worker_id)
             print(f"Destroyed worker: {worker_id}" if removed else f"Worker already absent: {worker_id}")
         elif args.command == "fetch":
-            worker_id = args.id
-            if worker_id is None:
-                config_dir, _ = paths()
-                worker_id = fetch_options(config_dir).get("id")
-            if not worker_id:
-                raise ValueError("Worker ID is required. Pass `fetch --id WORKER_ID` or set [fetch].id in the plugin config.")
+            config_dir, _ = paths()
+            worker_id = configured_or_sole_worker(args.id, config_dir, fetch_options, "fetch")
             print(format_fetch_result(fetch_worker(worker_id)))
         elif args.command == "cherry-pick":
             worker_id, commit = args.id, args.commit
@@ -1005,21 +1079,20 @@ def main():
                 worker_id = inspect_options.get("id")
                 if worker_id is not None and not isinstance(worker_id, str):
                     raise ValueError(f"Set [inspect].id to a string in {config_dir / 'config.toml'}.")
+                if not worker_id:
+                    _, state_dir = paths()
+                    worker_id = sole_worker_id(state_dir)
             if not worker_id:
-                raise ValueError("Worker ID is required. Pass `inspect WORKER_ID` or set [inspect].id in the plugin config.")
+                raise ValueError("Worker ID is required when there is not exactly one worker. Pass `inspect WORKER_ID` or set [inspect].id in the plugin config.")
             record = inspect_worker(worker_id)
             if args.json:
                 print(json.dumps(record, indent=2))
             else:
                 print(format_worker(record))
         elif args.command == "open":
-            worker_id = args.worker_id or args.option_worker_id
-            if not worker_id:
-                config_dir, _ = paths()
-                worker_id = open_options(config_dir).get("id")
-            if not worker_id:
-                raise ValueError("Worker ID is required. Pass `open WORKER_ID` or set [open].id in the plugin config.")
-            command = args.session_command or ["bash"]
+            config_dir, _ = paths()
+            worker_id = configured_or_sole_worker(args.worker_id or args.option_worker_id, config_dir, open_options, "open")
+            command = args.session_command or (["codex"] if args.codex else ["bash"])
             return open_worker(worker_id, command)
         elif args.command == "execute":
             worker_id = args.worker_id or args.option_worker_id

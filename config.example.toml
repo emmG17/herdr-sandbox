@@ -2,6 +2,12 @@
 image = "localhost/herdr-codex-worker:latest"
 network = "online"
 
+[build]
+# Used by the editable image/Containerfile boilerplate created by setup.
+# Choose a Debian/Ubuntu-compatible image, or adapt that boilerplate for a
+# different distribution and package manager.
+base_image = "node:22-bookworm-slim"
+
 [resources]
 cpus = 4
 memory = "8g"
@@ -10,7 +16,8 @@ pids = 1024
 [codex]
 home = "codex"
 
-# Configure the fixed inputs used by the noninteractive Execute Task action.
+# Advanced automation: configure the fixed inputs used by the noninteractive
+# Execute Task action. The interactive quick-start workflow needs no edits here.
 # [execute]
 # id = "WORKER-001"
 # prompt = "Implement the requested change and run the relevant tests."

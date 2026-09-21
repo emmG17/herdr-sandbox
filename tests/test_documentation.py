@@ -14,26 +14,27 @@ class DocumentationTests(unittest.TestCase):
         self.assertEqual(manifest["id"], "dev.herdr.sandbox")
         self.assertIn("min_herdr_version", manifest)
 
-    def test_readme_covers_the_install_and_safe_worker_workflow(self):
+    def test_readme_covers_public_installation_workflow_and_boundaries(self):
         readme = (ROOT / "README.md").read_text()
         required = (
-            "## Threat model and isolation",
+            "## What it does—and does not do",
             "containers share the host Linux kernel",
             "danger-full-access",
-            "## Arch Linux and rootless Podman",
+            "## Requirements",
             "podman info --format",
-            "## Install or link the plugin",
-            "herdr plugin install OWNER/herdr-sandbox",
+            "## Install",
+            "herdr plugin install emmG17/herdr-sandbox",
             "herdr plugin link /path/to/herdr-sandbox",
-            "herdr plugin list --plugin dev.herdr.sandbox",
             "herdr plugin action list --plugin dev.herdr.sandbox",
-            "## Online and offline profiles",
+            "## Quick start",
+            "herdr plugin action invoke bootstrap --plugin dev.herdr.sandbox",
+            "herdr plugin action invoke start-codex --plugin dev.herdr.sandbox",
+            "FETCH_HEAD",
+            "## Customize the worker image",
             "network = \"offline\"",
-            "## End-to-end worker workflow",
-            "## Integrate a reviewed change",
-            "## Destroy a worker",
-            "## Security test",
-            "## Troubleshooting",
+            "## Help, feedback, and changes",
+            "https://github.com/emmG17/herdr-sandbox/issues",
+            "emmanuel@emm-g.com",
         )
         for item in required:
             with self.subTest(item=item):

@@ -12,6 +12,12 @@ description = "Create plugin configuration and a dedicated Codex home"
 command = ["python3", "bin/herdr-sandbox", "setup"]
 
 [[actions]]
+id = "bootstrap"
+title = "Sandbox: Bootstrap"
+description = "Create plugin state and build the worker image for first use"
+command = ["python3", "bin/herdr-sandbox", "bootstrap"]
+
+[[actions]]
 id = "build-image"
 title = "Sandbox: Build Image"
 description = "Build the Codex worker image with rootless Podman"
@@ -64,6 +70,12 @@ id = "open"
 title = "Sandbox: Open Worker"
 description = "Open an interactive Podman session in a Herdr-managed pane"
 command = ["python3", "bin/herdr-sandbox", "open"]
+
+[[actions]]
+id = "start-codex"
+title = "Sandbox: Start Codex"
+description = "Start an interactive Codex session in the sole sandbox worker"
+command = ["python3", "bin/herdr-sandbox", "open", "--codex"]
 
 [[actions]]
 id = "execute"
