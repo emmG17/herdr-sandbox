@@ -147,6 +147,17 @@ class DestroyTests(unittest.TestCase):
             self.assertEqual(plugin.main(), 1)
         self.assertIn("Worker ID is required", stderr.getvalue())
 
+    def test_direct_id_does_not_read_destroy_config(self):
+        (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + '\n[destroy]\nid = "STALE"\n')
+        config_before = (self.config / "config.toml").read_bytes()
+        with patch.object(plugin, "destroy_options", side_effect=AssertionError("direct input read config")), \
+                patch.object(plugin.sys, "argv", [str(SCRIPT), "destroy", "--id", "TEST-001"]), \
+                patch.object(plugin, "destroy_worker", return_value=True) as destroy:
+            self.assertEqual(plugin.main(), 0)
+
+        destroy.assert_called_once_with("TEST-001")
+        self.assertEqual((self.config / "config.toml").read_bytes(), config_before)
+
 
 if __name__ == "__main__":
     unittest.main()

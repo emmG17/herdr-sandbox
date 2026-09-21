@@ -1,9 +1,10 @@
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
-import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -54,19 +55,17 @@ class CompleteWorkflowTests(unittest.TestCase):
         self.assertNotEqual(worker_repo.resolve(), self.source.resolve())
         self.assertEqual(git("-C", self.source, "rev-parse", "HEAD"), self.source_head)
 
-        def execute_in_worker(*args, **kwargs):
-            (worker_repo / "worker.txt").write_text("worker-only change\n")
-            return subprocess.CompletedProcess(args[0], 0, "completed\n", "")
-
         with patch.object(plugin, "check", return_value=[]), \
-                patch.object(plugin, "_git_read", side_effect=[
-                    (0, git("-C", worker_repo, "rev-parse", "HEAD"), ""),
-                    (0, " M worker.txt", ""),
+                patch.object(plugin, "execute_command", return_value=[
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(worker_repo / 'worker.txt')!r}).write_text('worker-only change\\n'); print('completed', flush=True)",
                 ]), \
-                patch.object(plugin.subprocess, "run", side_effect=execute_in_worker):
+                patch.object(plugin.sys, "stdout", new_callable=io.StringIO) as worker_output:
             result = plugin.execute_worker("FLOW-001", "write worker.txt")
         self.assertEqual(result["exit_status"], 0)
         self.assertTrue(result["dirty"])
+        self.assertIn("completed\n", worker_output.getvalue())
 
         git("-C", worker_repo, "config", "user.name", "Worker")
         git("-C", worker_repo, "config", "user.email", "worker@example.invalid")

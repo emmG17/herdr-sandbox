@@ -38,6 +38,11 @@ class OpenWorkerTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
 
+    def _git_repo(self, path):
+        path.mkdir()
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        return path.resolve()
+
     def test_runtime_command_enforces_isolation_and_only_mounts_worker_paths(self):
         command = plugin.open_command("TEST-001", ["codex", "--model", "gpt-5"])
 
@@ -131,7 +136,83 @@ class OpenWorkerTests(unittest.TestCase):
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "open", "TEST-001", "--", "codex", "--model", "gpt-5"]), \
                 patch.object(plugin, "open_worker", return_value=0) as open_worker:
             self.assertEqual(plugin.main(), 0)
-        open_worker.assert_called_once_with("TEST-001", ["codex", "--model", "gpt-5"])
+        open_worker.assert_called_once_with("TEST-001", ["codex", "--model", "gpt-5"], fresh=True)
+
+    def test_start_codex_subcommand_selects_a_fresh_worker_session(self):
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "start-codex", "--id", "TEST-001"]), \
+                patch.object(plugin, "open_worker", return_value=0) as open_worker:
+            self.assertEqual(plugin.main(), 0)
+        open_worker.assert_called_once_with("TEST-001", ["codex"], fresh=True)
+
+    def test_start_codex_uses_selected_worker_not_active_workspace_or_shared_history(self):
+        root = Path(self.temp.name)
+        landing_page = self._git_repo(root / "landing-page-1")
+        plugin_development = self._git_repo(root / "plugin-development")
+        worker = self.state / "workers" / "TEST-001"
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "source_repo": str(landing_page),
+        }))
+        auth = self.config / "codex" / "auth.json"
+        auth.write_text('{"token":"test"}\n')
+        old_history = self.config / "codex" / "sessions" / "unrelated.jsonl"
+        old_history.parent.mkdir()
+        old_history.write_text("unrelated task\n")
+
+        real_run = plugin.subprocess.run
+        mounted_home = None
+
+        def fake_run(*args, **kwargs):
+            nonlocal mounted_home
+            command = args[0]
+            if command and command[0] == "podman":
+                mounts = [command[index + 1] for index, value in enumerate(command) if value == "--mount"]
+                worker_mount = f"type=bind,src={(worker / 'repo').resolve()},dst=/workspace,rw"
+                self.assertIn(worker_mount, mounts)
+                self.assertNotIn(str(plugin_development), " ".join(command))
+                self.assertEqual(command[command.index("--workdir") + 1], "/workspace")
+                self.assertEqual(command[-3:], ["codex", "--cd", "/workspace"])
+                codex_mount = next(mount for mount in mounts if ",dst=/codex," in mount)
+                mounted_home = Path(codex_mount.split(",src=", 1)[1].split(",dst=", 1)[0])
+                self.assertTrue((mounted_home / "auth.json").is_file())
+                self.assertFalse((mounted_home / "unrelated.jsonl").exists())
+                return subprocess.CompletedProcess(command, 0)
+            return real_run(*args, **kwargs)
+
+        with patch.dict(os.environ, {
+            "HERDR_ENV": "1",
+            "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_cwd": str(landing_page)}),
+        }), patch.object(plugin, "check", return_value=[]), patch.object(plugin.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(plugin.open_worker("TEST-001", ["codex"], fresh=True), 0)
+
+        self.assertIsNotNone(mounted_home)
+        self.assertFalse(mounted_home.exists())
+
+    def test_start_codex_refuses_a_worker_from_a_different_workspace(self):
+        root = Path(self.temp.name)
+        landing_page = self._git_repo(root / "landing-page-1")
+        plugin_development = self._git_repo(root / "plugin-development")
+        worker = self.state / "workers" / "TEST-001"
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "source_repo": str(landing_page),
+        }))
+        real_run = plugin.subprocess.run
+        podman_calls = []
+
+        def fake_run(*args, **kwargs):
+            if args[0] and args[0][0] == "podman":
+                podman_calls.append(args[0])
+            return real_run(*args, **kwargs)
+
+        with patch.dict(os.environ, {
+            "HERDR_ENV": "1",
+            "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_cwd": str(plugin_development)}),
+        }), patch.object(plugin.subprocess, "run", side_effect=fake_run):
+            with self.assertRaisesRegex(ValueError, "mismatched workspace"):
+                plugin.open_worker("TEST-001", ["codex"], fresh=True)
+
+        self.assertEqual(podman_calls, [])
+        metadata = json.loads((worker / "worker.json").read_text())
+        self.assertEqual(metadata["status"], "created")
 
 
 if __name__ == "__main__":

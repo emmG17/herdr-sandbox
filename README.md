@@ -80,15 +80,15 @@ Then, in a Herdr workspace containing the Git repository you want to change:
 
 ```sh
 herdr plugin action invoke create --plugin dev.herdr.sandbox
-herdr plugin action invoke start-codex --plugin dev.herdr.sandbox
+herdr plugin pane open --plugin dev.herdr.sandbox --entrypoint start-codex --placement overlay
 herdr plugin action invoke inspect --plugin dev.herdr.sandbox
 herdr plugin action invoke fetch --plugin dev.herdr.sandbox
 ```
 
 `create` generates a worker ID and clones the workspace repository.
-`start-codex` opens Codex in that disposable clone. With exactly one worker,
-`start-codex`, `inspect`, and `fetch` select it automatically; when several
-workers exist, configure the action's `id` in `config.toml`.
+`start-codex` opens a fresh Codex session in that disposable clone. With exactly
+one worker, `start-codex`, `inspect`, and `fetch` select it automatically; when
+several workers exist, configure `[open].id` in `config.toml` for the pane.
 
 Review the fetched commit, changed files, and diff. To integrate it, configure
 the exact 40-character SHA reported by `fetch`:
@@ -116,6 +116,25 @@ List durable worker state at any time:
 ```sh
 herdr plugin action invoke list --plugin dev.herdr.sandbox
 ```
+
+## Herdr 0.9.0 integration limits
+
+Herdr 0.9.0 runs `plugin action invoke` commands in the invoking workspace and
+does not let a plugin dynamically create or move an action pane. The plugin
+declares `start-codex` only as a managed `[[panes]]` entrypoint. Use `herdr
+plugin pane open ... --entrypoint start-codex`; its default placement is an
+overlay over the active pane. Open it from the worker's source workspace. If
+Herdr reports a different `workspace_cwd` than the selected worker's recorded
+source repository, the plugin refuses to launch instead of exposing that
+workspace's task.
+
+The Podman command is independent of Herdr's pane cwd: it mounts only the
+selected worker clone at `/workspace`, sets the container workdir to
+`/workspace`, and starts Codex with `--cd /workspace`. Each interactive
+`start-codex` launch also gets a temporary plugin-owned `CODEX_HOME` containing
+only `auth.json`; the directory is removed when the session exits, so history
+from another worker or workspace cannot be resumed. The noninteractive
+`execute` action retains its existing shared dedicated Codex home.
 
 ## Customize the worker image
 
@@ -153,14 +172,58 @@ network = "offline"
 ## Advanced use and troubleshooting
 
 For noninteractive automation, configure `[execute].id` and `[execute].prompt`
-then invoke `execute`. You may configure action-specific IDs for `fetch`,
-`inspect`, or `open` when multiple workers exist. Direct script use requires
-Herdr's own paths; do not invent storage locations:
+then invoke `execute`. Codex stdout and stderr are streamed to the action while
+it runs. Every invocation also writes a durable result and output log beneath
+the worker directory at `runs/<run-id>/result.json` and
+`runs/<run-id>/output.log`. The final action summary prints both paths, and
+`list`/`inspect` expose the latest run as a compact summary. You may configure
+action-specific IDs for `fetch`, `inspect`, or the interactive `start-codex` pane
+via `[open].id` when multiple workers exist. Direct script use requires Herdr's
+own paths; do not invent storage locations:
 
 ```sh
 HERDR_PLUGIN_CONFIG_DIR=/path/to/config HERDR_PLUGIN_STATE_DIR=/path/to/state \
 python3 bin/herdr-sandbox create --id WORKER-001 --repo /path/to/source-repo --base main
 ```
+
+### One-off execute, cherry-pick, and destroy inputs
+
+Herdr 0.9.0 plugin actions have fixed command arguments. `herdr plugin action
+invoke` does not forward arguments after the action ID, so a command such as
+`herdr plugin action invoke execute -- --id WORKER-001` cannot provide
+per-invocation values. Avoid editing `config.toml` just for a one-off run.
+
+Setup/bootstrap creates an executable launcher at the plugin config directory,
+which can be found without discovering Herdr's state directory:
+
+```sh
+SANDBOX_LAUNCHER="$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox"
+
+"$SANDBOX_LAUNCHER" execute --id WORKER-001 \
+  --prompt "Implement the requested change and run the relevant tests."
+
+"$SANDBOX_LAUNCHER" cherry-pick --id WORKER-001 \
+  --commit 0123456789abcdef0123456789abcdef01234567
+
+"$SANDBOX_LAUNCHER" destroy --id WORKER-001
+```
+
+These direct invocations are one-shot overrides: each command requires all of
+its inputs and does not read that action's config table. The launcher safely
+binds the Herdr-provided config and state directories to the plugin script and
+forwards arguments directly, without shell evaluation. It still uses the same
+hardened runtime, worker-path validation, reviewed-commit range checks,
+clean-source check, and destroy ordering as the corresponding Herdr action.
+Rerun setup/bootstrap after changing the plugin installation so the launcher
+refreshes its bound script path.
+
+The plugin waits for the Codex process it starts, but it cannot add a separate
+`--wait` or status protocol to Herdr's plugin-action API. Herdr 0.9.0 controls
+whether the caller waits for and displays an action's live output. If that
+control-plane invocation is asynchronous or does not forward the stream, use
+`list` or `inspect` after the run; the persisted result and log remain the
+source of truth. Worker cleanup is unchanged: `destroy` removes the worker
+directory, including its run history.
 
 - **Podman unavailable or running as root:** repair rootless Podman and check
   `podman info --format '{{.Host.Security.Rootless}}'` returns `true`.

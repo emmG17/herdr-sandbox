@@ -80,6 +80,59 @@ class CreateTests(unittest.TestCase):
             worker = plugin.create_worker("context")
         self.assertEqual(git("-C", worker / "repo", "rev-parse", "HEAD"), self.head)
 
+    def test_copies_only_effective_source_identity_to_worker_local_config(self):
+        git("-C", self.source, "config", "--local", "--unset", "user.name")
+        git("-C", self.source, "config", "--local", "--unset", "user.email")
+        global_config = self.root / "global.gitconfig"
+        global_config.write_text(
+            '[user]\n'
+            '    name = Global Test\n'
+            '    email = global@example.invalid\n'
+            '    signingkey = host-signing-key\n'
+            '[credential]\n'
+            '    helper = store\n'
+        )
+
+        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config), "GIT_CONFIG_NOSYSTEM": "1"}):
+            worker = plugin.create_worker("identity", str(self.source))
+
+        clone = worker / "repo"
+        self.assertEqual(git("-C", clone, "config", "--local", "--get", "user.name"), "Global Test")
+        self.assertEqual(git("-C", clone, "config", "--local", "--get", "user.email"), "global@example.invalid")
+        for key in ("user.signingkey", "credential.helper"):
+            result = subprocess.run(
+                ["git", "-C", str(clone), "config", "--local", "--get", key],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, key)
+        (clone / "created.txt").write_text("worker\n")
+        subprocess.run(["git", "-C", str(clone), "add", "created.txt"], check=True)
+        subprocess.run(["git", "-C", str(clone), "commit", "-qm", "worker commit"], check=True)
+
+    def test_rejects_missing_identity_before_creating_worker(self):
+        git("-C", self.source, "config", "--local", "--unset", "user.name")
+        git("-C", self.source, "config", "--local", "--unset", "user.email")
+        missing_global = self.root / "missing.gitconfig"
+        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(missing_global), "GIT_CONFIG_NOSYSTEM": "1"}):
+            with self.assertRaisesRegex(ValueError, "Source Git identity is missing or invalid") as context:
+                plugin.create_worker("no-identity", str(self.source))
+
+        self.assertIn("user.name", str(context.exception))
+        self.assertIn("user.email", str(context.exception))
+        self.assertIn("retry worker creation", str(context.exception))
+        self.assertFalse((self.state / "workers").exists())
+
+    def test_rejects_invalid_identity_before_creating_worker(self):
+        git("-C", self.source, "config", "--local", "user.name", " ")
+        git("-C", self.source, "config", "--local", "user.email", "valid@example.invalid")
+
+        with self.assertRaisesRegex(ValueError, "Source Git identity is missing or invalid"):
+            plugin.create_worker("invalid-identity", str(self.source))
+
+        self.assertFalse((self.state / "workers").exists())
+
     def test_rejects_duplicate_without_touching_existing_worker(self):
         worker = plugin.create_worker("same", str(self.source))
         with self.assertRaisesRegex(ValueError, "already exists"):

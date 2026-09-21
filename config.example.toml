@@ -16,6 +16,10 @@ pids = 1024
 [codex]
 home = "codex"
 
+# Interactive pane worker selection for start-codex/open when several workers exist.
+# [open]
+# id = "WORKER-001"
+
 # Advanced automation: configure the fixed inputs used by the noninteractive
 # Execute Task action. The interactive quick-start workflow needs no edits here.
 # [execute]

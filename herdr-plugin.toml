@@ -27,7 +27,7 @@ command = ["python3", "bin/herdr-sandbox", "build-image"]
 id = "check"
 title = "Sandbox: Check Readiness"
 description = "Check host tools, image, and plugin-owned paths"
-command = ["python3", "bin/herdr-sandbox", "check"]
+command = ["python3", "bin/herdr-sandbox", "check", "--execution"]
 
 [[actions]]
 id = "create"
@@ -71,11 +71,11 @@ title = "Sandbox: Open Worker"
 description = "Open an interactive Podman session in a Herdr-managed pane"
 command = ["python3", "bin/herdr-sandbox", "open"]
 
-[[actions]]
+[[panes]]
 id = "start-codex"
 title = "Sandbox: Start Codex"
-description = "Start an interactive Codex session in the sole sandbox worker"
-command = ["python3", "bin/herdr-sandbox", "open", "--codex"]
+placement = "overlay"
+command = ["python3", "bin/herdr-sandbox", "start-codex"]
 
 [[actions]]
 id = "execute"

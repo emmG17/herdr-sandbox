@@ -121,6 +121,46 @@ class CherryPickTests(unittest.TestCase):
             self.assertEqual(plugin.main(), 1)
         self.assertIn("Worker ID is required", stderr.getvalue())
 
+    def test_direct_inputs_bypass_cherry_pick_config_without_bypassing_worker_function(self):
+        commit = "a" * 40
+        config_before = (self.config / "config.toml").read_bytes()
+        result = {"commit": commit, "integrated_commit": "b" * 40, "source": str(self.source)}
+        with patch.object(plugin, "cherry_pick_options", side_effect=AssertionError("direct input read config")), \
+                patch.object(plugin.sys, "argv", [
+                    str(SCRIPT), "cherry-pick", "--id", "TEST-001", "--commit", commit,
+                ]), \
+                patch.object(plugin, "cherry_pick_worker", return_value=result) as cherry_pick:
+            self.assertEqual(plugin.main(), 0)
+
+        cherry_pick.assert_called_once_with("TEST-001", commit)
+        self.assertEqual((self.config / "config.toml").read_bytes(), config_before)
+
+    def test_partial_direct_inputs_do_not_fall_back_to_cherry_pick_config(self):
+        commit = "a" * 40
+        (self.config / "config.toml").write_text(
+            plugin.DEFAULT_CONFIG + f'\n[cherry_pick]\nid = "STALE"\ncommit = "{commit}"\n'
+        )
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "cherry-pick", "--id", "TEST-001"]), \
+                patch.object(plugin.sys, "stderr", stderr), \
+                patch.object(plugin, "cherry_pick_options", side_effect=AssertionError("partial input read config")):
+            self.assertEqual(plugin.main(), 1)
+        self.assertIn("Commit is required with a direct worker ID", stderr.getvalue())
+
+    def test_direct_inputs_keep_dirty_source_safety_check(self):
+        commit = self.create_and_fetch_worker()
+        (self.source / "uncommitted.txt").write_text("leave source untouched\n")
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "argv", [
+                    str(SCRIPT), "cherry-pick", "--id", "TEST-001", "--commit", commit,
+                ]), \
+                patch.object(plugin.sys, "stderr", stderr):
+            self.assertEqual(plugin.main(), 1)
+
+        self.assertIn("uncommitted changes", stderr.getvalue())
+        self.assertEqual(git("-C", self.source, "rev-parse", "HEAD"), self.source_head)
+        self.assertEqual((self.source / "uncommitted.txt").read_text(), "leave source untouched\n")
+
     def test_manifest_exposes_cherry_pick_action(self):
         with (SCRIPT.parent.parent / "herdr-plugin.toml").open("rb") as stream:
             manifest = tomllib.load(stream)

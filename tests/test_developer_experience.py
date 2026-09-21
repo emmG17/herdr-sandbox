@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 
 
@@ -25,9 +26,16 @@ class DeveloperExperienceTests(unittest.TestCase):
             self.assertIsNone(plugin.sole_worker_id(state))
 
     def test_manifest_exposes_the_low_configuration_entrypoints(self):
+        manifest = tomllib.loads((SCRIPT.parent.parent / "herdr-plugin.toml").read_text())
+        self.assertIn("bootstrap", [action["id"] for action in manifest["actions"]])
+        self.assertNotIn("start-codex", [action["id"] for action in manifest["actions"]])
+        start_panes = [pane for pane in manifest["panes"] if pane["id"] == "start-codex"]
+        self.assertEqual(len(start_panes), 1)
+        self.assertEqual(start_panes[0]["placement"], "overlay")
+
+    def test_manifest_readiness_check_requires_execution_authentication(self):
         manifest = (SCRIPT.parent.parent / "herdr-plugin.toml").read_text()
-        self.assertIn('id = "bootstrap"', manifest)
-        self.assertIn('id = "start-codex"', manifest)
+        self.assertIn('command = ["python3", "bin/herdr-sandbox", "check", "--execution"]', manifest)
 
 
 if __name__ == "__main__":

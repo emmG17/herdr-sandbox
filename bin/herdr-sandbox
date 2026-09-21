@@ -2,14 +2,18 @@
 """Setup and readiness checks for the Herdr sandbox plugin."""
 
 import argparse
+import codecs
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import selectors
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -152,6 +156,53 @@ def context_repo():
     return repo
 
 
+def context_repo_root():
+    """Resolve Herdr's workspace context to its Git repository root."""
+    repo = context_repo()
+    if repo is None:
+        return None
+    candidate = Path(repo).expanduser().resolve()
+    if not candidate.is_dir():
+        raise ValueError(f"Herdr workspace context is not a directory: {candidate}.")
+    result = run("git", "-C", str(candidate), "rev-parse", "--show-toplevel")
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "Git could not resolve the workspace."
+        raise ValueError(f"Herdr workspace context is not a Git repository: {candidate} ({detail}).")
+    return Path(result.stdout.strip()).resolve()
+
+
+def plugin_root():
+    """Resolve the installed or linked plugin root used by setup artifacts."""
+    return Path(os.environ.get("HERDR_PLUGIN_ROOT", Path(__file__).resolve().parent.parent)).expanduser().resolve()
+
+
+def plugin_script_path():
+    script = plugin_root() / "bin" / "herdr-sandbox"
+    if not script.is_file() or script.is_symlink():
+        raise ValueError(f"Plugin script is missing or unsafe: {script}")
+    return script
+
+
+def write_launcher(config_dir, state_dir):
+    """Create the config-owned, argument-preserving direct CLI launcher."""
+    launcher = Path(config_dir) / "herdr-sandbox"
+    if launcher.is_symlink() or (launcher.exists() and not launcher.is_file()):
+        raise ValueError(f"Launcher path is not a regular file: {launcher}")
+    config_path = Path(config_dir).resolve()
+    state_path = Path(state_dir).resolve()
+    script_path = plugin_script_path()
+    launcher.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n\n"
+        f"os.environ['HERDR_PLUGIN_CONFIG_DIR'] = {json.dumps(str(config_path))}\n"
+        f"os.environ['HERDR_PLUGIN_STATE_DIR'] = {json.dumps(str(state_path))}\n"
+        f"os.execv(sys.executable, [sys.executable, {json.dumps(str(script_path))}, *sys.argv[1:]])\n"
+    )
+    launcher.chmod(0o700)
+    return launcher
+
+
 def check(repo=None, require_auth=False):
     errors = host_errors()
     try:
@@ -161,6 +212,7 @@ def check(repo=None, require_auth=False):
         if not state_dir.is_dir():
             errors.append(f"Plugin state directory is missing: {state_dir}. Run the setup action.")
         image, codex_home = load_config(config_dir)
+        runtime_settings(config_dir)
         if not codex_home.is_dir():
             errors.append(f"Dedicated Codex home is missing: {codex_home}. Run the setup action.")
         elif require_auth and not (codex_home / "auth.json").is_file():
@@ -189,12 +241,12 @@ def setup():
     image_dir.mkdir(exist_ok=True)
     boilerplate = image_dir / "Containerfile"
     if not boilerplate.exists():
-        root = Path(os.environ.get("HERDR_PLUGIN_ROOT", Path(__file__).resolve().parent.parent))
-        boilerplate.write_text((root / "Containerfile").read_text())
+        boilerplate.write_text((plugin_root() / "Containerfile").read_text())
     image, codex_home = load_config(config_dir)
     codex_home.mkdir(parents=True, exist_ok=True)
     codex_home.chmod(0o700)
-    print(f"Config: {config_file}\nImage boilerplate: {boilerplate}\nState: {state_dir}\nCodex home: {codex_home}\nImage: {image}")
+    launcher = write_launcher(config_dir, state_dir)
+    print(f"Config: {config_file}\nImage boilerplate: {boilerplate}\nLauncher: {launcher}\nState: {state_dir}\nCodex home: {codex_home}\nImage: {image}")
     print(f"Next: `herdr plugin action invoke build-image --plugin {PLUGIN_ID}`")
     print(f"Authenticate: `CODEX_HOME={codex_home} codex login --device-auth`")
 
@@ -242,6 +294,40 @@ def git(*args):
     return result.stdout.strip()
 
 
+def source_git_identity(source):
+    """Resolve and validate only the source repository's effective identity."""
+    identity = {}
+    missing = []
+    for key in ("user.name", "user.email"):
+        result = run("git", "-C", source, "config", "--get", key)
+        value = (result.stdout or "").rstrip("\n")
+        if result.returncode != 0 or not value.strip():
+            missing.append(key)
+        elif any(ord(char) < 32 or ord(char) == 127 for char in value):
+            missing.append(f"{key} (contains control characters)")
+        else:
+            identity[key] = value
+    if missing:
+        quoted_source = shlex.quote(source)
+        settings = " and ".join(f'`git -C {quoted_source} config {key} "..."`' for key in ("user.name", "user.email"))
+        detail = ", ".join(missing)
+        raise ValueError(
+            f"Source Git identity is missing or invalid ({detail}) for {source}. "
+            f"Set it locally or globally with {settings}, then retry worker creation."
+        )
+
+    identity_check = run("git", "-C", source, "var", "GIT_AUTHOR_IDENT")
+    if identity_check.returncode:
+        detail = identity_check.stderr.strip() or identity_check.stdout.strip() or "Git rejected the configured identity"
+        quoted_source = shlex.quote(source)
+        raise ValueError(
+            f"Source Git identity is invalid for {source}: {detail}. "
+            f"Set nonempty user.name and user.email with `git -C {quoted_source} config user.name ...` "
+            f"and `git -C {quoted_source} config user.email ...`, then retry worker creation."
+        )
+    return identity["user.name"], identity["user.email"]
+
+
 def validate_worker_id(worker_id):
     """Validate an ID before it is used as a worker path or container name."""
     if not isinstance(worker_id, str) or not WORKER_ID_RE.fullmatch(worker_id) or ".." in worker_id:
@@ -278,6 +364,67 @@ def worker_storage(worker_id, state_dir=None):
     if worker_dir.exists() and not worker_dir.is_dir():
         raise ValueError(f"Worker path is not a directory: {worker_dir}")
     return workers_dir, worker_dir
+
+
+def worker_source_repo(worker_id, state_dir=None):
+    """Read and validate the source repository recorded for one worker."""
+    _, worker_dir = worker_storage(worker_id, state_dir)
+    metadata_path = worker_dir / "worker.json"
+    try:
+        with metadata_path.open() as stream:
+            metadata = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid worker metadata: {metadata_path}") from exc
+    if not isinstance(metadata, dict) or metadata.get("id") != worker_id or not isinstance(metadata.get("source_repo"), str):
+        raise ValueError(f"Invalid worker metadata for {worker_id}: {metadata_path}")
+    source = Path(metadata["source_repo"]).expanduser().resolve()
+    source_error = check_source(source)
+    if source_error:
+        raise ValueError(source_error)
+    return source
+
+
+def validate_start_codex_context(worker_id):
+    """Refuse an interactive launch from a different Herdr workspace."""
+    workspace = context_repo_root()
+    if workspace is None:
+        if os.environ.get("HERDR_ENV") == "1":
+            raise ValueError(
+                "Herdr workspace context is missing; refusing to start Codex. "
+                "Invoke start-codex from the worker's source workspace."
+            )
+        return
+    source = worker_source_repo(worker_id)
+    if workspace != source:
+        raise ValueError(
+            f"Selected worker {worker_id} belongs to {source}, but the Herdr workspace is {workspace}. "
+            "Refusing to start Codex in a mismatched workspace."
+        )
+
+
+def fresh_codex_home(codex_home, worker_id):
+    """Create a disposable Codex home containing authentication but no history."""
+    auth_path = codex_home / "auth.json"
+    if auth_path.is_symlink() or not auth_path.is_file():
+        raise ValueError(f"Codex authentication is missing in {codex_home}.")
+
+    sessions_dir = codex_home / "sessions"
+    if sessions_dir.is_symlink() or (sessions_dir.exists() and not sessions_dir.is_dir()):
+        raise ValueError(f"Codex session storage is not a real directory: {sessions_dir}.")
+    sessions_dir.mkdir(mode=0o700, exist_ok=True)
+    sessions_dir.chmod(0o700)
+    session_home = Path(tempfile.mkdtemp(prefix=f"{worker_id}-", dir=sessions_dir))
+    try:
+        session_home.chmod(0o700)
+        shutil.copyfile(auth_path, session_home / "auth.json")
+        (session_home / "auth.json").chmod(0o600)
+    except (OSError, shutil.Error):
+        shutil.rmtree(session_home, ignore_errors=True)
+        raise
+    if not session_home.resolve().is_relative_to(codex_home.resolve()):
+        shutil.rmtree(session_home, ignore_errors=True)
+        raise ValueError(f"Fresh Codex home escapes plugin config directory: {session_home}.")
+    return session_home
 
 
 def _container_missing(result):
@@ -486,12 +633,16 @@ def execute_options(config_dir):
 
 
 def _write_worker_status(worker_dir, status):
+    _update_worker_metadata(worker_dir, {"status": status})
+
+
+def _update_worker_metadata(worker_dir, updates):
     metadata_path = worker_dir / "worker.json"
     with metadata_path.open() as stream:
         metadata = json.load(stream)
     if not isinstance(metadata, dict):
         raise ValueError(f"Invalid worker metadata: {metadata_path}")
-    metadata["status"] = status
+    metadata.update(updates)
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
 
@@ -527,10 +678,16 @@ class PodmanSandboxRuntime:
             invocation.append("--network=none")
         return invocation
 
-    def interactive_command(self, command=None):
+    def interactive_command(self, command=None, fresh=False):
         args = list(command or ["bash"])
         if not args or any(not isinstance(arg, str) or not arg for arg in args):
             raise ValueError("Interactive command must contain nonempty arguments.")
+        if fresh:
+            if args[0] != "codex":
+                raise ValueError("Fresh Codex sessions must start with the codex command.")
+            if any(arg == "-C" or arg == "--cd" or arg.startswith("--cd=") for arg in args[1:]):
+                raise ValueError("Fresh Codex sessions must use the worker workspace at /workspace.")
+            args = ["codex", "--cd", "/workspace", *args[1:]]
         return self._base_command(interactive=True) + [self.image] + args
 
     def noninteractive_command(self, prompt):
@@ -539,24 +696,30 @@ class PodmanSandboxRuntime:
         return self._base_command() + [self.image, "codex", "exec", "--sandbox", "danger-full-access", prompt]
 
 
-def podman_runtime(worker_id):
+def podman_runtime(worker_id, codex_home=None):
     """Create the configured runtime only after validating its permitted paths."""
     validate_worker_id(worker_id)
     config_dir, state_dir = paths()
-    image, codex_home = load_config(config_dir)
+    image, configured_codex_home = load_config(config_dir)
     network, cpus, memory, pids = runtime_settings(config_dir)
     _, worker_dir = worker_storage(worker_id, state_dir)
     repo = worker_dir / "repo"
     if not repo.is_dir() or repo.is_symlink() or not (repo / ".git").exists():
         raise ValueError(f"Worker repository does not exist: {repo}")
-    if not codex_home.is_dir() or codex_home.is_symlink():
-        raise ValueError(f"Dedicated Codex home does not exist: {codex_home}")
-    return PodmanSandboxRuntime(worker_id, image, repo, codex_home, network, cpus, memory, pids)
+    selected_codex_home = configured_codex_home if codex_home is None else Path(codex_home).expanduser().resolve()
+    if codex_home is not None and (
+        selected_codex_home == configured_codex_home
+        or not selected_codex_home.is_relative_to(configured_codex_home)
+    ):
+        raise ValueError(f"Fresh Codex home must be inside the dedicated plugin home: {selected_codex_home}")
+    if not selected_codex_home.is_dir() or selected_codex_home.is_symlink():
+        raise ValueError(f"Dedicated Codex home does not exist: {selected_codex_home}")
+    return PodmanSandboxRuntime(worker_id, image, repo, selected_codex_home, network, cpus, memory, pids)
 
 
-def open_command(worker_id, command=None):
+def open_command(worker_id, command=None, fresh=False, codex_home=None):
     """Build the central runtime's interactive invocation for a worker."""
-    return podman_runtime(worker_id).interactive_command(command)
+    return podman_runtime(worker_id, codex_home).interactive_command(command, fresh=fresh)
 
 
 def execute_command(worker_id, prompt):
@@ -564,27 +727,126 @@ def execute_command(worker_id, prompt):
     return podman_runtime(worker_id).noninteractive_command(prompt)
 
 
-def open_worker(worker_id, command=None):
+def open_worker(worker_id, command=None, fresh=False):
     """Open a terminal-attached worker session for Herdr to manage."""
     config_dir, state_dir = paths()
     _, worker_dir = worker_storage(worker_id, state_dir)
     command = list(command or ["bash"])
+    if fresh:
+        validate_start_codex_context(worker_id)
     errors = check(require_auth=command[0] == "codex")
     if errors:
         raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
-    invocation = open_command(worker_id, command)
-    _write_worker_status(worker_dir, "running")
+    session_home = None
     try:
-        result = subprocess.run(invocation, check=False)
-    except BaseException:
-        _write_worker_status(worker_dir, "failed")
-        raise
-    _write_worker_status(worker_dir, "stopped" if result.returncode == 0 else "failed")
-    return result.returncode
+        if fresh:
+            _, configured_codex_home = load_config(config_dir)
+            session_home = fresh_codex_home(configured_codex_home, worker_id)
+        invocation = open_command(worker_id, command, fresh=fresh, codex_home=session_home)
+        _write_worker_status(worker_dir, "running")
+        try:
+            result = subprocess.run(invocation, check=False)
+        except BaseException:
+            _write_worker_status(worker_dir, "failed")
+            raise
+        _write_worker_status(worker_dir, "stopped" if result.returncode == 0 else "failed")
+        return result.returncode
+    finally:
+        if session_home is not None:
+            shutil.rmtree(session_home, ignore_errors=True)
+
+
+def _execution_run_paths(worker_dir):
+    """Create an isolated durable directory for one noninteractive run."""
+    runs_dir = worker_dir / "runs"
+    runs_dir.mkdir(exist_ok=True)
+    for _ in range(10):
+        run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{uuid4().hex[:12]}"
+        run_dir = runs_dir / run_id
+        try:
+            run_dir.mkdir()
+        except FileExistsError:
+            continue
+        return run_id, run_dir / "result.json", run_dir / "output.log"
+    raise ValueError(f"Unable to allocate a unique execution result directory in {runs_dir}.")
+
+
+def _write_json(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def _start_execution_result(worker_dir, worker_id):
+    run_id, result_path, log_path = _execution_run_paths(worker_dir)
+    result = {
+        "run_id": run_id,
+        "worker_id": worker_id,
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "exit_status": None,
+        "head": None,
+        "dirty": None,
+        "git_status": None,
+        "result_location": str(result_path),
+        "log_location": str(log_path),
+        # Keep the original result field as an alias for callers of execute_worker.
+        "output_location": str(log_path),
+    }
+    _write_json(result_path, result)
+    _update_worker_metadata(worker_dir, {
+        "latest_run_id": run_id,
+        "latest_result": str(result_path.relative_to(worker_dir)),
+    })
+    return result, result_path, log_path
+
+
+def _finish_execution_result(result, result_path, **updates):
+    result.update(updates)
+    _write_json(result_path, result)
+    return result
+
+
+def _emit_process_output(name, text, log_stream, output):
+    if not text:
+        return
+    output[name].append(text)
+    log_stream.write(text)
+    log_stream.flush()
+    destination = getattr(sys, name)
+    destination.write(text)
+    destination.flush()
+
+
+def _stream_process(process, log_path):
+    """Tee both child streams to the action and a durable log until exit."""
+    output = {"stdout": [], "stderr": []}
+    streams = {
+        process.stdout: ("stdout", codecs.getincrementaldecoder("utf-8")(errors="replace")),
+        process.stderr: ("stderr", codecs.getincrementaldecoder("utf-8")(errors="replace")),
+    }
+    selector = selectors.DefaultSelector()
+    with log_path.open("w", encoding="utf-8") as log_stream:
+        for stream in streams:
+            selector.register(stream, selectors.EVENT_READ, stream)
+        try:
+            while selector.get_map():
+                for key, _ in selector.select():
+                    stream = key.fileobj
+                    name, decoder = streams[stream]
+                    chunk = os.read(stream.fileno(), 4096)
+                    if chunk:
+                        _emit_process_output(name, decoder.decode(chunk), log_stream, output)
+                        continue
+                    _emit_process_output(name, decoder.decode(b"", final=True), log_stream, output)
+                    selector.unregister(stream)
+                    stream.close()
+        finally:
+            selector.close()
+    return process.wait(), {name: "".join(value) for name, value in output.items()}
 
 
 def execute_worker(worker_id, prompt):
-    """Run one Codex prompt without a TTY or open stdin, preserving worker edits."""
+    """Run one Codex prompt with live output and a durable per-run result."""
     _, state_dir = paths()
     _, worker_dir = worker_storage(worker_id, state_dir)
     errors = check(require_auth=True)
@@ -592,42 +854,73 @@ def execute_worker(worker_id, prompt):
         raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
     invocation = execute_command(worker_id, prompt)
     _write_worker_status(worker_dir, "running")
+    result_record, result_path, log_path = _start_execution_result(worker_dir, worker_id)
+    process = None
     try:
-        result = subprocess.run(
-            invocation, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+        process = subprocess.Popen(
+            invocation,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
         )
-    except BaseException:
+        exit_status, output = _stream_process(process, log_path)
+    except BaseException as exc:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        error = f"{type(exc).__name__}: {exc}"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log_stream:
+            log_stream.write(f"\n[plugin error] {error}\n")
+        _finish_execution_result(
+            result_record,
+            result_path,
+            status="failed",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=error,
+        )
         _write_worker_status(worker_dir, "failed")
         raise
-    _write_worker_status(worker_dir, "completed" if result.returncode == 0 else "failed")
+
     repo = worker_dir / "repo"
     head_code, head, _ = _git_read(repo, "rev-parse", "HEAD")
     status_code, git_status, _ = _git_read(repo, "status", "--short")
+    status = "completed" if exit_status == 0 else "failed"
+    head_value = head if head_code == 0 else "unavailable"
+    git_status_value = git_status if status_code == 0 else "unavailable"
+    dirty_value = bool(git_status) if status_code == 0 else None
+    _finish_execution_result(
+        result_record,
+        result_path,
+        status=status,
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        exit_status=exit_status,
+        head=head_value,
+        dirty=dirty_value,
+        git_status=git_status_value,
+    )
+    _write_worker_status(worker_dir, status)
     return {
-        "worker_id": worker_id,
-        "exit_status": result.returncode,
-        "head": head if head_code == 0 else "unavailable",
-        "git_status": git_status if status_code == 0 else "unavailable",
-        "dirty": bool(git_status) if status_code == 0 else None,
-        "output_location": "Herdr action output (stdout/stderr)",
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        **result_record,
+        "stdout": output["stdout"],
+        "stderr": output["stderr"],
     }
 
 
 def print_execution_result(result):
-    """Print captured Codex output followed by an actionable worker summary."""
-    if result["stdout"]:
-        print(result["stdout"], end="")
-    if result["stderr"]:
-        print(result["stderr"], end="", file=sys.stderr)
+    """Print the final durable result summary after output was streamed live."""
+    result_location = result.get("result_location", "-")
+    log_location = result.get("log_location", result.get("output_location", "-"))
     print(
         f"Worker: {result['worker_id']}\n"
+        f"Run: {result.get('run_id', '-')}\n"
         f"Exit status: {result['exit_status']}\n"
         f"HEAD: {result['head']}\n"
         f"Dirty: {result['dirty']}\n"
         f"Git status: {result['git_status'] or 'clean'}\n"
-        f"Codex output: {result['output_location']}"
+        f"Result: {result_location}\n"
+        f"Log: {log_location}"
     )
 
 
@@ -728,6 +1021,50 @@ def _git_reality(repo, metadata):
     return reality
 
 
+def _result_path(worker_dir, value):
+    """Resolve a persisted result path without allowing it outside the worker."""
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = worker_dir / candidate
+    candidate = candidate.resolve()
+    return candidate if candidate.is_relative_to(worker_dir.resolve()) else None
+
+
+def _latest_result(worker_dir, metadata):
+    """Load the latest durable run result, including for older worker metadata."""
+    result_path = _result_path(worker_dir, metadata.get("latest_result"))
+    if result_path is None:
+        runs_dir = worker_dir / "runs"
+        candidates = list(runs_dir.glob("*/result.json")) if runs_dir.is_dir() else []
+        result_path = max(candidates, key=lambda path: path.stat().st_mtime_ns, default=None)
+    if result_path is None:
+        return None, None
+    try:
+        with result_path.open() as stream:
+            result = json.load(stream)
+        if not isinstance(result, dict):
+            raise ValueError("result must be a JSON object")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        return None, f"Invalid execution result {result_path}: {exc}"
+    result.setdefault("result_location", str(result_path))
+    if not isinstance(result.get("log_location"), str) or not result["log_location"]:
+        result["log_location"] = str(result_path.with_name("output.log"))
+    result.setdefault("output_location", result["log_location"])
+    return result, None
+
+
+def _latest_result_summary(result):
+    if not result:
+        return "-"
+    run_id = result.get("run_id", "-")
+    exit_status = _display(result.get("exit_status"))
+    head = str(result.get("head") or "-")[:12]
+    dirty = _display(result.get("dirty"))
+    return f"{run_id} exit={exit_status} HEAD={head} dirty={dirty}"
+
+
 def _worker_record(worker_dir):
     """Build a recoverable view by combining worker.json and live reality."""
     worker_id = worker_dir.name
@@ -750,6 +1087,7 @@ def _worker_record(worker_dir):
         "git_log": "",
         "git_status": "",
         "git_diff": "",
+        "latest_result": None,
         "issues": [],
     }
     if worker_dir.is_symlink() or not worker_dir.is_dir():
@@ -790,6 +1128,9 @@ def _worker_record(worker_dir):
     reality = _git_reality(worker_dir / "repo", metadata)
     record.update({key: reality[key] for key in ("head", "dirty", "git_log", "git_status", "git_diff")})
     record["issues"].extend(reality["issues"])
+    record["latest_result"], result_issue = _latest_result(worker_dir, metadata)
+    if result_issue:
+        record["issues"].append(result_issue)
     if reality["branch"]:
         actual_branch = reality["branch"]
         if record["metadata_branch"] != "-" and record["metadata_branch"] != actual_branch:
@@ -852,12 +1193,13 @@ def _display(value, missing="-"):
 
 
 def format_workers(records):
-    columns = ("ID", "REPOSITORY", "BASE", "BRANCH", "STATUS", "CREATED", "HEAD", "DIRTY", "CONTAINER")
+    columns = ("ID", "REPOSITORY", "BASE", "BRANCH", "STATUS", "CREATED", "HEAD", "DIRTY", "CONTAINER", "LATEST")
     rows = [columns]
     for record in records:
         rows.append((
             record["id"], record["repository"], record["base_ref"], record["branch"], record["status"],
             record["created_at"], (record["head"] or "-")[:12], _display(record["dirty"]), record["container"],
+            _latest_result_summary(record.get("latest_result")),
         ))
     if len(rows) == 1:
         return "No sandbox workers found."
@@ -880,6 +1222,18 @@ def format_worker(record):
         f"HEAD: {record['head'] or '-'}",
         f"Dirty: {_display(record['dirty'])}",
     ]
+    latest = record.get("latest_result")
+    if latest:
+        lines.extend([
+            "Latest result:",
+            f"  Run: {latest.get('run_id', '-')}",
+            f"  Status: {latest.get('status', '-')}",
+            f"  Exit status: {_display(latest.get('exit_status'))}",
+            f"  HEAD: {latest.get('head') or '-'}",
+            f"  Dirty: {_display(latest.get('dirty'))}",
+            f"  Result: {latest.get('result_location', '-')}",
+            f"  Log: {latest.get('log_location', '-')}",
+        ])
     if record["issues"]:
         lines.extend(["Issues:"] + [f"- {issue}" for issue in record["issues"]])
     lines.extend([
@@ -924,6 +1278,39 @@ def destroy_options(config_dir):
     return options
 
 
+def resolve_execute_inputs(worker_id, prompt, config_dir):
+    """Resolve one complete invocation or the configured Herdr action inputs.
+
+    A one-shot invocation must provide both values. Refusing to combine a
+    direct value with a configured value prevents a stale config entry from
+    silently changing the meaning of an invocation.
+    """
+    supplied = worker_id is not None or prompt is not None
+    if supplied:
+        if worker_id is None:
+            raise ValueError("Worker ID is required with a direct task prompt. Pass `execute --id WORKER_ID --prompt PROMPT`.")
+        if prompt is None:
+            raise ValueError("Task prompt is required with a direct worker ID. Pass `execute --id WORKER_ID --prompt PROMPT`.")
+        return worker_id, prompt
+
+    options = execute_options(config_dir)
+    return options.get("id"), options.get("prompt")
+
+
+def resolve_cherry_pick_inputs(worker_id, commit, config_dir):
+    """Resolve one complete integration request or configured action inputs."""
+    supplied = worker_id is not None or commit is not None
+    if supplied:
+        if worker_id is None:
+            raise ValueError("Worker ID is required with a direct commit. Pass `cherry-pick --id WORKER_ID --commit COMMIT`.")
+        if commit is None:
+            raise ValueError("Commit is required with a direct worker ID. Pass `cherry-pick --id WORKER_ID --commit COMMIT`.")
+        return worker_id, commit
+
+    options = cherry_pick_options(config_dir)
+    return options.get("id"), options.get("commit")
+
+
 def create_worker(worker_id, repo=None, base_ref="HEAD"):
     validate_worker_id(worker_id)
     branch = f"agent/{worker_id}"
@@ -939,6 +1326,7 @@ def create_worker(worker_id, repo=None, base_ref="HEAD"):
     source_root = Path(git("-C", source, "rev-parse", "--show-toplevel")).resolve()
     if source_root != source:
         source = source_root
+    user_name, user_email = source_git_identity(str(source))
     commit = git("-C", source, "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}")
     errors = check(str(source))
     if errors:
@@ -961,6 +1349,8 @@ def create_worker(worker_id, repo=None, base_ref="HEAD"):
     try:
         clone = destination / "repo"
         git("clone", "--local", "--no-hardlinks", "--no-checkout", source, clone)
+        git("-C", clone, "config", "--local", "user.name", user_name)
+        git("-C", clone, "config", "--local", "user.email", user_email)
         git("-C", clone, "switch", "--detach", commit)
         git("-C", clone, "switch", "-c", branch)
         metadata = {
@@ -1012,6 +1402,8 @@ def main():
     open_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
     open_parser.add_argument("--codex", action="store_true", help="Start Codex instead of the default shell")
     open_parser.add_argument("session_command", nargs=argparse.REMAINDER, help="Command and arguments to run in the worker")
+    start_parser = commands.add_parser("start-codex", help="Start a fresh Codex session in a sandbox worker")
+    start_parser.add_argument("--id", help="Worker ID (or configure [open].id)")
     execute_parser = commands.add_parser("execute", help="Run one noninteractive Codex task in a sandbox worker")
     execute_parser.add_argument("worker_id", nargs="?", help="Worker ID")
     execute_parser.add_argument("prompt", nargs="?", help="Task prompt")
@@ -1050,12 +1442,8 @@ def main():
             worker_id = configured_or_sole_worker(args.id, config_dir, fetch_options, "fetch")
             print(format_fetch_result(fetch_worker(worker_id)))
         elif args.command == "cherry-pick":
-            worker_id, commit = args.id, args.commit
-            if worker_id is None or commit is None:
-                config_dir, _ = paths()
-                options = cherry_pick_options(config_dir)
-                worker_id = worker_id or options.get("id")
-                commit = commit or options.get("commit")
+            config_dir, _ = paths()
+            worker_id, commit = resolve_cherry_pick_inputs(args.id, args.commit, config_dir)
             if not worker_id:
                 raise ValueError("Worker ID is required. Pass `cherry-pick --id WORKER_ID --commit COMMIT` or set [cherry_pick].id in the plugin config.")
             if not commit:
@@ -1093,15 +1481,18 @@ def main():
             config_dir, _ = paths()
             worker_id = configured_or_sole_worker(args.worker_id or args.option_worker_id, config_dir, open_options, "open")
             command = args.session_command or (["codex"] if args.codex else ["bash"])
+            if command and command[0] == "codex":
+                return open_worker(worker_id, command, fresh=True)
             return open_worker(worker_id, command)
+        elif args.command == "start-codex":
+            config_dir, _ = paths()
+            worker_id = configured_or_sole_worker(args.id, config_dir, open_options, "start-codex")
+            return open_worker(worker_id, ["codex"], fresh=True)
         elif args.command == "execute":
-            worker_id = args.worker_id or args.option_worker_id
-            prompt = args.prompt or args.option_prompt
-            if not worker_id or not prompt:
-                config_dir, _ = paths()
-                options = execute_options(config_dir)
-                worker_id = worker_id or options.get("id")
-                prompt = prompt or options.get("prompt")
+            worker_id = args.worker_id if args.worker_id is not None else args.option_worker_id
+            prompt = args.prompt if args.prompt is not None else args.option_prompt
+            config_dir, _ = paths()
+            worker_id, prompt = resolve_execute_inputs(worker_id, prompt, config_dir)
             if not worker_id:
                 raise ValueError("Worker ID is required. Pass `execute WORKER_ID PROMPT` or set [execute].id in the plugin config.")
             if not prompt:

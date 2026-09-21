@@ -41,11 +41,19 @@ herdr plugin action invoke check --plugin dev.herdr.sandbox
 2. Start Codex interactively to carry out the task, or use configured noninteractive execution. Give Codex a bounded task and require it to commit its completed change in the worker clone.
 
    ```sh
-   herdr plugin action invoke start-codex --plugin dev.herdr.sandbox
+   herdr plugin pane open --plugin dev.herdr.sandbox --entrypoint start-codex --placement overlay
    # Noninteractive: configure [execute].id and [execute].prompt in config.toml,
    # then invoke `execute`.
    herdr plugin action invoke execute --plugin dev.herdr.sandbox
    ```
+
+   Noninteractive output is streamed while Codex runs. Each invocation also
+   persists `runs/<run-id>/result.json` and `runs/<run-id>/output.log` below the
+   worker directory; `list` and `inspect` show a compact summary of the latest
+   result. The plugin waits for the Codex child process, but does not invent a
+   Herdr 0.9.0 `--wait` or status extension. If the Herdr action invocation is
+   asynchronous or does not forward live output, inspect the persisted result
+   and log after the run.
 
 3. Inspect the worker before bringing anything back. Validate the commit, status, tests, and diff against the requested task.
 
@@ -78,7 +86,15 @@ herdr plugin action invoke check --plugin dev.herdr.sandbox
 
 ## Worker selection and configuration
 
-With multiple workers, configure the action-specific `id` in the plugin config at `$(herdr plugin config-dir dev.herdr.sandbox)/config.toml`: `[fetch]`, `[inspect]`, `[open]`, `[execute]`, `[cherry_pick]`, or `[destroy]`. Use `list` to recover IDs and lifecycle state.
+With multiple workers, configure worker IDs in the plugin config at `$(herdr plugin config-dir dev.herdr.sandbox)/config.toml`: `[fetch]`, `[inspect]`, `[open]`, `[execute]`, `[cherry_pick]`, or `[destroy]`. `[open].id` selects the worker for the interactive `start-codex` pane. Use `list` to recover IDs and lifecycle state.
+
+Herdr 0.9.0 runs plugin actions in their invoking workspace and cannot let an
+action dynamically create or move its own pane. Use the manifest `start-codex`
+pane entrypoint for an interactive Herdr pane, and invoke it from the selected
+worker's source workspace. The plugin refuses a `workspace_cwd` mismatch. The
+Podman worker still mounts the selected clone at `/workspace`; interactive
+start-codex sessions use a temporary Codex home with only authentication, while
+the noninteractive execute action keeps its shared dedicated home.
 
 Set `[runtime].network = "offline"` only for self-contained tasks. Use the default `"online"` mode for model access or dependency installation. Customize project dependencies in the plugin-owned `image/Containerfile` and run `build-image`; the source repository and credentials are deliberately outside that build context.
 
