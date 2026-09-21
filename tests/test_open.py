@@ -34,6 +34,7 @@ class OpenWorkerTests(unittest.TestCase):
         self.env = patch.dict(os.environ, {
             "HERDR_PLUGIN_CONFIG_DIR": str(self.config),
             "HERDR_PLUGIN_STATE_DIR": str(self.state),
+            "HERDR_ENV": "",
         })
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -213,6 +214,138 @@ class OpenWorkerTests(unittest.TestCase):
         self.assertEqual(podman_calls, [])
         metadata = json.loads((worker / "worker.json").read_text())
         self.assertEqual(metadata["status"], "created")
+
+    def test_open_worker_validates_workspace_for_default_shell(self):
+        root = Path(self.temp.name)
+        landing_page = self._git_repo(root / "landing-page-1")
+        plugin_development = self._git_repo(root / "plugin-development")
+        worker = self.state / "workers" / "TEST-001"
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "source_repo": str(landing_page),
+        }))
+        with patch.dict(os.environ, {
+            "HERDR_ENV": "1",
+            "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_cwd": str(plugin_development)}),
+        }):
+            with self.assertRaisesRegex(ValueError, "mismatched workspace"):
+                plugin.open_worker("TEST-001", ["bash"])
+
+    def test_open_action_refuses_an_explicit_worker_from_a_different_workspace(self):
+        root = Path(self.temp.name)
+        landing_page = self._git_repo(root / "landing-page-1")
+        plugin_development = self._git_repo(root / "plugin-development")
+        worker = self.state / "workers" / "TEST-001"
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "source_repo": str(landing_page),
+        }))
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "open", "--id", "TEST-001"]), \
+                patch.object(plugin, "open_worker") as open_worker:
+            with patch.dict(os.environ, {
+                "HERDR_ENV": "1",
+                "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_cwd": str(plugin_development)}),
+            }):
+                self.assertEqual(plugin.main(), 1)
+        open_worker.assert_not_called()
+
+    def test_open_action_selects_sole_worker_in_current_workspace(self):
+        root = Path(self.temp.name)
+        landing_page = self._git_repo(root / "landing-page-1")
+        worker = self.state / "workers" / "TEST-001"
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "source_repo": str(landing_page),
+        }))
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "open"]), \
+                patch.object(plugin, "open_worker", return_value=0) as open_worker:
+            with patch.dict(os.environ, {
+                "HERDR_ENV": "1",
+                "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_cwd": str(landing_page)}),
+            }):
+                self.assertEqual(plugin.main(), 0)
+        open_worker.assert_called_once_with("TEST-001", ["bash"])
+
+    def test_open_action_requires_id_when_workspace_has_multiple_workers(self):
+        root = Path(self.temp.name)
+        landing_page = self._git_repo(root / "landing-page-1")
+        for worker_id in ("TEST-001", "TEST-002"):
+            worker = self.state / "workers" / worker_id
+            if worker_id == "TEST-002":
+                (worker / "repo" / ".git").mkdir(parents=True)
+            (worker / "worker.json").write_text(json.dumps({
+                "id": worker_id, "status": "created", "source_repo": str(landing_page),
+            }))
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "open"]), \
+                patch.object(plugin, "open_worker") as open_worker:
+            with patch.dict(os.environ, {
+                "HERDR_ENV": "1",
+                "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_cwd": str(landing_page)}),
+            }):
+                self.assertEqual(plugin.main(), 1)
+        open_worker.assert_not_called()
+
+    def test_open_action_fails_when_herdr_context_is_missing(self):
+        worker = self.state / "workers" / "TEST-001"
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created",
+        }))
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "open"]), \
+                patch.object(plugin, "open_worker") as open_worker:
+            with patch.dict(os.environ, {"HERDR_ENV": "1"}):
+                self.assertEqual(plugin.main(), 1)
+        open_worker.assert_not_called()
+
+    def test_open_action_does_not_select_worker_from_unrelated_workspace(self):
+        root = Path(self.temp.name)
+        landing_page = self._git_repo(root / "landing-page-1")
+        plugin_development = self._git_repo(root / "plugin-development")
+        worker = self.state / "workers" / "TEST-001"
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "source_repo": str(landing_page),
+        }))
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "open"]), \
+                patch.object(plugin, "open_worker") as open_worker:
+            with patch.dict(os.environ, {
+                "HERDR_ENV": "1",
+                "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_cwd": str(plugin_development)}),
+            }):
+                self.assertEqual(plugin.main(), 1)
+        open_worker.assert_not_called()
+
+    def test_open_action_refuses_configured_worker_from_a_different_workspace(self):
+        root = Path(self.temp.name)
+        landing_page = self._git_repo(root / "landing-page-1")
+        plugin_development = self._git_repo(root / "plugin-development")
+        worker = self.state / "workers" / "TEST-001"
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "source_repo": str(landing_page),
+        }))
+        (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + "\n[open]\nid = \"TEST-001\"\n")
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "open"]), \
+                patch.object(plugin, "open_worker") as open_worker:
+            with patch.dict(os.environ, {
+                "HERDR_ENV": "1",
+                "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_cwd": str(plugin_development)}),
+            }):
+                self.assertEqual(plugin.main(), 1)
+        open_worker.assert_not_called()
+
+    def test_start_codex_requires_id_when_workspace_has_multiple_workers(self):
+        root = Path(self.temp.name)
+        landing_page = self._git_repo(root / "landing-page-1")
+        for worker_id in ("TEST-001", "TEST-002"):
+            worker = self.state / "workers" / worker_id
+            if worker_id == "TEST-002":
+                (worker / "repo" / ".git").mkdir(parents=True)
+            (worker / "worker.json").write_text(json.dumps({
+                "id": worker_id, "status": "created", "source_repo": str(landing_page),
+            }))
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "start-codex"]), \
+                patch.object(plugin, "open_worker") as open_worker:
+            with patch.dict(os.environ, {
+                "HERDR_ENV": "1",
+                "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"workspace_cwd": str(landing_page)}),
+            }):
+                self.assertEqual(plugin.main(), 1)
+        open_worker.assert_not_called()
 
 
 if __name__ == "__main__":

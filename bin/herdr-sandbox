@@ -384,21 +384,21 @@ def worker_source_repo(worker_id, state_dir=None):
     return source
 
 
-def validate_start_codex_context(worker_id):
+def validate_open_context(worker_id):
     """Refuse an interactive launch from a different Herdr workspace."""
     workspace = context_repo_root()
     if workspace is None:
         if os.environ.get("HERDR_ENV") == "1":
             raise ValueError(
-                "Herdr workspace context is missing; refusing to start Codex. "
-                "Invoke start-codex from the worker's source workspace."
+                "Herdr workspace context is missing; refusing to open worker. "
+                "Invoke this action from the worker's source workspace."
             )
         return
     source = worker_source_repo(worker_id)
     if workspace != source:
         raise ValueError(
             f"Selected worker {worker_id} belongs to {source}, but the Herdr workspace is {workspace}. "
-            "Refusing to start Codex in a mismatched workspace."
+            "Refusing to open a worker in a mismatched workspace."
         )
 
 
@@ -495,6 +495,65 @@ def configured_or_sole_worker(worker_id, config_dir, option_loader, action):
         f"Worker ID is required when there is not exactly one worker. "
         f"Pass `{action} --id WORKER_ID` or set the action's id in the plugin config."
     )
+
+
+def workspace_sole_worker_id(workspace, state_dir=None):
+    """Return the only worker in the given workspace, or None when ambiguous.
+
+    Invalid worker entries are ignored so a single valid worker in scope still
+    resolves. When workspace is None, any valid worker qualifies (direct-launcher
+    use without Herdr context).
+    """
+    workers_dir = state_workers_dir(state_dir)
+    if not workers_dir.is_dir() or workers_dir.is_symlink():
+        return None
+    candidates = []
+    for entry in workers_dir.iterdir():
+        if not entry.is_dir() or entry.is_symlink() or not WORKER_ID_RE.fullmatch(entry.name):
+            continue
+        if workspace is not None:
+            try:
+                source = worker_source_repo(entry.name, state_dir)
+            except ValueError:
+                continue
+            if source != workspace:
+                continue
+        candidates.append(entry.name)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _require_open_worker_id(reason):
+    raise ValueError(
+        f"Worker ID is required when {reason}. "
+        "Pass `--id WORKER_ID` or set [open].id in the plugin config."
+    )
+
+
+def resolve_open_worker(worker_id, config_dir):
+    """Resolve the worker for an interactive open, scoping fallback to the workspace.
+
+    Explicit IDs and configured [open].id are validated against the current
+    workspace; the sole-worker fallback only considers workers that belong to
+    that workspace. This keeps an unrelated worker in another workspace from
+    being selected when no ID is supplied, and ensures no pane is created when
+    the context is stale, missing, or ambiguous.
+    """
+    if worker_id:
+        validate_open_context(worker_id)
+        return worker_id
+    configured = open_options(config_dir).get("id")
+    if configured:
+        validate_open_context(configured)
+        return configured
+    _, state_dir = paths()
+    workspace = context_repo_root()
+    selected = workspace_sole_worker_id(workspace, state_dir)
+    if selected:
+        validate_open_context(selected)
+        return selected
+    if workspace is not None:
+        _require_open_worker_id("the current workspace has no sandbox worker")
+    _require_open_worker_id("there is not exactly one worker")
 
 
 def fetch_worker(worker_id, state_dir=None):
@@ -731,9 +790,8 @@ def open_worker(worker_id, command=None, fresh=False):
     """Open a terminal-attached worker session for Herdr to manage."""
     config_dir, state_dir = paths()
     _, worker_dir = worker_storage(worker_id, state_dir)
+    validate_open_context(worker_id)
     command = list(command or ["bash"])
-    if fresh:
-        validate_start_codex_context(worker_id)
     errors = check(require_auth=command[0] == "codex")
     if errors:
         raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
@@ -1479,14 +1537,14 @@ def main():
                 print(format_worker(record))
         elif args.command == "open":
             config_dir, _ = paths()
-            worker_id = configured_or_sole_worker(args.worker_id or args.option_worker_id, config_dir, open_options, "open")
+            worker_id = resolve_open_worker(args.worker_id or args.option_worker_id, config_dir)
             command = args.session_command or (["codex"] if args.codex else ["bash"])
             if command and command[0] == "codex":
                 return open_worker(worker_id, command, fresh=True)
             return open_worker(worker_id, command)
         elif args.command == "start-codex":
             config_dir, _ = paths()
-            worker_id = configured_or_sole_worker(args.id, config_dir, open_options, "start-codex")
+            worker_id = resolve_open_worker(args.id, config_dir)
             return open_worker(worker_id, ["codex"], fresh=True)
         elif args.command == "execute":
             worker_id = args.worker_id if args.worker_id is not None else args.option_worker_id
