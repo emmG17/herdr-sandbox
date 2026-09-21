@@ -24,6 +24,8 @@ WORKER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 LIFECYCLE_STATES = {"created", "running", "stopped", "completed", "failed"}
 DEFAULT_CONFIG = (Path(__file__).resolve().parent.parent / "config.example.toml").read_text()
 DEFAULT_BASE_IMAGE = "node:22-bookworm-slim"
+SUPPORTED_PANE_PLACEMENTS = {"overlay", "split", "tab"}
+SPLIT_DIRECTIONS = {"right", "down"}
 
 
 def paths():
@@ -786,6 +788,73 @@ def execute_command(worker_id, prompt):
     return podman_runtime(worker_id).noninteractive_command(prompt)
 
 
+def resolve_pane_placement(placement, target_pane, direction):
+    """Validate and normalize a pane placement request.
+
+    Herdr's plugin.pane.open API accepts placement and an optional
+    target_pane_id. Herdr's CLI exposes this as --target-pane. This helper
+    enforces one consistent contract for the plugin launcher: overlay targets
+    the active pane and must not receive a target; split requires both a target
+    pane and a direction; tab opens in a new tab and must not receive a target.
+    """
+    if placement is None:
+        placement = "overlay"
+    placement = placement.lower()
+    if placement not in SUPPORTED_PANE_PLACEMENTS:
+        raise ValueError(
+            f"Unsupported placement '{placement}'. "
+            f"Use one of: {', '.join(sorted(SUPPORTED_PANE_PLACEMENTS))}."
+        )
+
+    if placement in {"overlay", "tab"}:
+        if target_pane is not None:
+            raise ValueError(
+                f"{placement} placement does not accept --target-pane. "
+                "Use split with --target-pane and --direction."
+            )
+        if direction is not None:
+            raise ValueError(
+                f"{placement} placement does not accept --direction. "
+                "Use split with --target-pane and --direction."
+            )
+        return placement, None, None
+
+    if target_pane is None:
+        raise ValueError(
+            "split placement requires a target pane. "
+            "Pass --target-pane PANE (for example, w1:p1) and --direction right|down."
+        )
+    if direction is None:
+        raise ValueError(
+            "split placement requires a direction. "
+            "Pass --direction right or --direction down with --target-pane."
+        )
+    direction = direction.lower()
+    if direction not in SPLIT_DIRECTIONS:
+        raise ValueError(
+            f"Unsupported split direction '{direction}'. "
+            f"Use one of: {', '.join(sorted(SPLIT_DIRECTIONS))}."
+        )
+    return placement, target_pane, direction
+
+
+def build_herdr_pane_open_command(placement, target_pane, direction):
+    """Build the herdr plugin pane open invocation using the canonical CLI flag."""
+    placement, target_pane, direction = resolve_pane_placement(placement, target_pane, direction)
+    herdr_bin = os.environ.get("HERDR_BIN_PATH", "herdr")
+    command = [
+        herdr_bin, "plugin", "pane", "open",
+        "--plugin", PLUGIN_ID,
+        "--entrypoint", "start-codex",
+        "--placement", placement,
+    ]
+    if target_pane is not None:
+        command.extend(["--target-pane", target_pane])
+    if direction is not None:
+        command.extend(["--direction", direction])
+    return command
+
+
 def open_worker(worker_id, command=None, fresh=False):
     """Open a terminal-attached worker session for Herdr to manage."""
     config_dir, state_dir = paths()
@@ -1462,6 +1531,10 @@ def main():
     open_parser.add_argument("session_command", nargs=argparse.REMAINDER, help="Command and arguments to run in the worker")
     start_parser = commands.add_parser("start-codex", help="Start a fresh Codex session in a sandbox worker")
     start_parser.add_argument("--id", help="Worker ID (or configure [open].id)")
+    pane_open_parser = commands.add_parser("pane-open", help="Open the start-codex pane through Herdr with validated placement")
+    pane_open_parser.add_argument("--placement", help="Pane placement: overlay, split, or tab (default: overlay)")
+    pane_open_parser.add_argument("--target-pane", help="Target pane for split placement (for example, w1:p1)")
+    pane_open_parser.add_argument("--direction", help="Split direction: right or down")
     execute_parser = commands.add_parser("execute", help="Run one noninteractive Codex task in a sandbox worker")
     execute_parser.add_argument("worker_id", nargs="?", help="Worker ID")
     execute_parser.add_argument("prompt", nargs="?", help="Task prompt")
@@ -1546,6 +1619,9 @@ def main():
             config_dir, _ = paths()
             worker_id = resolve_open_worker(args.id, config_dir)
             return open_worker(worker_id, ["codex"], fresh=True)
+        elif args.command == "pane-open":
+            command = build_herdr_pane_open_command(args.placement, args.target_pane, args.direction)
+            return subprocess.run(command, check=False).returncode
         elif args.command == "execute":
             worker_id = args.worker_id if args.worker_id is not None else args.option_worker_id
             prompt = args.prompt if args.prompt is not None else args.option_prompt

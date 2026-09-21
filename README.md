@@ -128,6 +128,42 @@ Herdr reports a different `workspace_cwd` than the selected worker's recorded
 source repository, the plugin refuses to launch instead of exposing that
 workspace's task.
 
+### Pane placement
+
+The supported placements for `start-codex` are `overlay`, `split`, and `tab`.
+The canonical target option is `--target-pane PANE`; this is the same value
+Herdr's plugin.pane.open API sends as `target_pane_id`. The CLI flag and the
+API field name the same concept, so use `--target-pane` in both the Herdr CLI
+and the plugin launcher.
+
+- `overlay` (default) opens over the active pane. It does not accept a target
+  pane or direction.
+- `split` opens next to a specific pane. It requires both `--target-pane` and
+  `--direction right|down`.
+- `tab` opens in a new tab. It does not accept a target pane or direction.
+
+Examples:
+
+```sh
+# Overlay over the active pane (default)
+herdr plugin pane open --plugin dev.herdr.sandbox --entrypoint start-codex --placement overlay
+
+# Split an existing pane
+herdr plugin pane open --plugin dev.herdr.sandbox --entrypoint start-codex \
+  --placement split --target-pane w1:p1 --direction right
+
+# New tab
+herdr plugin pane open --plugin dev.herdr.sandbox --entrypoint start-codex --placement tab
+```
+
+You can also use the plugin launcher, which validates the placement contract
+before calling Herdr:
+
+```sh
+SANDBOX_LAUNCHER="$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox"
+"$SANDBOX_LAUNCHER" pane-open --placement split --target-pane w1:p1 --direction right
+```
+
 The Podman command is independent of Herdr's pane cwd: it mounts only the
 selected worker clone at `/workspace`, sets the container workdir to
 `/workspace`, and starts Codex with `--cd /workspace`. Each interactive
