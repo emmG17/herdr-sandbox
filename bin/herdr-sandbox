@@ -1512,27 +1512,37 @@ def _atomic_write_json(path, data):
 
 
 def _get_pane_context():
-    """Extract pane and workspace IDs from environment."""
+    """Extract pane, workspace IDs, and socket path from environment."""
     pane_id = os.environ.get("HERDR_PANE_ID", "").strip()
     workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
-    return (pane_id if pane_id else None), (workspace_id if workspace_id else None)
+    socket_path = os.environ.get("HERDR_SOCKET_PATH", "").strip()
+    return (
+        pane_id if pane_id else None,
+        workspace_id if workspace_id else None,
+        socket_path if socket_path else None,
+    )
 
 
 def find_reusable_worker(source_repo, agent, state_dir=None):
-    """Find an existing worker that matches the reuse key (pane, repo, agent).
+    """Find an existing worker that matches the reuse key (pane, socket, repo, agent).
     
-    Returns None if no pane ID is available or no matching worker exists.
-    According to the spike findings, pane IDs are stable and never reused,
-    so a matching pane ID is a reliable reuse key.
+    Returns a tuple: (worker_id or None, head_moved_notice or None)
+    
+    The reuse key includes socket_path to prevent collision when multiple Herdr
+    servers run simultaneously (verified with Herdr 0.9.5: two servers can both
+    have w1:p1 but with different HERDR_SOCKET_PATH values).
+    
+    If a matching worker is found but source HEAD has moved, the worker is still
+    reused (to preserve any uncommitted work), but a notice is returned.
     """
-    pane_id, _ = _get_pane_context()
+    pane_id, _, socket_path = _get_pane_context()
     if not pane_id:
-        return None
+        return None, None
     
     source_repo = Path(source_repo).expanduser().resolve()
     workers_dir = state_workers_dir(state_dir)
     if not workers_dir.is_dir():
-        return None
+        return None, None
     
     for entry in workers_dir.iterdir():
         if not entry.is_dir() or entry.is_symlink():
@@ -1552,10 +1562,13 @@ def find_reusable_worker(source_repo, agent, state_dir=None):
                 continue
             
             recorded_pane = metadata.get("pane_id")
+            recorded_socket = metadata.get("socket_path")
             recorded_repo = metadata.get("source_repo")
             recorded_agent = metadata.get("agent")
             
             if recorded_pane != pane_id:
+                continue
+            if recorded_socket != socket_path:
                 continue
             if recorded_agent != agent:
                 continue
@@ -1566,11 +1579,25 @@ def find_reusable_worker(source_repo, agent, state_dir=None):
             if recorded_repo_path != source_repo:
                 continue
             
-            return entry.name
+            # Check if source HEAD has moved since worker's base commit
+            head_moved_notice = None
+            base_commit = metadata.get("base_commit")
+            if base_commit and isinstance(base_commit, str):
+                try:
+                    current_head = git("-C", source_repo, "rev-parse", "HEAD")
+                    if current_head != base_commit:
+                        head_moved_notice = (
+                            f"Notice: reusing worker {entry.name}; source HEAD has moved from "
+                            f"{base_commit[:12]} to {current_head[:12]}. The worker is based on the original commit."
+                        )
+                except (ValueError, subprocess.CalledProcessError):
+                    pass
+            
+            return entry.name, head_moved_notice
         except (OSError, json.JSONDecodeError, ValueError):
             continue
     
-    return None
+    return None, None
 
 
 def create_options(config_dir):
@@ -1699,7 +1726,7 @@ def create_worker(worker_id, repo=None, base_ref="HEAD", agent="codex"):
             git("-C", clone, "switch", "--detach", commit)
             git("-C", clone, "switch", "-c", branch)
             
-            pane_id, workspace_id = _get_pane_context()
+            pane_id, workspace_id, socket_path = _get_pane_context()
             
             metadata = {
                 "id": worker_id,
@@ -1707,6 +1734,7 @@ def create_worker(worker_id, repo=None, base_ref="HEAD", agent="codex"):
                 "agent": agent,
                 "pane_id": pane_id,
                 "workspace_id": workspace_id,
+                "socket_path": socket_path,
                 "base_ref": base_ref,
                 "base_commit": commit,
                 "branch": branch,
