@@ -3,11 +3,13 @@
 
 import argparse
 import codecs
+import fcntl
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import secrets
 import selectors
 import shlex
 import shutil
@@ -21,11 +23,12 @@ from uuid import uuid4
 
 PLUGIN_ID = "dev.herdr.sandbox"
 WORKER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-LIFECYCLE_STATES = {"created", "running", "stopped", "completed", "failed"}
+LIFECYCLE_STATES = {"created", "running", "stopped", "completed", "failed", "fetched"}
 DEFAULT_CONFIG = (Path(__file__).resolve().parent.parent / "config.example.toml").read_text()
 DEFAULT_BASE_IMAGE = "node:22-bookworm-slim"
 SUPPORTED_PANE_PLACEMENTS = {"overlay", "split", "tab"}
 SPLIT_DIRECTIONS = {"right", "down"}
+MAX_WORKER_ID_LENGTH = 64
 
 
 def paths():
@@ -559,7 +562,12 @@ def resolve_open_worker(worker_id, config_dir):
 
 
 def fetch_worker(worker_id, state_dir=None):
-    """Fetch a worker branch into its source repository for later review."""
+    """Fetch a worker branch into its source repository for later review.
+    
+    Fetches the worker's branch into refs/heads/sandbox/<id> in the source
+    repository. If the source repository HEAD has moved past the worker's
+    base commit, prints a notice but proceeds with the fetch as-is.
+    """
     _, worker_dir = worker_storage(worker_id, state_dir)
     repo = worker_dir / "repo"
     metadata_path = worker_dir / "worker.json"
@@ -578,22 +586,61 @@ def fetch_worker(worker_id, state_dir=None):
         raise ValueError(source_error)
     source = Path(git("-C", source, "rev-parse", "--show-toplevel")).resolve()
     branch = f"agent/{validate_worker_id(worker_id)}"
+    sandbox_branch = f"sandbox/{worker_id}"
     base_commit = metadata.get("base_commit")
     if not isinstance(base_commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", base_commit):
         raise ValueError(f"Worker metadata has no valid base commit: {metadata_path}")
 
-    git("-C", source, "fetch", "--no-tags", "--", repo, f"refs/heads/{branch}")
-    commit = git("-C", source, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
-    changed_files = [name for name in git("-C", source, "diff", "--no-ext-diff", "--name-only", f"{base_commit}...FETCH_HEAD").splitlines() if name]
-    diff_stat = git("-C", source, "diff", "--no-ext-diff", "--stat", f"{base_commit}...FETCH_HEAD")
-    return {"commit": commit, "changed_files": changed_files, "diff_stat": diff_stat}
+    current_head = git("-C", source, "rev-parse", "HEAD")
+    head_moved = current_head != base_commit
+    
+    git("-C", source, "fetch", "--no-tags", "--force", "--", repo, f"refs/heads/{branch}:refs/heads/{sandbox_branch}")
+    commit = git("-C", source, "rev-parse", "--verify", f"refs/heads/{sandbox_branch}^{{commit}}")
+    changed_files = [name for name in git("-C", source, "diff", "--no-ext-diff", "--name-only", f"{base_commit}...{sandbox_branch}").splitlines() if name]
+    diff_stat = git("-C", source, "diff", "--no-ext-diff", "--stat", f"{base_commit}...{sandbox_branch}")
+    
+    _update_worker_metadata(worker_dir, {
+        "status": "fetched",
+        "result_branch": sandbox_branch,
+        "fetched_commit": commit,
+    })
+    
+    result = {
+        "commit": commit,
+        "branch": sandbox_branch,
+        "changed_files": changed_files,
+        "diff_stat": diff_stat,
+        "base_commit": base_commit,
+        "current_head": current_head,
+        "head_moved": head_moved,
+    }
+    
+    if head_moved:
+        result["head_moved_notice"] = (
+            f"Notice: source HEAD has moved from {base_commit[:12]} to {current_head[:12]}. "
+            f"The worker result is based on the original base commit."
+        )
+    
+    return result
 
 
 def format_fetch_result(result):
     """Format the fetched commit and review summary without implying integration."""
     files = "\n".join(result["changed_files"]) or "(none)"
     stat = result["diff_stat"] or "(no changes)"
-    return f"Commit: {result['commit']}\nChanged files:\n{files}\nDiff stat:\n{stat}"
+    lines = [
+        f"Branch: {result.get('branch', '-')}",
+        f"Commit: {result['commit']}",
+    ]
+    if result.get("head_moved_notice"):
+        lines.append(result["head_moved_notice"])
+    lines.extend([
+        "Changed files:",
+        files,
+        "Diff stat:",
+        stat,
+    ])
+    return "\n".join(lines)
 
 
 def cherry_pick_options(config_dir):
@@ -704,7 +751,7 @@ def _update_worker_metadata(worker_dir, updates):
     if not isinstance(metadata, dict):
         raise ValueError(f"Invalid worker metadata: {metadata_path}")
     metadata.update(updates)
-    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    _atomic_write_json(metadata_path, metadata)
 
 
 class PodmanSandboxRuntime:
@@ -1243,7 +1290,7 @@ def _worker_record(worker_dir):
     record["runtime"] = _metadata_value(metadata, "runtime")
     record["network"] = _metadata_value(metadata, "network")
     record["metadata_status"] = _metadata_value(metadata, "status", "unknown")
-    if record["metadata_status"] not in LIFECYCLE_STATES and record["metadata_status"] != "unknown":
+    if record["metadata_status"] not in LIFECYCLE_STATES and record["metadata_status"] != "unknown" and record["metadata_status"] != "fetched":
         record["issues"].append(f"Unknown persisted lifecycle status: {record['metadata_status']}")
     if metadata and metadata.get("id") != worker_id:
         record["issues"].append(f"Metadata ID does not match state directory ({metadata.get('id', '-')})")
@@ -1377,6 +1424,155 @@ def format_worker(record):
     return "\n".join(lines)
 
 
+def _sanitize_for_worker_id(text):
+    """Sanitize text to match WORKER_ID_RE: alphanumeric, dots, underscores, hyphens."""
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", text)
+    text = re.sub(r"^[^A-Za-z0-9]+", "", text)
+    text = re.sub(r"-+", "-", text)
+    text = text.strip("-._")
+    return text if text else "worker"
+
+
+def _repo_slug_from_path(repo_path):
+    """Derive a short slug from the repository directory name."""
+    repo = Path(repo_path).expanduser().resolve()
+    slug = _sanitize_for_worker_id(repo.name)
+    max_slug_length = MAX_WORKER_ID_LENGTH - 9
+    if len(slug) > max_slug_length:
+        slug = slug[:max_slug_length]
+    return slug
+
+
+def generate_worker_id(repo_path, state_dir=None):
+    """Generate a worker ID as <repo-slug>-<short-random>."""
+    slug = _repo_slug_from_path(repo_path)
+    workers_dir = state_workers_dir(state_dir)
+    for attempt in range(100):
+        random_suffix = secrets.token_hex(3)
+        worker_id = f"{slug}-{random_suffix}"
+        if len(worker_id) > MAX_WORKER_ID_LENGTH:
+            worker_id = worker_id[:MAX_WORKER_ID_LENGTH]
+        try:
+            validate_worker_id(worker_id)
+            git("check-ref-format", "--branch", f"agent/{worker_id}")
+            git("check-ref-format", "--branch", f"sandbox/{worker_id}")
+        except ValueError:
+            continue
+        candidate_dir = workers_dir / worker_id
+        if not candidate_dir.exists():
+            return worker_id
+    raise ValueError(f"Unable to generate a unique worker ID after 100 attempts for {repo_path}")
+
+
+def _state_lock_path(state_dir=None):
+    """Return the path to the global state lock file."""
+    if state_dir is None:
+        _, state_dir = paths()
+    return Path(state_dir) / "state.lock"
+
+
+class StateLock:
+    """Exclusive file lock for state store operations."""
+
+    def __init__(self, state_dir=None):
+        self.lock_path = _state_lock_path(state_dir)
+        self.lock_file = None
+
+    def __enter__(self):
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_file = self.lock_path.open("a")
+        fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.lock_file:
+            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+            self.lock_file.close()
+        return False
+
+
+def _atomic_write_json(path, data):
+    """Write JSON atomically with fsync."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(data, indent=2) + "\n"
+    fd, temp_path = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _get_pane_context():
+    """Extract pane and workspace IDs from environment."""
+    pane_id = os.environ.get("HERDR_PANE_ID", "").strip()
+    workspace_id = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
+    return (pane_id if pane_id else None), (workspace_id if workspace_id else None)
+
+
+def find_reusable_worker(source_repo, agent, state_dir=None):
+    """Find an existing worker that matches the reuse key (pane, repo, agent).
+    
+    Returns None if no pane ID is available or no matching worker exists.
+    According to the spike findings, pane IDs are stable and never reused,
+    so a matching pane ID is a reliable reuse key.
+    """
+    pane_id, _ = _get_pane_context()
+    if not pane_id:
+        return None
+    
+    source_repo = Path(source_repo).expanduser().resolve()
+    workers_dir = state_workers_dir(state_dir)
+    if not workers_dir.is_dir():
+        return None
+    
+    for entry in workers_dir.iterdir():
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        if not WORKER_ID_RE.fullmatch(entry.name):
+            continue
+        
+        metadata_path = entry / "worker.json"
+        if not metadata_path.is_file():
+            continue
+        
+        try:
+            with metadata_path.open() as f:
+                metadata = json.load(f)
+            
+            if not isinstance(metadata, dict):
+                continue
+            
+            recorded_pane = metadata.get("pane_id")
+            recorded_repo = metadata.get("source_repo")
+            recorded_agent = metadata.get("agent")
+            
+            if recorded_pane != pane_id:
+                continue
+            if recorded_agent != agent:
+                continue
+            if not recorded_repo:
+                continue
+            
+            recorded_repo_path = Path(recorded_repo).expanduser().resolve()
+            if recorded_repo_path != source_repo:
+                continue
+            
+            return entry.name
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+    
+    return None
+
+
 def create_options(config_dir):
     config_file = config_dir / "config.toml"
     with config_file.open("rb") as stream:
@@ -1438,10 +1634,15 @@ def resolve_cherry_pick_inputs(worker_id, commit, config_dir):
     return options.get("id"), options.get("commit")
 
 
-def create_worker(worker_id, repo=None, base_ref="HEAD"):
-    validate_worker_id(worker_id)
-    branch = f"agent/{worker_id}"
-    git("check-ref-format", "--branch", branch)
+def create_worker(worker_id, repo=None, base_ref="HEAD", agent="codex"):
+    """Create a new worker with generated ID and pane tracking.
+    
+    Args:
+        worker_id: Worker ID, or None to generate one
+        repo: Source repository path
+        base_ref: Base ref or commit (default: HEAD)
+        agent: Agent name (default: codex)
+    """
     if not base_ref or base_ref.startswith("-") or any(char.isspace() for char in base_ref):
         raise ValueError("Base ref must be a nonempty Git ref or commit without whitespace or a leading hyphen.")
     repo = repo or context_repo()
@@ -1453,48 +1654,74 @@ def create_worker(worker_id, repo=None, base_ref="HEAD"):
     source_root = Path(git("-C", source, "rev-parse", "--show-toplevel")).resolve()
     if source_root != source:
         source = source_root
-    user_name, user_email = source_git_identity(str(source))
-    commit = git("-C", source, "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}")
+    
     errors = check(str(source))
     if errors:
         raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
+    
     _, state_dir = paths()
     if not state_dir.is_dir():
         raise ValueError(f"Plugin state directory is missing: {state_dir}. Run the setup action.")
     state_dir = state_dir.resolve()
     if state_dir.is_relative_to(source):
         raise ValueError("Plugin state directory must be outside the source repository.")
-    workers_dir = state_dir / "workers"
-    workers_dir.mkdir(exist_ok=True)
-    if workers_dir.resolve() != workers_dir or not workers_dir.is_dir():
-        raise ValueError("Plugin workers directory must be a real directory inside plugin state.")
-    destination = workers_dir / worker_id
-    try:
-        destination.mkdir()
-    except FileExistsError as exc:
-        raise ValueError(f"Worker already exists: {worker_id}.") from exc
-    try:
-        clone = destination / "repo"
-        git("clone", "--local", "--no-hardlinks", "--no-checkout", source, clone)
-        git("-C", clone, "config", "--local", "user.name", user_name)
-        git("-C", clone, "config", "--local", "user.email", user_email)
-        git("-C", clone, "switch", "--detach", commit)
-        git("-C", clone, "switch", "-c", branch)
-        metadata = {
-            "id": worker_id,
-            "source_repo": str(source),
-            "base_ref": base_ref,
-            "base_commit": commit,
-            "branch": branch,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "runtime": "podman",
-            "network": "online",
-            "status": "created",
-        }
-        (destination / "worker.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    except (ValueError, OSError):
-        shutil.rmtree(destination)
-        raise
+    
+    with StateLock(state_dir):
+        if worker_id is None:
+            worker_id = generate_worker_id(source, state_dir)
+        else:
+            validate_worker_id(worker_id)
+        
+        branch = f"agent/{worker_id}"
+        git("check-ref-format", "--branch", branch)
+        sandbox_branch = f"sandbox/{worker_id}"
+        git("check-ref-format", "--branch", sandbox_branch)
+        
+        user_name, user_email = source_git_identity(str(source))
+        commit = git("-C", source, "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}")
+        
+        workers_dir = state_dir / "workers"
+        workers_dir.mkdir(exist_ok=True)
+        if workers_dir.resolve() != workers_dir or not workers_dir.is_dir():
+            raise ValueError("Plugin workers directory must be a real directory inside plugin state.")
+        
+        destination = workers_dir / worker_id
+        try:
+            destination.mkdir()
+        except FileExistsError as exc:
+            raise ValueError(f"Worker already exists: {worker_id}.") from exc
+        
+        try:
+            clone = destination / "repo"
+            git("clone", "--local", "--no-hardlinks", "--no-checkout", source, clone)
+            git("-C", clone, "config", "--local", "user.name", user_name)
+            git("-C", clone, "config", "--local", "user.email", user_email)
+            git("-C", clone, "switch", "--detach", commit)
+            git("-C", clone, "switch", "-c", branch)
+            
+            pane_id, workspace_id = _get_pane_context()
+            
+            metadata = {
+                "id": worker_id,
+                "source_repo": str(source),
+                "agent": agent,
+                "pane_id": pane_id,
+                "workspace_id": workspace_id,
+                "base_ref": base_ref,
+                "base_commit": commit,
+                "branch": branch,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "runtime": "podman",
+                "network": "online",
+                "status": "created",
+                "result_branch": None,
+                "fetched_commit": None,
+            }
+            _atomic_write_json(destination / "worker.json", metadata)
+        except (ValueError, OSError):
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+    
     return destination
 
 
@@ -1556,9 +1783,12 @@ def main():
             worker_id = args.id or options.get("id")
             if not worker_id and sys.stdin.isatty():
                 worker_id = input("Worker ID: ").strip()
-            if not worker_id:
-                worker_id = f"worker-{uuid4().hex[:12]}"
-            print(create_worker(worker_id, args.repo or options.get("source_repo"), args.base or options.get("base_ref") or "HEAD"))
+            worker_dir = create_worker(
+                worker_id or None,
+                args.repo or options.get("source_repo"),
+                args.base or options.get("base_ref") or "HEAD"
+            )
+            print(worker_dir)
         elif args.command == "destroy":
             worker_id = args.id
             if worker_id is None:
