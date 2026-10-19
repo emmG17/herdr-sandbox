@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""
+hs - Herdr sandbox launcher that works from any pane.
+
+Discovers plugin config and state directories, then delegates to the main
+herdr-sandbox script. Works without HERDR_PLUGIN_CONFIG_DIR/HERDR_PLUGIN_STATE_DIR
+being set by a Herdr action.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+PLUGIN_ID = "dev.herdr.sandbox"
+
+
+def find_herdr_base():
+    """Locate the Herdr base directory containing plugin state."""
+    # Try HERDR_BASE first (if set)
+    if "HERDR_BASE" in os.environ:
+        return Path(os.environ["HERDR_BASE"]).expanduser().resolve()
+    
+    # Default to ~/.herdr
+    return Path.home() / ".herdr"
+
+
+def find_plugin_dirs():
+    """Discover the plugin config and state directories."""
+    herdr_base = find_herdr_base()
+    
+    # Standard plugin directories under Herdr base
+    config_dir = herdr_base / "plugins" / PLUGIN_ID / "config"
+    state_dir = herdr_base / "plugins" / PLUGIN_ID / "state"
+    
+    # Check if directories exist
+    if not config_dir.is_dir():
+        print(f"Error: Plugin config directory not found: {config_dir}", file=sys.stderr)
+        print(f"Run setup first: herdr plugin action invoke setup --plugin {PLUGIN_ID}", file=sys.stderr)
+        sys.exit(1)
+    
+    if not state_dir.is_dir():
+        print(f"Error: Plugin state directory not found: {state_dir}", file=sys.stderr)
+        print(f"Run setup first: herdr plugin action invoke setup --plugin {PLUGIN_ID}", file=sys.stderr)
+        sys.exit(1)
+    
+    return config_dir, state_dir
+
+
+def find_plugin_script():
+    """Locate the main herdr-sandbox script."""
+    # Try the launcher in config dir first (created by setup)
+    config_dir, _ = find_plugin_dirs()
+    launcher = config_dir / "herdr-sandbox"
+    if launcher.is_file() and not launcher.is_symlink():
+        return launcher
+    
+    # Fall back to the script in the same directory as this hs script
+    script = Path(__file__).resolve().parent / "herdr-sandbox"
+    if script.is_file():
+        return script
+    
+    print(f"Error: Could not find herdr-sandbox script", file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    """Delegate to herdr-sandbox with discovered config/state directories."""
+    config_dir, state_dir = find_plugin_dirs()
+    script = find_plugin_script()
+    
+    # Set environment variables for the main script
+    os.environ["HERDR_PLUGIN_CONFIG_DIR"] = str(config_dir)
+    os.environ["HERDR_PLUGIN_STATE_DIR"] = str(state_dir)
+    
+    # Execute the main script with all arguments
+    os.execv(sys.executable, [sys.executable, str(script), *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    main()
