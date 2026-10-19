@@ -179,7 +179,7 @@ class CreateTests(unittest.TestCase):
                 patch.object(plugin.sys, "stdin", io.StringIO()), \
                 patch.object(plugin, "create_worker", return_value=Path("/tmp/generated")) as create:
             self.assertEqual(plugin.main(), 0)
-        self.assertRegex(create.call_args.args[0], r"^worker-[0-9a-f]{12}$")
+        self.assertIsNone(create.call_args.args[0])
 
     def test_noninteractive_action_uses_configured_inputs(self):
         (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + f'\n[create]\nid = "chosen"\nsource_repo = "{self.source}"\nbase_ref = "base"\n')
