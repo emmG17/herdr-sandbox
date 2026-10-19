@@ -2,57 +2,113 @@
 """
 hs - Herdr sandbox launcher that works from any pane.
 
-Discovers plugin config and state directories, then delegates to the main
-herdr-sandbox script. Works without HERDR_PLUGIN_CONFIG_DIR/HERDR_PLUGIN_STATE_DIR
-being set by a Herdr action.
+Discovers plugin config and state directories using Herdr CLI, then delegates to
+the main herdr-sandbox script. Works without HERDR_PLUGIN_CONFIG_DIR/
+HERDR_PLUGIN_STATE_DIR being set by a Herdr action.
 """
 
-import json
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 
-PLUGIN_ID = "dev.herdr.sandbox"
-
-
-def find_herdr_base():
-    """Locate the Herdr base directory containing plugin state."""
-    # Try HERDR_BASE first (if set)
-    if "HERDR_BASE" in os.environ:
-        return Path(os.environ["HERDR_BASE"]).expanduser().resolve()
+def read_plugin_id():
+    """Read the plugin ID from herdr-plugin.toml in this plugin's root."""
+    # This script is in the plugin root's bin/ directory
+    manifest = Path(__file__).resolve().parent.parent / "herdr-plugin.toml"
+    if not manifest.is_file():
+        print("Error: Could not find herdr-plugin.toml", file=sys.stderr)
+        sys.exit(1)
     
-    # Default to ~/.herdr
-    return Path.home() / ".herdr"
+    try:
+        with manifest.open("rb") as f:
+            config = tomllib.load(f)
+        plugin_id = config.get("id")
+        if not isinstance(plugin_id, str) or not plugin_id:
+            print("Error: Invalid plugin id in herdr-plugin.toml", file=sys.stderr)
+            sys.exit(1)
+        return plugin_id
+    except Exception as exc:
+        print(f"Error: Could not read plugin id: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
-def find_plugin_dirs():
-    """Discover the plugin config and state directories."""
-    herdr_base = find_herdr_base()
+def find_herdr_bin():
+    """Locate the herdr binary."""
+    # Try HERDR_BIN_PATH first
+    if "HERDR_BIN_PATH" in os.environ:
+        herdr = Path(os.environ["HERDR_BIN_PATH"]).resolve()
+        if herdr.is_file():
+            return str(herdr)
     
-    # Standard plugin directories under Herdr base
-    config_dir = herdr_base / "plugins" / PLUGIN_ID / "config"
-    state_dir = herdr_base / "plugins" / PLUGIN_ID / "state"
+    # Try PATH
+    import shutil
+    herdr = shutil.which("herdr")
+    if herdr:
+        return herdr
     
-    # Check if directories exist
+    print("Error: herdr not found. Install Herdr or set HERDR_BIN_PATH.", file=sys.stderr)
+    sys.exit(1)
+
+
+def discover_plugin_dirs(plugin_id):
+    """Discover plugin directories using the Herdr CLI.
+    
+    Uses herdr plugin config-dir (available in 0.9.5) and derives state-dir
+    from XDG patterns since herdr plugin state-dir doesn't exist in 0.9.5.
+    """
+    herdr = find_herdr_bin()
+    
+    # Query config directory (herdr plugin config-dir exists in 0.9.5)
+    try:
+        result = subprocess.run(
+            [herdr, "plugin", "config-dir", plugin_id],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        if result.returncode != 0:
+            print(f"Error: herdr plugin config-dir failed: {result.stderr.strip()}", file=sys.stderr)
+            print(f"Run setup first: herdr plugin action invoke setup --plugin {plugin_id}", file=sys.stderr)
+            sys.exit(1)
+        config_dir = Path(result.stdout.strip()).resolve()
+    except Exception as exc:
+        print(f"Error: Could not query plugin config directory: {exc}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Derive state directory from XDG pattern
+    # Config is typically: ~/.config/herdr/plugins/config/<plugin_id>
+    # State is typically: ~/.local/state/herdr/plugins/<plugin_id>
+    try:
+        xdg_state_home = os.environ.get("XDG_STATE_HOME")
+        if xdg_state_home:
+            state_dir = Path(xdg_state_home) / "herdr" / "plugins" / plugin_id
+        else:
+            state_dir = Path.home() / ".local" / "state" / "herdr" / "plugins" / plugin_id
+        state_dir = state_dir.resolve()
+    except Exception as exc:
+        print(f"Error: Could not derive plugin state directory: {exc}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Verify directories exist
     if not config_dir.is_dir():
         print(f"Error: Plugin config directory not found: {config_dir}", file=sys.stderr)
-        print(f"Run setup first: herdr plugin action invoke setup --plugin {PLUGIN_ID}", file=sys.stderr)
+        print(f"Run setup first: herdr plugin action invoke setup --plugin {plugin_id}", file=sys.stderr)
         sys.exit(1)
     
     if not state_dir.is_dir():
         print(f"Error: Plugin state directory not found: {state_dir}", file=sys.stderr)
-        print(f"Run setup first: herdr plugin action invoke setup --plugin {PLUGIN_ID}", file=sys.stderr)
+        print(f"Run setup first: herdr plugin action invoke setup --plugin {plugin_id}", file=sys.stderr)
         sys.exit(1)
     
     return config_dir, state_dir
 
 
-def find_plugin_script():
+def find_plugin_script(config_dir):
     """Locate the main herdr-sandbox script."""
     # Try the launcher in config dir first (created by setup)
-    config_dir, _ = find_plugin_dirs()
     launcher = config_dir / "herdr-sandbox"
     if launcher.is_file() and not launcher.is_symlink():
         return launcher
@@ -62,14 +118,15 @@ def find_plugin_script():
     if script.is_file():
         return script
     
-    print(f"Error: Could not find herdr-sandbox script", file=sys.stderr)
+    print("Error: Could not find herdr-sandbox script", file=sys.stderr)
     sys.exit(1)
 
 
 def main():
     """Delegate to herdr-sandbox with discovered config/state directories."""
-    config_dir, state_dir = find_plugin_dirs()
-    script = find_plugin_script()
+    plugin_id = read_plugin_id()
+    config_dir, state_dir = discover_plugin_dirs(plugin_id)
+    script = find_plugin_script(config_dir)
     
     # Set environment variables for the main script
     os.environ["HERDR_PLUGIN_CONFIG_DIR"] = str(config_dir)

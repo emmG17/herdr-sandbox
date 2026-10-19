@@ -73,10 +73,24 @@ herdr plugin action invoke check --plugin dev.herdr.sandbox
 ```
 
 `bootstrap` creates plugin-owned configuration and state directories, a
-dedicated Codex home, and the worker image. Authenticate only in that dedicated
-home, never in the normal user Codex home.
+dedicated Codex home, and the worker image. It also installs a small `hs` shim
+to `~/.local/bin/hs` (ensure `~/.local/bin` is on your PATH). The shim resolves
+the current plugin root from Herdr at runtime, so it continues to work after
+plugin updates. Authenticate only in that dedicated home, never in the normal
+user Codex home.
 
-Then, in a Herdr workspace containing the Git repository you want to change:
+Then, in a Herdr pane containing the Git repository you want to change:
+
+```sh
+cd ~/my-project
+hs codex
+```
+
+`hs codex` automatically creates or reuses a worker for the current pane and
+launches Codex in the sandbox. It works from any Herdr pane or plain shell
+without requiring action-specific environment variables.
+
+Alternatively, use the plugin actions:
 
 ```sh
 herdr plugin action invoke create --plugin dev.herdr.sandbox
@@ -116,6 +130,22 @@ List durable worker state at any time:
 ```sh
 herdr plugin action invoke list --plugin dev.herdr.sandbox
 ```
+
+### `hs` CLI Installation
+
+The `bootstrap` or `setup` action installs a small shim script to `~/.local/bin/hs`.
+This shim queries Herdr for the current plugin root each time it runs, making it
+resilient to plugin updates (GitHub-managed plugin checkouts get replaced on
+update, which would break a direct symlink).
+
+If `~/.local/bin` is not on your PATH, either:
+- Add it: `export PATH="$HOME/.local/bin:$PATH"` (add to `~/.bashrc` or `~/.zshrc`)
+- Use the full path: `~/.local/bin/hs codex`
+- Call the plugin's `bin/hs` directly: `$(herdr plugin root dev.herdr.sandbox)/bin/hs codex`
+
+The shim uses `herdr plugin root`, `herdr plugin config-dir`, and `herdr plugin
+state-dir` to discover directories at runtime, so it works regardless of XDG
+overrides or custom Herdr base directories.
 
 ## Herdr 0.9.0 integration limits
 
