@@ -209,27 +209,100 @@ def write_launcher(config_dir, state_dir):
 
 
 def install_hs_to_path():
-    """Symlink hs script to ~/.local/bin for PATH access."""
-    hs_source = plugin_root() / "bin" / "hs"
-    if not hs_source.is_file():
-        raise ValueError(f"hs script not found: {hs_source}")
+    """Install hs shim to ~/.local/bin that resolves plugin root at runtime.
     
+    Creates a standalone shim instead of a symlink so it survives plugin updates.
+    The shim queries the current plugin root from Herdr each time it runs.
+    """
     local_bin = Path.home() / ".local" / "bin"
     local_bin.mkdir(parents=True, exist_ok=True)
     
     hs_dest = local_bin / "hs"
     
-    # Remove existing symlink or file
-    if hs_dest.exists() or hs_dest.is_symlink():
-        if hs_dest.is_symlink():
-            existing_target = hs_dest.resolve()
-            if existing_target == hs_source.resolve():
-                # Already points to the right place
-                return hs_dest
-        hs_dest.unlink()
+    # Create a standalone shim that queries the plugin root from Herdr
+    # Uses 'herdr plugin list --json' instead of 'plugin root' for Herdr 0.9.5 compatibility
+    shim_content = '''\
+#!/usr/bin/env python3
+"""hs - Herdr sandbox launcher (installed shim).
+
+This shim resolves the current plugin root at runtime, making it resilient to
+plugin updates. It queries Herdr for the plugin root via plugin list JSON, then
+delegates to the bin/hs script in that root.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+PLUGIN_ID = "dev.herdr.sandbox"
+
+def find_herdr_bin():
+    """Locate the herdr binary."""
+    if "HERDR_BIN_PATH" in os.environ:
+        herdr = Path(os.environ["HERDR_BIN_PATH"]).resolve()
+        if herdr.is_file():
+            return str(herdr)
     
-    # Create symlink
-    hs_dest.symlink_to(hs_source)
+    import shutil
+    herdr = shutil.which("herdr")
+    if herdr:
+        return herdr
+    
+    print("Error: herdr not found. Install Herdr or set HERDR_BIN_PATH.", file=sys.stderr)
+    sys.exit(1)
+
+def main():
+    herdr = find_herdr_bin()
+    
+    # Query the current plugin root from JSON (Herdr 0.9.5 compatible)
+    result = subprocess.run(
+        [herdr, "plugin", "list", "--plugin", PLUGIN_ID, "--json"],
+        capture_output=True,
+        text=True,
+        check=False
+    )
+    
+    if result.returncode != 0:
+        print(f"Error: herdr plugin list failed: {result.stderr.strip()}", file=sys.stderr)
+        print(f"Plugin may not be installed. Run: herdr plugin install emmG17/herdr-sandbox", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        data = json.loads(result.stdout)
+        plugins = data.get("result", {}).get("plugins", [])
+        if not plugins or len(plugins) == 0:
+            print(f"Error: Plugin {PLUGIN_ID} not found in herdr", file=sys.stderr)
+            print(f"Run: herdr plugin install emmG17/herdr-sandbox", file=sys.stderr)
+            sys.exit(1)
+        
+        plugin_root_str = plugins[0].get("plugin_root")
+        if not plugin_root_str:
+            print(f"Error: Plugin root not found in herdr plugin list output", file=sys.stderr)
+            sys.exit(1)
+        
+        plugin_root = Path(plugin_root_str).resolve()
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        print(f"Error: Could not parse plugin list output: {exc}", file=sys.stderr)
+        sys.exit(1)
+    
+    hs_script = plugin_root / "bin" / "hs"
+    
+    if not hs_script.is_file():
+        print(f"Error: hs script not found in plugin: {hs_script}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Execute the plugin's hs script
+    os.execv(sys.executable, [sys.executable, str(hs_script), *sys.argv[1:]])
+
+if __name__ == "__main__":
+    main()
+'''
+    
+    hs_dest.write_text(shim_content)
+    hs_dest.chmod(0o755)
+    
     return hs_dest
 
 
@@ -277,11 +350,15 @@ def setup():
     codex_home.chmod(0o700)
     launcher = write_launcher(config_dir, state_dir)
     try:
-        hs_link = install_hs_to_path()
-        hs_installed = f"\nhs CLI: {hs_link}"
+        hs_shim = install_hs_to_path()
+        hs_installed = f"\nhs CLI: Installed shim to {hs_shim} (resolves plugin root at runtime)"
+        hs_path_check = ""
+        if str(hs_shim.parent) not in os.environ.get("PATH", "").split(os.pathsep):
+            hs_path_check = f"\nNote: {hs_shim.parent} is not on PATH. Add it or use the full path."
     except Exception as exc:
         hs_installed = f"\nhs CLI installation failed: {exc}\nManually add {plugin_root() / 'bin'} to PATH to use `hs codex`"
-    print(f"Config: {config_file}\nImage boilerplate: {boilerplate}\nLauncher: {launcher}\nState: {state_dir}\nCodex home: {codex_home}\nImage: {image}{hs_installed}")
+        hs_path_check = ""
+    print(f"Config: {config_file}\nImage boilerplate: {boilerplate}\nLauncher: {launcher}\nState: {state_dir}\nCodex home: {codex_home}\nImage: {image}{hs_installed}{hs_path_check}")
     print(f"Next: `herdr plugin action invoke build-image --plugin {PLUGIN_ID}`")
     print(f"Authenticate: `CODEX_HOME={codex_home} codex login --device-auth`")
 
