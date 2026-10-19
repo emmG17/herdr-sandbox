@@ -134,7 +134,39 @@ HERDR_SOCKET_PATH="/tmp/herdr-b.sock" herdr pane read "w1:p1"
 - **Pane IDs CAN collide** across different Herdr server instances
 - **Socket path disambiguates** server instances
 
-See `COLLISION_TEST_RESULTS.md` for full test details and commands.
+#### Full Test Results (Herdr 0.9.5)
+
+**Test 1: Workspace ID Reuse After Closure**
+
+Commands:
+```bash
+herdr server &
+herdr workspace create --label "test1"      # → w1, pane w1:p1
+herdr workspace close "w1"
+herdr workspace create --label "test2"      # → w2, pane w2:p1
+```
+
+Result: ✅ **NO COLLISION** - Workspace IDs are NOT reused after closure
+
+**Test 2: Multiple Servers with Different Sockets**
+
+Commands:
+```bash
+HERDR_SOCKET_PATH="/tmp/herdr-a.sock" herdr server &
+HERDR_SOCKET_PATH="/tmp/herdr-b.sock" herdr server &
+
+HERDR_SOCKET_PATH="/tmp/herdr-a.sock" herdr workspace create
+# → workspace=w1, pane=w1:p1, socket=/tmp/herdr-a.sock
+
+HERDR_SOCKET_PATH="/tmp/herdr-b.sock" herdr workspace create
+# → workspace=w1, pane=w1:p1, socket=/tmp/herdr-b.sock
+```
+
+Result: ❌ **COLLISION DETECTED** - Both servers have pane w1:p1!
+
+Discriminator: ✅ Each pane sees different `HERDR_SOCKET_PATH`:
+- Server A pane: `/tmp/herdr-a.sock`
+- Server B pane: `/tmp/herdr-b.sock`
 
 ### Metadata Schema Update
 
@@ -244,3 +276,41 @@ The new state store maintains all existing security invariants:
 - Metadata updates are atomic and locked to prevent races
 - Pane IDs are recorded but never blindly trusted from user-controlled context
 - The reuse key prevents a worker from being reused across different repos or agents
+
+## Implementation Details
+
+### Concurrency Safety
+
+The state store uses two mechanisms to prevent corruption:
+
+1. **File locking**: A global lock file (`state.lock`) ensures exclusive access during create/update operations using `fcntl.flock()`
+2. **Atomic writes**: Metadata updates write to a temporary file, fsync, then `os.replace()` to ensure atomicity
+
+This prevents two panes launching `hs` simultaneously from corrupting state or generating duplicate IDs.
+
+### ID Generation Algorithm
+
+```python
+def generate_worker_id(repo_path):
+    slug = sanitize_repo_name(repo.name)  # Alphanumeric, dots, hyphens
+    for attempt in range(100):
+        random_suffix = secrets.token_hex(3)  # 6 hex chars
+        worker_id = f"{slug}-{random_suffix}"
+        if valid_and_unique(worker_id):
+            return worker_id
+```
+
+Generated IDs are validated to be:
+- Legal Git refs under both `agent/` and `sandbox/` namespaces
+- Unique across all existing workers
+- At most 64 characters long
+
+### Clone Without Shared Objects
+
+Worker creation uses:
+```python
+git("clone", "--no-hardlinks", "--no-checkout", source, clone)
+```
+
+After cloning, the implementation explicitly removes any `objects/info/alternates` file
+to ensure the worker can never access the source repository's objects, even indirectly.

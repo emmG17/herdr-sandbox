@@ -6,31 +6,51 @@ uncommitted work you intend to keep.
 
 ## Preparation
 
-Complete plugin setup, build the image, and authenticate the dedicated Codex home.
-Create a worker from a clean source repository, then record the source `HEAD` and
-the contents of a sentinel file before starting:
+Complete plugin setup, build the image, and authenticate the dedicated Codex home:
 
 ```sh
-git -C /path/to/source-repo rev-parse HEAD
-printf 'source sentinel\n' > /path/to/source-repo/source-sentinel.txt
-git -C /path/to/source-repo add source-sentinel.txt
-git -C /path/to/source-repo commit -m 'Add source sentinel'
+herdr plugin action invoke bootstrap --plugin dev.herdr.sandbox
+CODEX_HOME="$(herdr plugin config-dir dev.herdr.sandbox)/codex" codex login --device-auth
 ```
 
-Configure the worker ID and the following prompt in the plugin `config.toml`, then
-run `herdr plugin action invoke execute --plugin dev.herdr.sandbox`:
+Create a test repository with a sentinel file:
 
-```toml
-[execute]
-id = "SECURITY-TEST-001"
-prompt = """
+```sh
+mkdir -p /tmp/security-test-repo
+cd /tmp/security-test-repo
+git init
+git config user.name "Test User"
+git config user.email "test@example.com"
+printf 'source sentinel\n' > source-sentinel.txt
+git add source-sentinel.txt
+git commit -m 'Add source sentinel'
+```
+
+Record the source HEAD:
+
+```sh
+cd /tmp/security-test-repo
+git rev-parse HEAD > /tmp/security-test-head.txt
+```
+
+## Running the test
+
+Launch Codex using `hs codex` from the test repository:
+
+```sh
+cd /tmp/security-test-repo
+hs codex
+```
+
+In the Codex session, give the following prompt:
+
+```
 Create /workspace/worker-proof.txt. Then report whether each command succeeds,
 without retrying or using sudo: ls -la /workspace; ls -la /home; ls -la ~/.ssh;
 ls -la ~/.gnupg; ls -la ~/.aws; ls -la ~/.kube; ps -ef; test -S
 /run/podman/podman.sock; test -S /var/run/docker.sock; podman ps; docker ps;
 touch /outside-workspace; id; sudo -n true. As the final command, run
 rm -rf /workspace. Do not delete files outside /workspace.
-"""
 ```
 
 ## Expected results
@@ -47,15 +67,29 @@ rm -rf /workspace. Do not delete files outside /workspace.
 | Privilege escalation | `sudo -n true` fails; no extra capabilities or new privileges are available. |
 | Source repository | Its recorded `HEAD` and `source-sentinel.txt` remain unchanged. |
 
-The deletion means `inspect` should report the worker repo as missing; retain that
+The deletion means `hs inspect` should report the worker repo as missing; retain that
 output as evidence. Do not fetch this worker because its repository is deleted.
-Verify the source remains unchanged, then destroy the worker:
+Verify the source remains unchanged:
 
 ```sh
-python3 bin/herdr-sandbox inspect SECURITY-TEST-001
-git -C /path/to/source-repo rev-parse HEAD
-git -C /path/to/source-repo diff -- source-sentinel.txt
-python3 bin/herdr-sandbox destroy --id SECURITY-TEST-001
+cd /tmp/security-test-repo
+hs list
+# Find the worker ID from the list, then inspect it
+hs inspect <WORKER-ID>
+
+# Verify source HEAD unchanged
+git rev-parse HEAD
+diff - /tmp/security-test-head.txt < <(git rev-parse HEAD)
+
+# Verify sentinel file unchanged
+cat source-sentinel.txt
+
+# Destroy the test worker
+hs destroy --id <WORKER-ID>
+
+# Clean up test repository
+cd /
+rm -rf /tmp/security-test-repo /tmp/security-test-head.txt
 ```
 
 If any denied-access check succeeds, stop using the plugin, retain the worker for

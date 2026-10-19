@@ -208,6 +208,31 @@ def write_launcher(config_dir, state_dir):
     return launcher
 
 
+def install_hs_to_path():
+    """Symlink hs script to ~/.local/bin for PATH access."""
+    hs_source = plugin_root() / "bin" / "hs"
+    if not hs_source.is_file():
+        raise ValueError(f"hs script not found: {hs_source}")
+    
+    local_bin = Path.home() / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    
+    hs_dest = local_bin / "hs"
+    
+    # Remove existing symlink or file
+    if hs_dest.exists() or hs_dest.is_symlink():
+        if hs_dest.is_symlink():
+            existing_target = hs_dest.resolve()
+            if existing_target == hs_source.resolve():
+                # Already points to the right place
+                return hs_dest
+        hs_dest.unlink()
+    
+    # Create symlink
+    hs_dest.symlink_to(hs_source)
+    return hs_dest
+
+
 def check(repo=None, require_auth=False):
     errors = host_errors()
     try:
@@ -251,7 +276,12 @@ def setup():
     codex_home.mkdir(parents=True, exist_ok=True)
     codex_home.chmod(0o700)
     launcher = write_launcher(config_dir, state_dir)
-    print(f"Config: {config_file}\nImage boilerplate: {boilerplate}\nLauncher: {launcher}\nState: {state_dir}\nCodex home: {codex_home}\nImage: {image}")
+    try:
+        hs_link = install_hs_to_path()
+        hs_installed = f"\nhs CLI: {hs_link}"
+    except Exception as exc:
+        hs_installed = f"\nhs CLI installation failed: {exc}\nManually add {plugin_root() / 'bin'} to PATH to use `hs codex`"
+    print(f"Config: {config_file}\nImage boilerplate: {boilerplate}\nLauncher: {launcher}\nState: {state_dir}\nCodex home: {codex_home}\nImage: {image}{hs_installed}")
     print(f"Next: `herdr plugin action invoke build-image --plugin {PLUGIN_ID}`")
     print(f"Authenticate: `CODEX_HOME={codex_home} codex login --device-auth`")
 
@@ -269,7 +299,7 @@ def bootstrap():
     if errors:
         print(f"Almost ready. Authenticate once:\n  CODEX_HOME={codex_home} codex login --device-auth")
     else:
-        print("Sandbox setup is ready. Create a worker with the Create Worker action, then use Start Codex.")
+        print("Sandbox setup is ready. Use `hs codex` from any Git repository pane, or create a worker with the Create Worker action.")
 
 
 def build_image():
@@ -1720,7 +1750,13 @@ def create_worker(worker_id, repo=None, base_ref="HEAD", agent="codex"):
         
         try:
             clone = destination / "repo"
-            git("clone", "--local", "--no-hardlinks", "--no-checkout", source, clone)
+            git("clone", "--no-hardlinks", "--no-checkout", source, clone)
+            
+            # Ensure no alternates file exists (worker must never access source objects)
+            alternates_file = clone / ".git" / "objects" / "info" / "alternates"
+            if alternates_file.exists():
+                alternates_file.unlink()
+            
             git("-C", clone, "config", "--local", "user.name", user_name)
             git("-C", clone, "config", "--local", "user.email", user_email)
             git("-C", clone, "switch", "--detach", commit)
@@ -1751,6 +1787,102 @@ def create_worker(worker_id, repo=None, base_ref="HEAD", agent="codex"):
             raise
     
     return destination
+
+
+def check_dirty_tree(repo):
+    """Check if repository has uncommitted or untracked changes."""
+    result = run("git", "-C", str(repo), "status", "--porcelain")
+    if result.returncode != 0:
+        raise ValueError(f"Unable to check repository status: {result.stderr.strip() or 'git failed'}")
+    return bool(result.stdout.strip())
+
+
+def check_root():
+    """Refuse to run as root."""
+    if os.geteuid() == 0:
+        raise ValueError("Refusing to run as root. Run this command as a regular user with rootless Podman.")
+
+
+def ensure_image_exists(config_dir):
+    """Build image lazily if it doesn't exist."""
+    if shutil.which("podman") is None:
+        return
+    
+    image, _ = load_config(config_dir)
+    result = run("podman", "image", "exists", image)
+    
+    if result.returncode != 0:
+        print(f"Worker image {image} not found. Building it now...", file=sys.stderr)
+        build_image()
+        print(f"Image {image} built successfully.", file=sys.stderr)
+
+
+def resolve_source_repo_from_cwd():
+    """Resolve source repository from current working directory."""
+    cwd = Path.cwd()
+    result = run("git", "-C", str(cwd), "rev-parse", "--show-toplevel")
+    if result.returncode != 0:
+        raise ValueError(f"Current directory is not in a Git repository: {cwd}")
+    return Path(result.stdout.strip()).resolve()
+
+
+def hs_codex(codex_args):
+    """
+    hs codex entrypoint: create or reuse worker and launch Codex.
+    
+    This is the main RFC phase 1 command that works from any pane without
+    requiring HERDR_PLUGIN_CONFIG_DIR/HERDR_PLUGIN_STATE_DIR to be set by
+    an action.
+    """
+    # Security checks first
+    check_root()
+    
+    config_dir, state_dir = paths()
+    
+    # Resolve source repository from cwd
+    try:
+        source_repo = resolve_source_repo_from_cwd()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    
+    # Check for dirty tree
+    if check_dirty_tree(source_repo):
+        print(f"Refusing: source repository has uncommitted or untracked changes: {source_repo}", file=sys.stderr)
+        return 1
+    
+    # Ensure image exists (lazy build)
+    try:
+        ensure_image_exists(config_dir)
+    except Exception as exc:
+        print(f"Image build failed: {exc}", file=sys.stderr)
+        return 1
+    
+    # Check for reusable worker
+    agent = "codex"
+    worker_id, head_moved_notice = find_reusable_worker(source_repo, agent, state_dir)
+    
+    # Create worker if no reusable one found
+    if worker_id is None:
+        try:
+            worker_dir = create_worker(None, str(source_repo), "HEAD", agent)
+            worker_id = worker_dir.name
+            print(f"Created worker: {worker_id}", file=sys.stderr)
+        except Exception as exc:
+            print(f"Worker creation failed: {exc}", file=sys.stderr)
+            return 1
+    else:
+        print(f"Reusing worker: {worker_id}", file=sys.stderr)
+        if head_moved_notice:
+            print(head_moved_notice, file=sys.stderr)
+    
+    # Launch Codex with fresh session
+    try:
+        command = ["codex"] + codex_args
+        return open_worker(worker_id, command, fresh=True)
+    except Exception as exc:
+        print(f"Worker launch failed: {exc}", file=sys.stderr)
+        return 1
 
 
 def main():
@@ -1797,6 +1929,8 @@ def main():
     execute_parser.add_argument("--prompt", dest="option_prompt", help="Task prompt (for direct use)")
     workers_parser = commands.add_parser("workers", help=argparse.SUPPRESS)
     workers_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    codex_parser = commands.add_parser("codex", help="Create or reuse worker and launch Codex (RFC phase 1)")
+    codex_parser.add_argument("codex_args", nargs=argparse.REMAINDER, help="Arguments to pass to codex")
     args = parser.parse_args()
     try:
         if args.command == "setup":
@@ -1892,6 +2026,8 @@ def main():
             result = execute_worker(worker_id, prompt)
             print_execution_result(result)
             return result["exit_status"]
+        elif args.command == "codex":
+            return hs_codex(args.codex_args)
         else:
             errors = check(args.repo or context_repo(), args.execution)
             if errors:
