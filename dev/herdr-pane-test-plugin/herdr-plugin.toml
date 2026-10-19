@@ -1,0 +1,46 @@
+id = "dev.test.pane-lifecycle"
+name = "Pane Lifecycle Test"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Test plugin for verifying pane ID and lifecycle events"
+platforms = ["linux"]
+
+[[actions]]
+id = "dump-env"
+title = "Test: Dump Environment"
+description = "Dump all HERDR_* environment variables"
+command = ["bash", "scripts/dump-env.sh"]
+
+[[actions]]
+id = "test-normal-pane"
+title = "Test: Normal Pane Env"
+description = "Create a normal pane and dump its env vars"
+command = ["bash", "scripts/test-normal-pane.sh"]
+
+[[panes]]
+id = "overlay-test"
+title = "Test: Overlay Pane"
+placement = "overlay"
+command = ["bash", "scripts/dump-env-to-file.sh", "overlay"]
+
+[[panes]]
+id = "tab-test"
+title = "Test: Tab Pane"
+placement = "tab"
+command = ["bash", "scripts/dump-env-to-file.sh", "tab"]
+
+[[panes]]
+id = "popup-test"
+title = "Test: Popup Pane"
+placement = "popup"
+width = "80%"
+height = 20
+command = ["bash", "scripts/dump-env-to-file.sh", "popup"]
+
+[[events]]
+on = "pane.closed"
+command = ["bash", "scripts/on-pane-closed.sh"]
+
+[[events]]
+on = "pane.exited"
+command = ["bash", "scripts/on-pane-exited.sh"]
