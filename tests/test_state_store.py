@@ -254,24 +254,40 @@ class WorkerReuseTests(unittest.TestCase):
         ready.start()
         self.addCleanup(ready.stop)
 
-    def test_reuse_finds_worker_with_matching_pane_repo_agent(self):
-        """find_reusable_worker should return a worker matching all three keys."""
+    def test_reuse_finds_worker_with_matching_pane_socket_repo_agent(self):
+        """find_reusable_worker should return a worker matching all four keys."""
         pane_id = "w1:p1"
-        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1"}):
+        socket_path = "/tmp/herdr.sock"
+        env = {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": socket_path}
+        
+        with patch.dict(os.environ, env):
             worker = plugin.create_worker(None, str(self.source), "HEAD", agent="codex")
         
-        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1"}):
-            found = plugin.find_reusable_worker(str(self.source), "codex", self.state)
+        with patch.dict(os.environ, env):
+            found, notice = plugin.find_reusable_worker(str(self.source), "codex", self.state)
         
         self.assertEqual(found, worker.name)
+        self.assertIsNone(notice)
 
     def test_reuse_returns_none_when_pane_id_differs(self):
         """Different pane ID should not match."""
-        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"}):
+        socket_path = "/tmp/herdr.sock"
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": socket_path}):
             plugin.create_worker(None, str(self.source), "HEAD", agent="codex")
         
-        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "HERDR_WORKSPACE_ID": "w1"}):
-            found = plugin.find_reusable_worker(str(self.source), "codex", self.state)
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": socket_path}):
+            found, _ = plugin.find_reusable_worker(str(self.source), "codex", self.state)
+        
+        self.assertIsNone(found)
+
+    def test_reuse_returns_none_when_socket_path_differs(self):
+        """Different socket path should not match (prevents multi-server collision)."""
+        pane_id = "w1:p1"
+        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": "/tmp/herdr-a.sock"}):
+            plugin.create_worker(None, str(self.source), "HEAD", agent="codex")
+        
+        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": "/tmp/herdr-b.sock"}):
+            found, _ = plugin.find_reusable_worker(str(self.source), "codex", self.state)
         
         self.assertIsNone(found)
 
@@ -287,44 +303,90 @@ class WorkerReuseTests(unittest.TestCase):
         git("-C", other_source, "commit", "-qm", "test")
         
         pane_id = "w1:p1"
-        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1"}):
+        socket_path = "/tmp/herdr.sock"
+        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": socket_path}):
             plugin.create_worker(None, str(self.source), "HEAD", agent="codex")
         
-        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1"}):
-            found = plugin.find_reusable_worker(str(other_source), "codex", self.state)
+        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": socket_path}):
+            found, _ = plugin.find_reusable_worker(str(other_source), "codex", self.state)
         
         self.assertIsNone(found)
 
     def test_reuse_returns_none_when_agent_differs(self):
         """Different agent should not match."""
         pane_id = "w1:p1"
-        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1"}):
+        socket_path = "/tmp/herdr.sock"
+        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": socket_path}):
             plugin.create_worker(None, str(self.source), "HEAD", agent="codex")
         
-        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1"}):
-            found = plugin.find_reusable_worker(str(self.source), "claude", self.state)
+        with patch.dict(os.environ, {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": socket_path}):
+            found, _ = plugin.find_reusable_worker(str(self.source), "claude", self.state)
         
         self.assertIsNone(found)
 
     def test_reuse_returns_none_when_pane_id_is_unset(self):
         """Missing HERDR_PANE_ID should always return None."""
-        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"}):
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": "/tmp/herdr.sock"}):
             plugin.create_worker(None, str(self.source), "HEAD", agent="codex")
         
-        with patch.dict(os.environ, {"HERDR_WORKSPACE_ID": "w1"}, clear=True):
-            found = plugin.find_reusable_worker(str(self.source), "codex", self.state)
+        with patch.dict(os.environ, {"HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": "/tmp/herdr.sock"}, clear=True):
+            found, _ = plugin.find_reusable_worker(str(self.source), "codex", self.state)
         
         self.assertIsNone(found)
 
     def test_reuse_returns_none_when_pane_id_is_empty_string(self):
         """Empty HERDR_PANE_ID should be treated as missing."""
-        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"}):
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": "/tmp/herdr.sock"}):
             plugin.create_worker(None, str(self.source), "HEAD", agent="codex")
         
-        with patch.dict(os.environ, {"HERDR_PANE_ID": "", "HERDR_WORKSPACE_ID": "w1"}):
-            found = plugin.find_reusable_worker(str(self.source), "codex", self.state)
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "", "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": "/tmp/herdr.sock"}):
+            found, _ = plugin.find_reusable_worker(str(self.source), "codex", self.state)
         
         self.assertIsNone(found)
+
+    def test_reuse_notices_when_head_has_moved(self):
+        """find_reusable_worker should notice when source HEAD has moved since worker creation."""
+        pane_id = "w1:p1"
+        socket_path = "/tmp/herdr.sock"
+        env = {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": socket_path}
+        
+        with patch.dict(os.environ, env):
+            worker = plugin.create_worker(None, str(self.source), "HEAD", agent="codex")
+        worker_id = worker.name
+        
+        # Move source HEAD forward
+        (self.source / "new.txt").write_text("new content\n")
+        git("-C", self.source, "add", "new.txt")
+        git("-C", self.source, "commit", "-qm", "new commit")
+        
+        with patch.dict(os.environ, env):
+            found, notice = plugin.find_reusable_worker(str(self.source), "codex", self.state)
+        
+        self.assertEqual(found, worker_id)
+        self.assertIsNotNone(notice)
+        self.assertIn("source HEAD has moved", notice)
+        self.assertIn(worker_id, notice)
+
+    def test_reuse_still_returns_worker_when_head_moved(self):
+        """Worker should be reused even when HEAD has moved (to preserve work)."""
+        pane_id = "w1:p1"
+        socket_path = "/tmp/herdr.sock"
+        env = {"HERDR_PANE_ID": pane_id, "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": socket_path}
+        
+        with patch.dict(os.environ, env):
+            worker = plugin.create_worker(None, str(self.source), "HEAD", agent="codex")
+        worker_id = worker.name
+        
+        # Move source HEAD forward
+        (self.source / "new.txt").write_text("new content\n")
+        git("-C", self.source, "add", "new.txt")
+        git("-C", self.source, "commit", "-qm", "new commit")
+        
+        with patch.dict(os.environ, env):
+            found, notice = plugin.find_reusable_worker(str(self.source), "codex", self.state)
+        
+        self.assertEqual(found, worker_id)
+        self.assertIsNotNone(notice)
 
 
 class WorkerMetadataTests(unittest.TestCase):
@@ -352,6 +414,7 @@ class WorkerMetadataTests(unittest.TestCase):
             "HERDR_PLUGIN_STATE_DIR": str(self.state),
             "HERDR_PANE_ID": "w1:p1",
             "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_SOCKET_PATH": "/tmp/herdr.sock",
         })
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -360,8 +423,8 @@ class WorkerMetadataTests(unittest.TestCase):
         ready.start()
         self.addCleanup(ready.stop)
 
-    def test_worker_records_pane_and_workspace_ids(self):
-        """Worker metadata should include pane_id and workspace_id."""
+    def test_worker_records_pane_workspace_and_socket(self):
+        """Worker metadata should include pane_id, workspace_id, and socket_path."""
         worker = plugin.create_worker(None, str(self.source), "HEAD", agent="codex")
         
         with (worker / "worker.json").open() as f:
@@ -369,6 +432,7 @@ class WorkerMetadataTests(unittest.TestCase):
         
         self.assertEqual(metadata["pane_id"], "w1:p1")
         self.assertEqual(metadata["workspace_id"], "w1")
+        self.assertEqual(metadata["socket_path"], "/tmp/herdr.sock")
 
     def test_worker_records_agent(self):
         """Worker metadata should include the agent name."""
@@ -379,8 +443,8 @@ class WorkerMetadataTests(unittest.TestCase):
         
         self.assertEqual(metadata["agent"], "claude")
 
-    def test_worker_records_null_pane_when_missing(self):
-        """Workers created without HERDR_PANE_ID should record null."""
+    def test_worker_records_null_when_herdr_context_missing(self):
+        """Workers created without Herdr context should record null."""
         env_without_pane = {
             "HERDR_PLUGIN_CONFIG_DIR": str(self.config),
             "HERDR_PLUGIN_STATE_DIR": str(self.state),
@@ -393,6 +457,7 @@ class WorkerMetadataTests(unittest.TestCase):
         
         self.assertIsNone(metadata["pane_id"])
         self.assertIsNone(metadata["workspace_id"])
+        self.assertIsNone(metadata["socket_path"])
 
     def test_worker_metadata_includes_result_branch_and_fetched_commit(self):
         """Worker metadata should have result_branch and fetched_commit fields."""

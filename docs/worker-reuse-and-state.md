@@ -60,7 +60,7 @@ The `status` field now includes a new lifecycle state: `"fetched"`.
 
 ## Worker Reuse
 
-Worker reuse is based on a three-part key: **(pane ID, source repo, agent)**.
+Worker reuse is based on a four-part key: **(pane ID, socket path, source repo, agent)**.
 
 ### Reuse Rules
 
@@ -69,40 +69,85 @@ Worker reuse is based on a three-part key: **(pane ID, source repo, agent)**.
    - Shells outside Herdr do not receive `HERDR_PANE_ID`
    - Never fall back to `focused_pane_id` from `HERDR_PLUGIN_CONTEXT_JSON`
 
-2. **All three keys must match** for reuse:
-   - Same pane ID
+2. **All four keys must match** for reuse:
+   - Same pane ID (`HERDR_PANE_ID`)
+   - Same socket path (`HERDR_SOCKET_PATH`)
    - Same source repository (resolved to absolute path)
    - Same agent
 
-3. **Different directory, different agent** → new worker
+3. **Different directory, agent, or session** → new worker
    - A pane that changes directory into another repo gets a new worker
    - A pane that switches from `hs codex` to `hs claude` gets a new worker
+   - A pane in a different Herdr server instance gets a new worker
 
-### Pane ID Stability (Verified with Herdr 0.9.5)
+### Collision Verification (Empirically Tested with Herdr 0.9.5)
 
-From the spike findings in `docs/herdr-pane-lifecycle.md` (PR #16):
+#### Test 1: Workspace ID Reuse After Closure
 
-- **Pane IDs are stable** across Herdr server restarts
-- **Pane IDs are never reused** after a pane is closed
-- **No collision risk** across sessions or workspaces
-  - The pane ID counter persists across restarts
-  - New panes always get a higher ID than any previous pane
-  - Format is `w<workspace-number>:p<pane-number>`
+**Commands:**
+```bash
+herdr server &
+herdr workspace create --label "test1"
+# Result: workspace_id=w1, pane_id=w1:p1
 
-**Conclusion**: Pane IDs alone are sufficient as a stable, unique reuse key. No additional session identity or disambiguation is needed.
+herdr workspace close "w1"
 
-### Workspace ID Considerations
+herdr workspace create --label "test2"
+# Result: workspace_id=w2, pane_id=w2:p1
+```
 
-The `workspace_id` is recorded for diagnostics and potential future use, but is not strictly required for the reuse key because:
-- Pane IDs already include workspace scope (`w1:p1`, `w2:p1`, etc.)
-- Different workspaces cannot have the same pane ID
-- The spike verified no collision risk
+**Result:** ✅ **NO COLLISION** - Workspace IDs are NOT reused after closure
+
+#### Test 2: Multiple Servers with Different Sockets
+
+**Commands:**
+```bash
+HERDR_SOCKET_PATH="/tmp/herdr-a.sock" herdr server &
+HERDR_SOCKET_PATH="/tmp/herdr-b.sock" herdr server &
+
+HERDR_SOCKET_PATH="/tmp/herdr-a.sock" herdr workspace create --label "session-a"
+# Result: workspace_id=w1, pane_id=w1:p1
+
+HERDR_SOCKET_PATH="/tmp/herdr-b.sock" herdr workspace create --label "session-b"
+# Result: workspace_id=w1, pane_id=w1:p1
+
+# Check pane environments
+HERDR_SOCKET_PATH="/tmp/herdr-a.sock" herdr pane read "w1:p1"
+# Output: SOCKET=/tmp/herdr-a.sock PANE=w1:p1 WS=w1
+
+HERDR_SOCKET_PATH="/tmp/herdr-b.sock" herdr pane read "w1:p1"
+# Output: SOCKET=/tmp/herdr-b.sock PANE=w1:p1 WS=w1
+```
+
+**Result:** ❌ **COLLISION DETECTED** - Multiple Herdr servers CAN have the same pane ID simultaneously!
+
+**Discriminator:** ✅ `HERDR_SOCKET_PATH` is available in pane environments and differs per server:
+- Server A pane sees: `/tmp/herdr-a.sock`
+- Server B pane sees: `/tmp/herdr-b.sock`
+
+### Conclusion from Empirical Testing
+
+**Socket path must be included in the reuse key** to prevent collision across multiple Herdr servers.
+
+- **Pane IDs are stable** within a single Herdr server across restarts
+- **Pane IDs are never reused** after a pane is closed (within same server)
+- **Pane IDs CAN collide** across different Herdr server instances
+- **Socket path disambiguates** server instances
+
+See `COLLISION_TEST_RESULTS.md` for full test details and commands.
+
+### Metadata Schema Update
+
+New field:
+- `socket_path`: Socket path from `HERDR_SOCKET_PATH` (null when not in Herdr)
 
 ## HEAD-Moved Behavior
 
+### At Fetch Time
+
 When a worker's result is fetched and the source repository HEAD has moved past the worker's base commit:
 
-### Decision: Proceed as-is with notice
+**Decision: Proceed as-is with notice**
 
 The plugin:
 1. Fetches the worker branch into `refs/heads/sandbox/<id>` as-is
@@ -114,15 +159,43 @@ The plugin:
 3. Does NOT auto-rebase
 4. Does NOT touch the host branch
 
-### Rationale
-
+**Rationale:**
 - **Predictable**: The user knows exactly what commit the worker started from
 - **Safe**: No automatic changes to the worker's result or the host branch
 - **Flexible**: The user can rebase, merge, or cherry-pick manually as needed
 - **Transparent**: The notice provides both SHAs so the user can assess the delta
 
-### Example Scenario
+### At Reuse Time
 
+When `hs <agent>` would reuse an existing worker and the source HEAD has moved since that worker's base commit:
+
+**Decision: Reuse the worker with notice**
+
+The plugin:
+1. Reuses the existing worker (to preserve any uncommitted work)
+2. Prints a one-line notice:
+   ```
+   Notice: reusing worker herdr-sandbox-a1b2c3; source HEAD has moved from abc123... to def456....
+   The worker is based on the original commit.
+   ```
+3. Does NOT create a new worker
+4. Does NOT update the worker's base commit
+
+**Rationale:**
+- **Preserves work**: The worker may have uncommitted changes or state
+- **Explicit control**: User can destroy the worker if they want a fresh one at current HEAD
+- **Consistent**: Matches the fetch-time behavior (proceed with notice)
+- **Transparent**: User is informed of the base commit mismatch
+
+**To start fresh at current HEAD:**
+```bash
+hs destroy <worker-id>
+hs codex  # Creates new worker at current HEAD
+```
+
+### Example Scenarios
+
+**Scenario 1: Fetch after HEAD moved**
 ```bash
 # Worker created when HEAD is at commit A
 hs codex
@@ -140,7 +213,24 @@ hs fetch
 # Commit: 789abc...
 ```
 
-The user can then review and integrate as appropriate:
+**Scenario 2: Reuse after HEAD moved**
+```bash
+# Worker exists, created at commit A
+# (previous session with `hs codex`)
+
+# Host has moved forward to commit B
+git log --oneline -1  # shows commit B
+
+# Relaunch in same pane
+hs codex
+
+# Output:
+# Notice: reusing worker herdr-sandbox-a1b2c3; source HEAD has moved from abc123... to def456....
+# The worker is based on the original commit.
+# [Worker starts with its existing state]
+```
+
+Integration example:
 ```bash
 git log main..sandbox/herdr-sandbox-a1b2c3
 git rebase main sandbox/herdr-sandbox-a1b2c3  # if desired
