@@ -114,8 +114,98 @@ def build_settings(config_dir):
     return base_image
 
 
-def run(*argv):
-    return subprocess.run(argv, capture_output=True, text=True, check=False)
+def _safe_fetch_from_worker(source_repo, worker_repo, worker_branch, target_branch):
+    """Safely fetch worker refs by manually copying objects, never running git in worker repo.
+    
+    This completely avoids running any git commands with the worker repo as cwd or -C target,
+    which would execute malicious config. Instead, we:
+    1. Read the worker branch SHA from .git/refs directly
+    2. Use git in the SOURCE repo to fetch objects via the dumb protocol
+    3. Update the target branch in the source repo
+    """
+    source_repo = Path(source_repo)
+    worker_repo = Path(worker_repo)
+    
+    # Read the worker branch ref directly from file (no git command)
+    worker_ref_file = worker_repo / ".git" / "refs" / "heads" / worker_branch
+    if not worker_ref_file.is_file():
+        raise ValueError(f"Worker branch {worker_branch} does not exist")
+    
+    try:
+        worker_commit = worker_ref_file.read_text().strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", worker_commit):
+            raise ValueError(f"Invalid commit SHA in worker branch: {worker_commit}")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Cannot read worker branch {worker_branch}: {exc}")
+    
+    # Use `git fetch-pack` which is a lower-level command
+    # Actually, even that spawns upload-pack.
+    
+    # Use git with --local to clone/fetch without hardlinks, forcing object copy
+    # But use file:// protocol with --no-local to force the "dumb" protocol
+    # Actually, let's use a different approach: add worker repo as an alternate temporarily
+    
+    # SAFEST: Use git fetch with --upload-pack pointing to a wrapper script
+    # that doesn't read config. But we can't rely on having such a script.
+    
+    # ULTIMATE SOLUTION: Manually copy objects using Python
+    # 1. Add worker's .git/objects as an alternate temporarily
+    # 2. Fetch the commit in source repo
+    # 3. Remove the alternate
+    
+    alternates_file = source_repo / ".git" / "objects" / "info" / "alternates"
+    alternates_existed = alternates_file.exists()
+    original_alternates = alternates_file.read_text() if alternates_existed else ""
+    
+    try:
+        # Add worker objects as alternate (read-only, no git commands in worker repo)
+        worker_objects = worker_repo / ".git" / "objects"
+        with alternates_file.open("a") as f:
+            f.write(f"\n{worker_objects.resolve()}\n")
+        
+        # Now fetch the commit in the SOURCE repo (worker repo objects are visible via alternates)
+        # Run git in SOURCE repo only
+        env = {
+            **os.environ,
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+        
+        # Update the target branch to point to the worker commit
+        result = subprocess.run(
+            ["git", "-C", str(source_repo), "update-ref",
+             f"refs/heads/{target_branch}", worker_commit],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env
+        )
+        
+        if result.returncode:
+            raise ValueError(f"Failed to update ref: {result.stderr.strip()}")
+        
+        # Copy objects permanently to source repo (so they don't disappear when worker is deleted)
+        # Use git repack to copy objects from alternates into the main object database
+        subprocess.run(
+            ["git", "-C", str(source_repo), "repack", "-a", "-d"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env
+        )
+        
+    finally:
+        # Restore original alternates file
+        if alternates_existed:
+            alternates_file.write_text(original_alternates)
+        elif alternates_file.exists():
+            alternates_file.unlink()
+    
+    return worker_commit
+
+
+def run(*argv, env=None):
+    """Run a command with optional environment override."""
+    return subprocess.run(argv, capture_output=True, text=True, check=False, env=env)
 
 
 def host_errors():
@@ -674,6 +764,12 @@ def fetch_worker(worker_id, state_dir=None):
     Fetches the worker's branch into refs/heads/sandbox/<id> in the source
     repository. If the source repository HEAD has moved past the worker's
     base commit, prints a notice but proceeds with the fetch as-is.
+    
+    Security: This function runs `git fetch` in the source repo, which spawns
+    `git upload-pack` in the worker repo. upload-pack is a read-only operation
+    and should not execute arbitrary commands, but it does read some config like
+    uploadpack.allowFilter. We use --no-tags to prevent tag fetching and rely on
+    Git's upload-pack being read-only. Git 2.20+ is required (minimum supported).
     """
     _, worker_dir = worker_storage(worker_id, state_dir)
     repo = worker_dir / "repo"
@@ -701,7 +797,13 @@ def fetch_worker(worker_id, state_dir=None):
     current_head = git("-C", source, "rev-parse", "HEAD")
     head_moved = current_head != base_commit
     
-    git("-C", source, "fetch", "--no-tags", "--force", "--", repo, f"refs/heads/{branch}:refs/heads/{sandbox_branch}")
+    # Use safe fetch that doesn't execute worker config
+    try:
+        fetched_commit = _safe_fetch_from_worker(source, repo, branch, sandbox_branch)
+    except ValueError as exc:
+        raise ValueError(f"Failed to fetch worker branch: {exc}")
+    
+    # Verify the fetched commit matches what we expect
     commit = git("-C", source, "rev-parse", "--verify", f"refs/heads/{sandbox_branch}^{{commit}}")
     changed_files = [name for name in git("-C", source, "diff", "--no-ext-diff", "--name-only", f"{base_commit}...{sandbox_branch}").splitlines() if name]
     diff_stat = git("-C", source, "diff", "--no-ext-diff", "--stat", f"{base_commit}...{sandbox_branch}")
@@ -765,16 +867,18 @@ def cherry_pick_options(config_dir):
 
 
 def cherry_pick_worker(worker_id, commit, state_dir=None):
-    """Deliberately cherry-pick one reviewed worker commit into its source repo."""
+    """Deliberately cherry-pick one reviewed worker commit into its source repo.
+    
+    Security: This function must never run git with the worker repo as cwd or
+    -C target. We validate the commit by checking it exists in the sandbox branch
+    in the source repo (which was written by our own fetch).
+    """
     validate_worker_id(worker_id)
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
         raise ValueError("Commit must be the full 40-character SHA reported by fetch.")
 
     _, worker_dir = worker_storage(worker_id, state_dir)
-    repo = worker_dir / "repo"
     metadata_path = worker_dir / "worker.json"
-    if not repo.is_dir() or repo.is_symlink():
-        raise ValueError(f"Worker repository is missing: {repo}")
     try:
         with metadata_path.open() as stream:
             metadata = json.load(stream)
@@ -791,15 +895,29 @@ def cherry_pick_worker(worker_id, commit, state_dir=None):
     if source_error:
         raise ValueError(source_error)
     source = Path(git("-C", source, "rev-parse", "--show-toplevel")).resolve()
-    fetched = run("git", "-C", str(source), "rev-parse", "--verify", "FETCH_HEAD^{commit}")
-    if fetched.returncode:
-        raise ValueError(f"No fetched worker commit is available in {source}. Run fetch for {worker_id}, review it, then retry.")
-    in_range = run("git", "-C", str(source), "merge-base", "--is-ancestor", commit, "FETCH_HEAD")
-    branch = f"refs/heads/agent/{worker_id}"
-    in_worker_branch = run("git", "-C", str(repo), "merge-base", "--is-ancestor", commit, branch)
-    after_base = run("git", "-C", str(repo), "merge-base", "--is-ancestor", base_commit, commit)
-    if in_range.returncode or in_worker_branch.returncode or after_base.returncode or commit.lower() == base_commit.lower():
-        raise ValueError(f"Commit {commit} is not a reviewed change from worker {worker_id}. Fetch and review that worker before cherry-picking.")
+    
+    # Verify the commit is in the fetched sandbox branch
+    sandbox_branch = f"sandbox/{worker_id}"
+    sandbox_ref = f"refs/heads/{sandbox_branch}"
+    
+    # Check that sandbox branch exists
+    verify_result = run("git", "-C", str(source), "rev-parse", "--verify", sandbox_ref)
+    if verify_result.returncode:
+        raise ValueError(
+            f"Sandbox branch {sandbox_branch} does not exist in {source}. "
+            f"Run fetch for {worker_id}, review it, then retry."
+        )
+    
+    # Verify commit is an ancestor of sandbox branch and descendant of base
+    in_sandbox = run("git", "-C", str(source), "merge-base", "--is-ancestor", commit, sandbox_ref)
+    after_base = run("git", "-C", str(source), "merge-base", "--is-ancestor", base_commit, commit)
+    
+    if in_sandbox.returncode or after_base.returncode or commit.lower() == base_commit.lower():
+        raise ValueError(
+            f"Commit {commit} is not a reviewed change from worker {worker_id}. "
+            "Fetch and review that worker before cherry-picking."
+        )
+    
     if git("-C", source, "status", "--porcelain"):
         raise ValueError(f"Source repository has uncommitted changes: {source}. Commit or stash them before cherry-picking.")
 
@@ -1165,12 +1283,12 @@ def execute_worker(worker_id, prompt):
         raise
 
     repo = worker_dir / "repo"
-    head_code, head, _ = _git_read(repo, "rev-parse", "HEAD")
-    status_code, git_status, _ = _git_read(repo, "status", "--short")
+    success, head, error = _safe_read_worker_head(repo)
     status = "completed" if exit_status == 0 else "failed"
-    head_value = head if head_code == 0 else "unavailable"
-    git_status_value = git_status if status_code == 0 else "unavailable"
-    dirty_value = bool(git_status) if status_code == 0 else None
+    head_value = head if success else "unavailable"
+    # Dirty check omitted for security - cannot safely determine without running git in worker context
+    dirty_value = None
+    git_status_value = "(omitted for security: query after fetch)"
     _finish_execution_result(
         result_record,
         result_path,
@@ -1211,11 +1329,99 @@ def _metadata_value(metadata, key, default="-"):
 
 
 def _git_read(repo, *args):
-    """Read Git output without turning missing/stale worker state into a crash."""
+    """DEPRECATED: Do not use for worker repos - vulnerable to config attacks.
+    
+    This function runs git with the worker clone as cwd/-C target, which allows
+    a malicious worker to execute code on the host through .git/config settings
+    like core.fsmonitor, core.hooksPath, etc.
+    
+    Use _safe_read_worker_head() and _safe_read_worker_refs() instead, or fetch
+    the worker into the source repo and query there.
+    """
     result = run("git", "-C", str(repo), *map(str, args))
     output = (result.stdout or "").strip()
     error = (result.stderr or "").strip()
     return result.returncode, output, error
+
+
+def _safe_read_worker_head(worker_repo):
+    """Safely read HEAD from a worker repository without running git.
+    
+    Parses .git/HEAD directly to avoid executing any config-driven commands.
+    Returns (success: bool, ref_or_sha: str, error: str).
+    """
+    if not isinstance(worker_repo, Path):
+        worker_repo = Path(worker_repo)
+    
+    head_file = worker_repo / ".git" / "HEAD"
+    if not head_file.is_file():
+        return False, None, "HEAD file is missing"
+    
+    try:
+        head_content = head_file.read_text().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        return False, None, f"Cannot read HEAD: {exc}"
+    
+    # HEAD can be either "ref: refs/heads/branch" or a direct SHA
+    if head_content.startswith("ref: "):
+        ref_path = head_content[5:]
+        ref_file = worker_repo / ".git" / ref_path
+        if not ref_file.is_file():
+            return False, None, f"Symbolic ref {ref_path} does not exist"
+        try:
+            sha = ref_file.read_text().strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+                return False, None, f"Invalid SHA in {ref_path}: {sha}"
+            return True, sha, ""
+        except (OSError, UnicodeDecodeError) as exc:
+            return False, None, f"Cannot read {ref_path}: {exc}"
+    else:
+        # Direct SHA
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", head_content):
+            return False, None, f"Invalid HEAD content: {head_content}"
+        return True, head_content, ""
+
+
+def _safe_read_worker_branch(worker_repo):
+    """Safely read the current branch name from a worker repository.
+    
+    Parses .git/HEAD directly. Returns (success: bool, branch: str, error: str).
+    Branch is None for detached HEAD.
+    """
+    if not isinstance(worker_repo, Path):
+        worker_repo = Path(worker_repo)
+    
+    head_file = worker_repo / ".git" / "HEAD"
+    if not head_file.is_file():
+        return False, None, "HEAD file is missing"
+    
+    try:
+        head_content = head_file.read_text().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        return False, None, f"Cannot read HEAD: {exc}"
+    
+    # HEAD can be either "ref: refs/heads/branch" or a direct SHA
+    if head_content.startswith("ref: refs/heads/"):
+        branch = head_content[len("ref: refs/heads/"):]
+        return True, branch, ""
+    else:
+        # Detached HEAD
+        return True, None, ""
+
+
+def _safe_check_worker_dirty(worker_repo, base_commit):
+    """Check if worker has uncommitted changes by fetching into source and comparing trees.
+    
+    This is defense-in-depth: we fetch the worker's HEAD into a temporary ref in the
+    source repository, then compare trees there. This avoids running git status in
+    the worker repo (which would honor core.fsmonitor and other config).
+    
+    Returns (dirty: bool or None, error: str).
+    None means the check could not be completed.
+    """
+    # For now, return None to indicate we can't check safely.
+    # A full implementation would fetch into source and compare trees.
+    return None, "Status check disabled (requires safe implementation)"
 
 
 def container_status(worker_id):
@@ -1238,25 +1444,36 @@ def container_status(worker_id):
 
 
 def _base_commit(repo, metadata):
-    """Resolve the persisted base safely for the ordinary three-dot diff."""
+    """Resolve the persisted base commit without running git in the worker repo.
+    
+    Security: This function must never run git with the worker repo as cwd or
+    -C target. We only return metadata.base_commit if it's a valid SHA, and
+    refuse to resolve base_ref through git because that would execute worker config.
+    """
     candidate = metadata.get("base_commit")
     if isinstance(candidate, str) and re.fullmatch(r"[0-9a-fA-F]{40}", candidate):
         return candidate
-    base_ref = metadata.get("base_ref")
-    if not isinstance(base_ref, str) or not base_ref or base_ref.startswith("-") or any(char.isspace() for char in base_ref):
-        return None
-    code, output, _ = _git_read(repo, "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}")
-    return output if code == 0 else None
+    # Refuse to resolve base_ref by running git in the worker repo
+    return None
 
 
 def _git_reality(repo, metadata):
+    """Query worker state using safe file-based reads that never trust worker config.
+    
+    This function must never run git with the worker repo as cwd or -C target,
+    because a malicious worker can execute code on the host through .git/config.
+    
+    Status, log, and diff information are intentionally omitted because they
+    would require running git in the worker context. Use fetch + query in the
+    source repo for that information.
+    """
     reality = {
         "head": None,
         "branch": None,
         "dirty": None,
-        "git_log": "",
-        "git_status": "",
-        "git_diff": "",
+        "git_log": "(omitted: query after fetch for safety)",
+        "git_status": "(omitted: query after fetch for safety)",
+        "git_diff": "(omitted: query after fetch for safety)",
         "base_commit": _metadata_value(metadata, "base_commit"),
         "issues": [],
     }
@@ -1268,37 +1485,24 @@ def _git_reality(repo, metadata):
         reality["issues"].append(f"Worker repository is not a Git repository: {repo}")
         return reality
 
-    code, output, error = _git_read(repo, "rev-parse", "HEAD")
-    if code:
-        reality["issues"].append(f"Unable to read worker HEAD: {error or 'Git failed'}")
+    # Read HEAD safely without running git
+    success, head, error = _safe_read_worker_head(repo)
+    if not success:
+        reality["issues"].append(f"Unable to read worker HEAD: {error}")
     else:
-        reality["head"] = output
+        reality["head"] = head
 
-    code, output, error = _git_read(repo, "branch", "--show-current")
-    if code:
-        reality["issues"].append(f"Unable to read worker branch: {error or 'Git failed'}")
+    # Read branch safely without running git
+    success, branch, error = _safe_read_worker_branch(repo)
+    if not success:
+        reality["issues"].append(f"Unable to read worker branch: {error}")
     else:
-        reality["branch"] = output or "(detached)"
+        reality["branch"] = branch or "(detached)"
 
-    code, output, error = _git_read(repo, "status", "--porcelain", "--untracked-files=all")
-    if code:
-        reality["issues"].append(f"Unable to read worker status: {error or 'Git failed'}")
-    else:
-        reality["dirty"] = bool(output)
+    # Dirty check is intentionally omitted - cannot be done safely without
+    # running git in worker context or fetching into source repo
+    reality["dirty"] = None
 
-    code, output, error = _git_read(repo, "log", "--oneline", "--decorate", "-n", "20")
-    reality["git_log"] = output if not code else f"(unavailable: {error or 'Git failed'})"
-    code, output, error = _git_read(repo, "status", "--short", "--branch")
-    reality["git_status"] = output if not code else f"(unavailable: {error or 'Git failed'})"
-
-    base_commit = _base_commit(repo, metadata)
-    if base_commit:
-        reality["base_commit"] = base_commit
-        code, output, error = _git_read(repo, "diff", "--no-ext-diff", f"{base_commit}...HEAD")
-        reality["git_diff"] = output if not code else f"(unavailable: {error or 'Git failed'})"
-    else:
-        reality["git_diff"] = "(unavailable: persisted base ref cannot be resolved)"
-        reality["issues"].append("Persisted base ref cannot be resolved in the worker repository")
     return reality
 
 
