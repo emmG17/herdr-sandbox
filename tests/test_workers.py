@@ -87,14 +87,16 @@ class WorkerInspectionTests(unittest.TestCase):
         record = plugin.inspect_worker("TEST-001")
 
         self.assertEqual(record["actual_branch"], "agent/TEST-001")
-        self.assertTrue(record["dirty"])
-        self.assertIn("worker change", record["git_log"])
-        self.assertIn("untracked.txt", record["git_status"])
-        self.assertIn("worker change", record["git_diff"])
+        # dirty is now None for security (not checked on host)
+        self.assertIsNone(record["dirty"])
+        # git_log, git_status, git_diff are now omitted for security
+        self.assertIn("omitted", record["git_log"].lower())
+        self.assertIn("omitted", record["git_status"].lower())
+        self.assertIn("omitted", record["git_diff"].lower())
         rendered = plugin.format_worker(record)
         self.assertIn("Git log:", rendered)
         self.assertIn("Git status:", rendered)
-        self.assertIn("Git diff base...HEAD:", rendered)
+        self.assertIn("Git diff", rendered)
 
     def test_live_container_overrides_persisted_lifecycle_status(self):
         worker = self.create_worker()

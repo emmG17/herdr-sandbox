@@ -193,6 +193,15 @@ def _safe_fetch_from_worker(source_repo, worker_repo, worker_branch, target_bran
             env=env
         )
         
+        # Also set FETCH_HEAD for compatibility with existing code
+        subprocess.run(
+            ["git", "-C", str(source_repo), "update-ref", "FETCH_HEAD", worker_commit],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env
+        )
+        
     finally:
         # Restore original alternates file
         if alternates_existed:

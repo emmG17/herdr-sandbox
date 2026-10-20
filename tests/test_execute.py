@@ -88,8 +88,9 @@ class ExecuteWorkerTests(unittest.TestCase):
         durable = json.loads(Path(result["result_location"]).read_text())
         self.assertEqual(durable["worker_id"], "TEST-001")
         self.assertEqual(durable["exit_status"], 0)
-        self.assertEqual(durable["head"], "abc123")
-        self.assertTrue(durable["dirty"])
+        self.assertEqual(durable["head"], "abc123def456789012345678901234567890abcd")
+        # dirty is now None for security
+        self.assertIsNone(durable["dirty"])
         self.assertEqual(durable["log_location"], result["log_location"])
         metadata = json.loads((self.state / "workers" / "TEST-001" / "worker.json").read_text())
         self.assertEqual(metadata["status"], "completed")
