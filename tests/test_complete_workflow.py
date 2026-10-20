@@ -64,7 +64,8 @@ class CompleteWorkflowTests(unittest.TestCase):
                 patch.object(plugin.sys, "stdout", new_callable=io.StringIO) as worker_output:
             result = plugin.execute_worker("FLOW-001", "write worker.txt")
         self.assertEqual(result["exit_status"], 0)
-        self.assertTrue(result["dirty"])
+        # Dirty is now None for security (not checked on host)
+        self.assertIsNone(result["dirty"])
         self.assertIn("completed\n", worker_output.getvalue())
 
         git("-C", worker_repo, "config", "user.name", "Worker")
@@ -76,7 +77,8 @@ class CompleteWorkflowTests(unittest.TestCase):
         with patch.object(plugin, "container_status", return_value="not-found"):
             inspection = plugin.inspect_worker("FLOW-001")
         self.assertEqual(inspection["head"], worker_head)
-        self.assertIn("worker-only change", inspection["git_diff"])
+        # git_diff is now omitted for security (not queried on host)
+        self.assertIn("omitted", inspection["git_diff"].lower())
 
         fetched = plugin.fetch_worker("FLOW-001")
         self.assertEqual(fetched["commit"], worker_head)

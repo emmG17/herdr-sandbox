@@ -53,10 +53,10 @@ class ExecuteWorkerTests(unittest.TestCase):
         self.assertEqual(command[-5:], ["codex", "exec", "--sandbox", "danger-full-access", "write a file"])
 
     def test_execute_streams_output_and_persists_result_and_log(self):
-        git_results = iter([
-            (0, "abc123", ""),
-            (0, " M persisted.txt", ""),
-        ])
+        # Create a valid .git/HEAD file for the safe read function
+        worker_git_dir = self.state / "workers" / "TEST-001" / "repo" / ".git"
+        (worker_git_dir / "HEAD").write_text("abc123def456789012345678901234567890abcd\n")
+        
         persisted_file = self.state / "workers" / "TEST-001" / "repo" / "persisted.txt"
         code = (
             "from pathlib import Path; "
@@ -66,7 +66,6 @@ class ExecuteWorkerTests(unittest.TestCase):
 
         with patch.object(plugin, "check", return_value=[]) as check, \
                 patch.object(plugin, "execute_command", return_value=[sys.executable, "-c", code]), \
-                patch.object(plugin, "_git_read", side_effect=lambda *args: next(git_results)), \
                 patch.object(plugin.sys, "stdout", new_callable=io.StringIO) as stdout, \
                 patch.object(plugin.sys, "stderr", new_callable=io.StringIO) as stderr:
             result = plugin.execute_worker("TEST-001", "write persisted.txt")
@@ -74,9 +73,11 @@ class ExecuteWorkerTests(unittest.TestCase):
         check.assert_called_once_with(require_auth=True)
         self.assertEqual(result["exit_status"], 0)
         self.assertTrue(result["run_id"].startswith("run-"))
-        self.assertEqual(result["head"], "abc123")
-        self.assertEqual(result["git_status"], " M persisted.txt")
-        self.assertTrue(result["dirty"])
+        self.assertEqual(result["head"], "abc123def456789012345678901234567890abcd")
+        # git_status is now omitted for security
+        self.assertIn("omitted", result["git_status"].lower())
+        # dirty is now None for security
+        self.assertIsNone(result["dirty"])
         self.assertEqual(stdout.getvalue(), "task output\n")
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(persisted_file.read_text(), "saved by Codex\n")
