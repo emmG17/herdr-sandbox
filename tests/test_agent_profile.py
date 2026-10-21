@@ -314,6 +314,9 @@ class AgentProfileTests(unittest.TestCase):
         self.assertEqual(argv, list(plugin.DEFAULT_PROFILE.login_argv))
         self.assertEqual(env[plugin.DEFAULT_PROFILE.home_env_var], str((self.config / "codex").resolve()))
         self.assertNotEqual(env[plugin.DEFAULT_PROFILE.home_env_var], str(plugin.DEFAULT_PROFILE.normal_user_home_path()))
+        # Codex opts out of login HOME isolation (CODEX_HOME is enough).
+        self.assertFalse(plugin.DEFAULT_PROFILE.login_isolate_home)
+        self.assertEqual(env.get("HOME"), os.environ.get("HOME"))
 
     def test_prompt_and_interactive_share_per_launch_home_policy(self):
         worker = self.state / "workers" / "TEST-001"
@@ -498,6 +501,44 @@ class AgentProfileTests(unittest.TestCase):
         argv, env = calls[0]
         self.assertEqual(argv, list(plugin.CLAUDE_PROFILE.login_argv))
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(home.resolve()))
+
+    def test_login_isolates_home_for_claude(self):
+        """Claude login HOME is plugin-owned; argv/env never point at host ~/.claude.json."""
+        self.assertTrue(plugin.CLAUDE_PROFILE.login_isolate_home)
+        host_claude_json = str((Path.home() / ".claude.json").resolve())
+        calls = []
+
+        def fake_run(argv, env=None, check=False):
+            calls.append((argv, env))
+            return type("R", (), {"returncode": 0})()
+
+        with patch.object(plugin.subprocess, "run", side_effect=fake_run):
+            code = plugin.login_agent(plugin.CLAUDE_PROFILE.name)
+        self.assertEqual(code, 0)
+        argv, env = calls[0]
+        login_home = Path(env["HOME"])
+        self.assertTrue(login_home.is_relative_to(self.state.resolve()))
+        self.assertEqual(login_home, (self.state / "login-homes" / "claude").resolve())
+        self.assertNotEqual(login_home, Path.home())
+        self.assertEqual(login_home.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(login_home.is_symlink())
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str((self.config / "claude").resolve()))
+        self.assertNotEqual(env["CLAUDE_CONFIG_DIR"], env["HOME"])
+        # Nothing in argv or env points at the host ~/.claude.json.
+        self.assertNotIn(host_claude_json, argv)
+        for key, value in env.items():
+            self.assertNotEqual(str(value), host_claude_json, key)
+            self.assertNotIn(host_claude_json, str(value), key)
+        self.assertNotIn(str(Path.home()), [str(login_home), env["CLAUDE_CONFIG_DIR"]])
+
+    def test_login_home_refuses_symlink_components(self):
+        evil = Path(self.temp.name) / "evil-login"
+        evil.mkdir()
+        root = self.state / "login-homes"
+        root.mkdir(mode=0o700)
+        (root / "claude").symlink_to(evil)
+        with self.assertRaisesRegex(ValueError, r"symlink|real directory"):
+            plugin.ensure_login_home(self.state, plugin.CLAUDE_PROFILE)
 
     def test_login_refuses_claude_banned_host_paths(self):
         user_home = Path(self.temp.name) / "user-home"

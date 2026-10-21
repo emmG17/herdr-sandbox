@@ -95,11 +95,18 @@ home (see [Claude Code authentication](https://code.claude.com/docs/en/authentic
 and [`CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/env-vars)).
 `CLAUDE_CONFIG_DIR` relocates the `~/.claude` config directory (including
 `.credentials.json`), but it does **not** relocate the separate global
-`~/.claude.json` file under the host home
-([Claude directory](https://code.claude.com/docs/en/claude-directory)). Login
-refuses normal user homes (`~/.codex`, `~/.claude`) and banned host paths such
-as `~/.claude.json`. After `hs login claude`, confirm the host `~/.claude.json`
-is unchanged (see `docs/manual-worker-security-test.md`).
+`~/.claude.json` file, which is HOME-relative
+([Claude directory](https://code.claude.com/docs/en/claude-directory)).
+`hs login claude` therefore also sets `HOME` to a dedicated plugin-owned
+directory under the plugin state dir (`login-homes/claude`, mode `0700`) so the
+host CLI cannot create or modify the real `~/.claude.json`. That login HOME is
+a sibling of worker state, not under the Claude agent home (the agent home can
+be bind-mounted wholesale on non-fresh opens; per-launch sessions only copy
+auth files). Codex leaves host `HOME` unchanged because `CODEX_HOME` already
+redirects its state. Login refuses normal user homes (`~/.codex`, `~/.claude`)
+and banned host paths such as `~/.claude.json`. After `hs login claude`, the
+manual security test still `cmp`s the host `~/.claude.json` as a regression
+check (see `docs/manual-worker-security-test.md`).
 
 Then, in a Herdr pane containing the Git repository you want to change:
 
