@@ -93,4 +93,4 @@ rm -rf /tmp/security-test-repo /tmp/security-test-head.txt
 ```
 
 If any denied-access check succeeds, stop using the plugin, retain the worker for
-investigation, and report the command output. Do not fetch or cherry-pick its work.
+investigation, and report the command output. Do not fetch or integrate its work.

@@ -13,7 +13,8 @@ not operate directly in your source checkout.
 The plugin does not replace Herdr, automatically merge worker changes, or give
 a worker host credentials, container-engine sockets, or source-repository
 write access. `fetch` force-updates only `refs/heads/sandbox/<id>` in the
-source repo; cherry-picking remains a separate, explicit action after review.
+source repo. Integration is ordinary git (`merge`, rebase, or applying
+selected commits) after you review that branch.
 
 Codex uses `danger-full-access` *inside the container*. Rootless Podman is the
 security boundary: the runtime mounts only the worker repository at
@@ -101,11 +102,12 @@ into `refs/heads/sandbox/<id>` and prints the branch name, commit count, and a
 short log. It works from any Herdr pane or plain shell without requiring
 action-specific environment variables.
 
-Review results with plain git:
+Review and integrate with plain git:
 
 ```sh
 git log main..sandbox/<id>
 git diff main...sandbox/<id>
+git merge sandbox/<id>    # or cherry-pick or rebase
 hs fetch <id>   # re-run fetch by hand (for example after switching off a checked-out sandbox branch)
 ```
 
@@ -123,21 +125,8 @@ herdr plugin action invoke fetch --plugin dev.herdr.sandbox
 one worker, `start-codex`, `inspect`, and `fetch` select it automatically; when
 several workers exist, configure `[open].id` in `config.toml` for the pane.
 
-Review the fetched branch, changed files, and diff. To integrate via the legacy
-cherry-pick action, configure the exact 40-character SHA reported by `fetch`:
-
-```toml
-[cherry_pick]
-id = "WORKER-001"
-commit = "0123456789abcdef0123456789abcdef01234567"
-```
-
-```sh
-herdr plugin action invoke cherry-pick --plugin dev.herdr.sandbox
-```
-
-Cherry-pick rejects a dirty source repository and commits outside the selected
-worker's fetched range. After fetching anything worth keeping, configure
+`fetch` writes `refs/heads/sandbox/<id>` and prints the same review and
+integration commands. After keeping or discarding the result, configure
 `[destroy].id` and remove the worker:
 
 ```sh
@@ -271,7 +260,7 @@ HERDR_PLUGIN_CONFIG_DIR=/path/to/config HERDR_PLUGIN_STATE_DIR=/path/to/state \
 python3 bin/herdr-sandbox create --id WORKER-001 --repo /path/to/source-repo --base main
 ```
 
-### One-off execute, cherry-pick, and destroy inputs
+### One-off execute and destroy inputs
 
 Herdr 0.9.0 plugin actions have fixed command arguments. `herdr plugin action
 invoke` does not forward arguments after the action ID, so a command such as
@@ -287,8 +276,7 @@ SANDBOX_LAUNCHER="$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox"
 "$SANDBOX_LAUNCHER" execute --id WORKER-001 \
   --prompt "Implement the requested change and run the relevant tests."
 
-"$SANDBOX_LAUNCHER" cherry-pick --id WORKER-001 \
-  --commit 0123456789abcdef0123456789abcdef01234567
+"$SANDBOX_LAUNCHER" fetch WORKER-001
 
 "$SANDBOX_LAUNCHER" destroy --id WORKER-001
 ```
@@ -297,10 +285,10 @@ These direct invocations are one-shot overrides: each command requires all of
 its inputs and does not read that action's config table. The launcher safely
 binds the Herdr-provided config and state directories to the plugin script and
 forwards arguments directly, without shell evaluation. It still uses the same
-hardened runtime, worker-path validation, reviewed-commit range checks,
-clean-source check, and destroy ordering as the corresponding Herdr action.
-Rerun setup/bootstrap after changing the plugin installation so the launcher
-refreshes its bound script path.
+hardened runtime, worker-path validation, and destroy ordering as the
+corresponding Herdr action. After `fetch`, integrate with plain git on
+`sandbox/<id>`. Rerun setup/bootstrap after changing the plugin installation so
+the launcher refreshes its bound script path.
 
 The plugin waits for the Codex process it starts, but it cannot add a separate
 `--wait` or status protocol to Herdr's plugin-action API. Herdr 0.9.0 controls
