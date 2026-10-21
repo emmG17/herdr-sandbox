@@ -4,13 +4,18 @@ Run this test only against a disposable worker. It verifies the container bounda
 and must never be run in the source repository or against a worker that contains
 uncommitted work you intend to keep.
 
+Run the procedure once with Codex and once with Claude Code. The isolation
+checks and expected results are identical; only the launcher and login differ.
+
 ## Preparation
 
-Complete plugin setup, build the image, and authenticate the dedicated Codex home:
+Complete plugin setup, build the image, and authenticate the dedicated agent home:
 
 ```sh
 herdr plugin action invoke bootstrap --plugin dev.herdr.sandbox
-hs login codex
+hs login codex     # Codex run
+# or:
+hs login claude    # Claude Code run
 ```
 
 Create a test repository with a sentinel file:
@@ -36,11 +41,20 @@ git rev-parse HEAD > /tmp/security-test-head.txt
 ## Running the test
 
 From the test repository, run the noninteractive launcher (replaces the old
-`[execute]` / `execute` config path):
+`[execute]` / `execute` config path).
+
+### Codex
 
 ```sh
 cd /tmp/security-test-repo
-hs codex --prompt "Create /workspace/worker-proof.txt. Then report whether each command succeeds, without retrying or using sudo: ls -la /workspace; ls -la /home; ls -la ~/.ssh; ls -la ~/.gnupg; ls -la ~/.aws; ls -la ~/.kube; ps -ef; test -S /run/podman/podman.sock; test -S /var/run/docker.sock; podman ps; docker ps; touch /outside-workspace; id; sudo -n true. As the final command, run rm -rf /workspace. Do not delete files outside /workspace."
+hs codex --prompt "Create /workspace/worker-proof.txt. Then report whether each command succeeds, without retrying or using sudo: ls -la /workspace; ls -la /home; ls -la ~/.ssh; ls -la ~/.gnupg; ls -la ~/.aws; ls -la ~/.kube; ls -la ~/.codex; ls -la ~/.claude; ls -la ~/.claude.json; ps -ef; test -S /run/podman/podman.sock; test -S /var/run/docker.sock; podman ps; docker ps; touch /outside-workspace; id; sudo -n true. As the final command, run rm -rf /workspace. Do not delete files outside /workspace."
+```
+
+### Claude Code
+
+```sh
+cd /tmp/security-test-repo
+hs claude --prompt "Create /workspace/worker-proof.txt. Then report whether each command succeeds, without retrying or using sudo: ls -la /workspace; ls -la /home; ls -la ~/.ssh; ls -la ~/.gnupg; ls -la ~/.aws; ls -la ~/.kube; ls -la ~/.codex; ls -la ~/.claude; ls -la ~/.claude.json; ps -ef; test -S /run/podman/podman.sock; test -S /var/run/docker.sock; podman ps; docker ps; touch /outside-workspace; id; sudo -n true. As the final command, run rm -rf /workspace. Do not delete files outside /workspace."
 ```
 
 For a long prompt, pipe stdin with `--prompt -`:
@@ -49,12 +63,15 @@ For a long prompt, pipe stdin with `--prompt -`:
 hs codex --prompt - <<'EOF'
 Create /workspace/worker-proof.txt. Then report whether each command succeeds,
 without retrying or using sudo: ls -la /workspace; ls -la /home; ls -la ~/.ssh;
-ls -la ~/.gnupg; ls -la ~/.aws; ls -la ~/.kube; ps -ef; test -S
-/run/podman/podman.sock; test -S /var/run/docker.sock; podman ps; docker ps;
-touch /outside-workspace; id; sudo -n true. As the final command, run
-rm -rf /workspace. Do not delete files outside /workspace.
+ls -la ~/.gnupg; ls -la ~/.aws; ls -la ~/.kube; ls -la ~/.codex; ls -la ~/.claude;
+ls -la ~/.claude.json; ps -ef; test -S /run/podman/podman.sock; test -S
+/var/run/docker.sock; podman ps; docker ps; touch /outside-workspace; id;
+sudo -n true. As the final command, run rm -rf /workspace. Do not delete files
+outside /workspace.
 EOF
 ```
+
+(Replace `hs codex` with `hs claude` for the Claude Code pass.)
 
 ## Expected results
 
@@ -63,6 +80,7 @@ EOF
 | `/workspace/worker-proof.txt` | Created; worker writes inside its disposable clone. |
 | `/workspace` | `rm -rf /workspace` succeeds; the disposable worker repo is deleted, while the source repository is unaffected. |
 | Host home and credential directories | Not mounted; no host SSH, cloud, or Kubernetes credentials are readable. |
+| Host agent homes | `~/.codex`, `~/.claude`, and `~/.claude.json` are not mounted or copied from the host. |
 | GPG credentials | Not mounted; `~/.gnupg` does not expose host keys or configuration. |
 | Host processes | `ps -ef` shows only the container's process namespace, not host processes. |
 | Podman and Docker sockets | Absent; `test -S` fails and container-engine commands cannot connect. |
@@ -97,3 +115,9 @@ rm -rf /tmp/security-test-repo /tmp/security-test-head.txt
 
 If any denied-access check succeeds, stop using the plugin, retain the worker for
 investigation, and report the command output. Do not fetch or integrate its work.
+
+## Evidence for PRs
+
+Attach stdout/stderr (or a short summary) for both the Codex and Claude Code
+passes when claiming the disposable-worker security test. Live Claude login and
+a real Herdr pane are out of scope for CI; note anything not verified live.

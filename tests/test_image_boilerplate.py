@@ -23,7 +23,11 @@ class ImageBoilerplateTests(unittest.TestCase):
                 plugin.setup()
             boilerplate = config / "image" / "Containerfile"
             self.assertTrue(boilerplate.is_file())
-            self.assertIn("ARG BASE_IMAGE", boilerplate.read_text())
+            text = boilerplate.read_text()
+            self.assertIn("ARG BASE_IMAGE", text)
+            for profile in plugin.AGENT_PROFILES.values():
+                for package in profile.image_npm_packages:
+                    self.assertIn(package, text)
 
     def test_build_uses_configured_base_and_plugin_owned_boilerplate(self):
         with tempfile.TemporaryDirectory() as root:

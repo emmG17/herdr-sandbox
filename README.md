@@ -1,12 +1,12 @@
 # Herdr Sandbox Workers
 
-`dev.herdr.sandbox` is a Linux plugin for Herdr. It runs Codex in a disposable
-Git clone inside a hardened, rootless Podman container; Herdr remains the
-control plane.
+`dev.herdr.sandbox` is a Linux plugin for Herdr. It runs Codex or Claude Code in
+a disposable Git clone inside a hardened, rootless Podman container; Herdr
+remains the control plane.
 
 ## What it does—and does not do
 
-Each worker gets an independent local clone. Codex may read, write, delete,
+Each worker gets an independent local clone. The agent may read, write, delete,
 install dependencies, run commands, and commit **inside that clone**. It does
 not operate directly in your source checkout.
 
@@ -16,12 +16,14 @@ write access. `fetch` force-updates only `refs/heads/sandbox/<id>` in the
 source repo. Integration is ordinary git (`merge`, rebase, or applying
 selected commits) after you review that branch.
 
-Codex uses `danger-full-access` *inside the container*. Rootless Podman is the
-security boundary: the runtime mounts only the worker repository at
-`/workspace` and a dedicated plugin Codex home at `/codex`. It does not mount
-your normal `~/.codex`, host home, SSH/GPG/cloud credentials, or
-Podman/Docker sockets. It uses `--userns=keep-id`, drops capabilities, enables
-`no-new-privileges`, and has a read-only container root.
+Agents use full in-container permissions (Codex: `danger-full-access`; Claude
+Code: `--dangerously-skip-permissions`). Rootless Podman is the security
+boundary: the runtime mounts only the worker repository at `/workspace` and a
+dedicated plugin agent home (`/codex` or `/claude`). It does not mount your
+normal `~/.codex`, `~/.claude`, `~/.claude.json`, host home, SSH/GPG/cloud
+credentials, or Podman/Docker sockets. It uses `--userns=keep-id`, drops
+capabilities, enables `no-new-privileges`, and has a read-only container root.
+Host environment variables are never forwarded into the container implicitly.
 
 **Host-side Git operations**: The plugin never runs git commands with a worker  
 repository as cwd or `-C` target. Worker `.git/config` is attacker-controlled  
@@ -40,7 +42,7 @@ protection is required.
 
 - Linux with rootless Podman
 - Herdr 0.9.0 or later
-- Git, Python 3.11 or later, and a current Codex CLI
+- Git, Python 3.11 or later, and a current Codex and/or Claude Code CLI for host-side `hs login`
 
 On Arch Linux:
 
@@ -78,26 +80,32 @@ Run the first three commands once:
 
 ```sh
 herdr plugin action invoke bootstrap --plugin dev.herdr.sandbox
-hs login codex
+hs login codex    # and/or: hs login claude
 herdr plugin action invoke check --plugin dev.herdr.sandbox
 ```
 
-`bootstrap` creates plugin-owned configuration and state directories, a
-dedicated Codex home, and the worker image. It also installs a small `hs` shim
-to `~/.local/bin/hs` (ensure `~/.local/bin` is on your PATH). The shim resolves
-the current plugin root from Herdr at runtime, so it continues to work after
-plugin updates. `hs login codex` runs device auth with `CODEX_HOME` pointed at
-that plugin-owned home. It refuses the normal user Codex home (`~/.codex`).
+`bootstrap` creates plugin-owned configuration and state directories, dedicated
+agent homes, and the worker image (Codex and Claude Code CLIs). It also installs
+a small `hs` shim to `~/.local/bin/hs` (ensure `~/.local/bin` is on your PATH).
+The shim resolves the current plugin root from Herdr at runtime, so it continues
+to work after plugin updates. `hs login codex` runs device auth with
+`CODEX_HOME` pointed at the plugin-owned home. `hs login claude` runs
+`claude auth login` with `CLAUDE_CONFIG_DIR` pointed at the plugin-owned Claude
+home (see [Claude Code authentication](https://code.claude.com/docs/en/authentication)
+and [`CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/env-vars)). Login
+refuses normal user homes (`~/.codex`, `~/.claude`) and banned host paths such
+as `~/.claude.json`.
 
 Then, in a Herdr pane containing the Git repository you want to change:
 
 ```sh
 cd ~/my-project
 hs codex
+# or: hs claude
 ```
 
-`hs codex` automatically creates or reuses a worker for the current pane and
-launches Codex in the sandbox. When the agent exits, it fetches the worker tip
+`hs codex` / `hs claude` automatically creates or reuses a worker for the current pane and
+launches the agent in the sandbox. When the agent exits, it fetches the worker tip
 into `refs/heads/sandbox/<id>` and prints the branch name, commit count, and a
 short log. It works from any Herdr pane or plain shell without requiring
 action-specific environment variables.
@@ -238,12 +246,22 @@ SANDBOX_LAUNCHER="$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox"
 
 The Podman command is independent of Herdr's pane cwd: it mounts only the
 selected worker clone at `/workspace`, sets the container workdir to
-`/workspace`, and starts Codex with `--cd /workspace`. Both interactive
-`start-codex` / `hs codex` and noninteractive `hs codex --prompt "..."` (plus
-the thin `execute --prompt` alias) use the same per-launch temporary
-plugin-owned `CODEX_HOME` that contains only `auth.json`. The session directory
+`/workspace`, and starts the agent with profile-owned flags (Codex:
+`--cd /workspace`; Claude Code: `--dangerously-skip-permissions`, with
+`CLAUDE_CONFIG_DIR` pointing at the mounted `/claude` home). Both interactive
+`hs <agent>` / `start-<agent>` and noninteractive `hs <agent> --prompt "..."`
+(plus the thin `execute --prompt` alias for Codex) use the same per-launch
+temporary plugin-owned agent home that contains only auth artifacts
+(`auth.json` for Codex; `.credentials.json` for Claude). The session directory
 is removed when the agent exits, so history from another worker or workspace
-cannot be resumed.
+cannot be resumed. For Claude, `--prompt` maps to `-p`.
+
+Optional Claude API-key auth: set `[claude].forward_api_key = true` and export
+`ANTHROPIC_API_KEY` on the host. That single variable is then passed as a
+container `--env`. Host env is never forwarded implicitly; never put the key
+in the repo, image, or config file. Prefer `hs login claude` so credentials
+live under the plugin-owned `CLAUDE_CONFIG_DIR` instead
+([docs](https://code.claude.com/docs/en/authentication)).
 
 **Token refresh (option a):** write-back is always attempted in a `finally`
 block after the agent exits (including non-zero exits), then the per-launch
@@ -265,8 +283,10 @@ bad file.
 
 For Herdr screen-based agent detection when Podman wraps the real CLI, `hs`
 sets `HERDR_AGENT` on the **host** pane/wrapper process (not only inside the
-container). Isolation flags stay fixed on the runtime; agent profiles may only
-supply home mount, env, argv, auth files, forbidden args, and `HERDR_AGENT`.
+container; values match [Herdr agents](https://herdr.dev/docs/agents):
+`codex` / `claude`). Isolation flags stay fixed on the runtime; agent profiles
+may only supply image install packages, home mount, env, argv, auth files /
+optional API-key env, banned host paths, forbidden args, and `HERDR_AGENT`.
 
 ## Customize the worker image
 
@@ -289,7 +309,7 @@ herdr plugin action invoke build-image --plugin dev.herdr.sandbox
 The starter expects a Debian/Ubuntu-compatible base with `apt-get`. For Alpine
 or another distribution, adapt its package-install steps and base image. The
 build context is only the plugin-owned `image` directory, so your source
-checkout and Codex credentials cannot be copied into the image.
+checkout and agent credentials cannot be copied into the image.
 
 Set `[runtime].network` to `"offline"` before creating or opening a
 self-contained worker to use Podman's `--network=none`; keep it `"online"`
@@ -314,6 +334,7 @@ For noninteractive automation from a clean source tree:
 
 ```sh
 hs codex --prompt "Implement the requested change and run the relevant tests."
+hs claude --prompt "Implement the requested change and run the relevant tests."
 # Long prompts: hs codex --prompt - < prompt.txt
 ```
 

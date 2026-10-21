@@ -40,7 +40,8 @@ class DocumentationTests(unittest.TestCase):
             "## Herdr 0.9.0 integration limits",
             "plugin action invoke",
             "workspace_cwd",
-            "plugin-owned `CODEX_HOME`",
+            "plugin-owned agent home",
+            "CODEX_HOME",
             "refs/heads/sandbox/",
             "Herdr 0.9.0 plugin actions have fixed command arguments",
             "does not forward arguments after the action ID",
@@ -55,6 +56,9 @@ class DocumentationTests(unittest.TestCase):
             "hs ls",
             "hs inspect",
             "hs login codex",
+            "hs login claude",
+            "CLAUDE_CONFIG_DIR",
+            "ANTHROPIC_API_KEY",
             "Token refresh (option a)",
             "HERDR_AGENT",
             "[gc].max_age",
@@ -76,6 +80,10 @@ class DocumentationTests(unittest.TestCase):
         procedure = (ROOT / "docs" / "manual-worker-security-test.md").read_text()
         self.assertIn("rm -rf /workspace", procedure)
         self.assertIn("worker repo is deleted", procedure)
+        self.assertIn("hs codex --prompt", procedure)
+        self.assertIn("hs claude --prompt", procedure)
+        self.assertIn("hs login claude", procedure)
+        self.assertIn("~/.claude.json", procedure)
 
 
 if __name__ == "__main__":

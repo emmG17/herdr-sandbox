@@ -21,9 +21,15 @@ VALID_AUTH = {"tokens": {"access_token": "old", "refresh_token": "r1", "id_token
 REFRESHED_AUTH = {"tokens": {"access_token": "new", "refresh_token": "r2", "id_token": "i2"}}
 T1_AUTH = {"tokens": {"access_token": "T1", "refresh_token": "rT1", "id_token": "iT1"}}
 STALE_AUTH = {"tokens": {"access_token": "stale", "refresh_token": "rS", "id_token": "iS"}}
+VALID_CLAUDE_AUTH = {
+    "claudeAiOauth": {"accessToken": "old", "refreshToken": "r1", "expiresAt": 1},
+}
+REFRESHED_CLAUDE_AUTH = {
+    "claudeAiOauth": {"accessToken": "new", "refreshToken": "r2", "expiresAt": 2},
+}
 
-# Profile marker block must stay compact; raise if Codex-specific surface grows.
-MAX_CODEX_PROFILE_LINES = 50
+# Profile marker blocks must stay compact; raise if agent-specific surface grows.
+MAX_PROFILE_LINES = 55
 
 
 class AgentProfileTests(unittest.TestCase):
@@ -38,15 +44,22 @@ class AgentProfileTests(unittest.TestCase):
         (self.config / "codex").mkdir()
         (self.config / "codex" / "auth.json").write_text(json.dumps(VALID_AUTH) + "\n")
         (self.config / "codex" / "auth.json").chmod(0o600)
+        (self.config / "claude").mkdir()
+        (self.config / "claude" / ".credentials.json").write_text(
+            json.dumps(VALID_CLAUDE_AUTH) + "\n"
+        )
+        (self.config / "claude" / ".credentials.json").chmod(0o600)
         (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG)
         self.env = patch.dict(os.environ, {
             "HERDR_PLUGIN_CONFIG_DIR": str(self.config),
             "HERDR_PLUGIN_STATE_DIR": str(self.state),
             "HOME": str(root / "user-home"),
-        })
+        }, clear=False)
         self.env.start()
         self.addCleanup(self.env.stop)
         (root / "user-home" / ".codex").mkdir(parents=True)
+        (root / "user-home" / ".claude").mkdir(parents=True)
+        (root / "user-home" / ".claude.json").write_text("{}\n")
 
     def test_write_back_on_refresh(self):
         home = self.config / "codex"
@@ -429,26 +442,294 @@ class AgentProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit per-launch agent_home"):
             plugin.execute_command("TEST-001", "task", agent_home=None)
 
-    def test_no_codex_literal_outside_profile_and_image_boilerplate(self):
+    def test_agent_literals_only_inside_profile_blocks_and_image_boilerplate(self):
         source = (ROOT / "bin" / "herdr-sandbox").read_text().splitlines()
-        begin = end = None
-        for index, line in enumerate(source, 1):
-            if line.strip() == "# BEGIN AGENT PROFILE: codex":
-                begin = index
-            if line.strip() == "# END AGENT PROFILE: codex":
-                end = index
-        self.assertIsNotNone(begin)
-        self.assertIsNotNone(end)
-        self.assertLess(begin, end)
-        self.assertLessEqual(end - begin + 1, MAX_CODEX_PROFILE_LINES)
-        offenders = []
-        for index, line in enumerate(source, 1):
-            if "codex" in line.lower() and not (begin <= index <= end):
-                # Allow the marker lines themselves only inside the block.
-                offenders.append(f"{index}:{line}")
-        self.assertEqual(offenders, [])
         boilerplate = (ROOT / "Containerfile").read_text()
-        self.assertIn("codex", boilerplate.lower())
+        for agent in ("codex", "claude"):
+            begin = end = None
+            for index, line in enumerate(source, 1):
+                if line.strip() == f"# BEGIN AGENT PROFILE: {agent}":
+                    begin = index
+                if line.strip() == f"# END AGENT PROFILE: {agent}":
+                    end = index
+            self.assertIsNotNone(begin, agent)
+            self.assertIsNotNone(end, agent)
+            self.assertLess(begin, end)
+            self.assertLessEqual(end - begin + 1, MAX_PROFILE_LINES, agent)
+            offenders = [
+                f"{index}:{line}"
+                for index, line in enumerate(source, 1)
+                if agent in line.lower() and not (begin <= index <= end)
+            ]
+            self.assertEqual(offenders, [], agent)
+            for package in plugin.AGENT_PROFILES[agent].image_npm_packages:
+                self.assertIn(package, boilerplate)
+
+    def test_claude_write_back_and_login_env(self):
+        home = self.config / "claude"
+        session, snaps = plugin.fresh_agent_home(home, "W1", plugin.CLAUDE_PROFILE)
+        (session / ".credentials.json").write_text(json.dumps(REFRESHED_CLAUDE_AUTH) + "\n")
+        written = plugin.write_back_auth_files(
+            home, session, plugin.CLAUDE_PROFILE, snaps, state_dir=self.state,
+        )
+        self.assertEqual(written, [".credentials.json"])
+        stored = json.loads((home / ".credentials.json").read_text())
+        self.assertEqual(stored["claudeAiOauth"]["accessToken"], "new")
+        self.assertEqual((home / ".credentials.json").stat().st_mode & 0o777, 0o600)
+
+        calls = []
+
+        def fake_run(argv, env=None, check=False):
+            calls.append((argv, env))
+            return type("R", (), {"returncode": 0})()
+
+        with patch.object(plugin.subprocess, "run", side_effect=fake_run):
+            code = plugin.login_agent(plugin.CLAUDE_PROFILE.name)
+        self.assertEqual(code, 0)
+        argv, env = calls[0]
+        self.assertEqual(argv, list(plugin.CLAUDE_PROFILE.login_argv))
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(home.resolve()))
+
+    def test_login_refuses_claude_banned_host_paths(self):
+        user_home = Path(self.temp.name) / "user-home"
+        for banned_rel, home_value in (
+            (".claude", "link-claude"),
+            (".claude.json", "link-claude-json"),
+        ):
+            target = (user_home / banned_rel).resolve()
+            link = self.config / home_value
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            link.symlink_to(target)
+            (self.config / "config.toml").write_text(
+                '[runtime]\nimage = "localhost/herdr-codex-worker:latest"\nnetwork = "online"\n'
+                '[resources]\ncpus = 4\nmemory = "8g"\npids = 1024\n'
+                '[codex]\nhome = "codex"\n'
+                f'[claude]\nhome = "{home_value}"\n'
+            )
+            with self.assertRaisesRegex(ValueError, r"normal user|banned|escapes plugin config"):
+                plugin.resolve_agent_home(self.config, plugin.CLAUDE_PROFILE)
+
+    def test_never_mounts_or_copies_host_agent_homes(self):
+        worker = self.state / "workers" / "TEST-001"
+        repo = worker / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "network": "online",
+        }))
+        host_home = Path(self.temp.name) / "user-home"
+        banned_snippets = [
+            str((host_home / ".codex").resolve()),
+            str((host_home / ".claude").resolve()),
+            str((host_home / ".claude.json").resolve()),
+            str(host_home.resolve()),
+        ]
+        for profile in (plugin.CODEX_PROFILE, plugin.CLAUDE_PROFILE):
+            home = self.config / profile.home_dirname
+            session, _ = plugin.fresh_agent_home(home, "TEST-001", profile)
+            for builder in (
+                lambda: plugin.open_command(
+                    "TEST-001", [profile.interactive_bin], fresh=True,
+                    agent_home=session, profile=profile,
+                ),
+                lambda: plugin.execute_command(
+                    "TEST-001", "task", agent_home=session, profile=profile,
+                ),
+            ):
+                argv = builder()
+                joined = "\n".join(argv)
+                for banned in banned_snippets:
+                    self.assertNotIn(banned, joined, profile.name)
+                mount_srcs = [
+                    arg.split(",src=", 1)[1].split(",", 1)[0]
+                    for arg in argv if arg.startswith("type=bind,src=")
+                ]
+                for src in mount_srcs:
+                    self.assertFalse(
+                        Path(src).resolve().is_relative_to(host_home.resolve()),
+                        f"{profile.name} mounted under host home: {src}",
+                    )
+
+    def test_podman_argv_claude_vs_codex_differs_only_in_profile_fields(self):
+        """Isolation flags are identical; only profile-owned fields may differ."""
+        worker = self.state / "workers" / "TEST-001"
+        repo = worker / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "network": "online",
+        }))
+        image, _ = plugin.load_config(self.config, plugin.CODEX_PROFILE)
+        repo_s = str(repo.resolve())
+
+        def build(profile):
+            home = self.config / profile.home_dirname
+            session, _ = plugin.fresh_agent_home(home, "TEST-001", profile)
+            session_s = str(session.resolve())
+            interactive = plugin.open_command(
+                "TEST-001", [profile.interactive_bin, "--extra"], fresh=True,
+                agent_home=session, profile=profile,
+            )
+            prompt = plugin.execute_command(
+                "TEST-001", "do the task", agent_home=session, profile=profile,
+            )
+
+            def normalize(argv):
+                out = []
+                for arg in argv:
+                    out.append(
+                        arg.replace(repo_s, "<REPO>")
+                        .replace(session_s, "<SESSION>")
+                        .replace("herdr-TEST-001", "herdr-<ID>")
+                        .replace(image, "<IMAGE>")
+                    )
+                return out
+
+            return normalize(interactive), normalize(prompt), session_s
+
+        codex_i, codex_p, _ = build(plugin.CODEX_PROFILE)
+        claude_i, claude_p, _ = build(plugin.CLAUDE_PROFILE)
+
+        expected_codex_i = [
+            "podman", "run", "--rm", "-it", "--name", "herdr-<ID>",
+            "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+            "--pids-limit=1024", "--memory=8g", "--cpus=4",
+            "--env", "HOME=/tmp/home",
+            "--env", "CODEX_HOME=/codex",
+            "--env", "XDG_CACHE_HOME=/tmp/cache",
+            "--mount", "type=bind,src=<REPO>,dst=/workspace,rw",
+            "--mount", "type=bind,src=<SESSION>,dst=/codex,rw",
+            "--workdir", "/workspace",
+            "<IMAGE>",
+            "codex", "--cd", "/workspace", "--extra",
+        ]
+        expected_claude_i = [
+            "podman", "run", "--rm", "-it", "--name", "herdr-<ID>",
+            "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+            "--pids-limit=1024", "--memory=8g", "--cpus=4",
+            "--env", "HOME=/tmp/home",
+            "--env", "CLAUDE_CONFIG_DIR=/claude",
+            "--env", "XDG_CACHE_HOME=/tmp/cache",
+            "--mount", "type=bind,src=<REPO>,dst=/workspace,rw",
+            "--mount", "type=bind,src=<SESSION>,dst=/claude,rw",
+            "--workdir", "/workspace",
+            "<IMAGE>",
+            "claude", "--dangerously-skip-permissions", "--extra",
+        ]
+        self.assertEqual(codex_i, expected_codex_i)
+        self.assertEqual(claude_i, expected_claude_i)
+
+        expected_codex_p = [
+            "podman", "run", "--rm", "--name", "herdr-<ID>",
+            "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+            "--pids-limit=1024", "--memory=8g", "--cpus=4",
+            "--env", "HOME=/tmp/home",
+            "--env", "CODEX_HOME=/codex",
+            "--env", "XDG_CACHE_HOME=/tmp/cache",
+            "--mount", "type=bind,src=<REPO>,dst=/workspace,rw",
+            "--mount", "type=bind,src=<SESSION>,dst=/codex,rw",
+            "--workdir", "/workspace",
+            "<IMAGE>",
+            "codex", "exec", "--sandbox", "danger-full-access", "do the task",
+        ]
+        expected_claude_p = [
+            "podman", "run", "--rm", "--name", "herdr-<ID>",
+            "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+            "--pids-limit=1024", "--memory=8g", "--cpus=4",
+            "--env", "HOME=/tmp/home",
+            "--env", "CLAUDE_CONFIG_DIR=/claude",
+            "--env", "XDG_CACHE_HOME=/tmp/cache",
+            "--mount", "type=bind,src=<REPO>,dst=/workspace,rw",
+            "--mount", "type=bind,src=<SESSION>,dst=/claude,rw",
+            "--workdir", "/workspace",
+            "<IMAGE>",
+            "claude", "--dangerously-skip-permissions", "-p", "do the task",
+        ]
+        self.assertEqual(codex_p, expected_codex_p)
+        self.assertEqual(claude_p, expected_claude_p)
+
+        def isolation_core(argv):
+            """Drop profile-owned env/mount/trailing argv; keep isolation flags."""
+            out = []
+            i = 0
+            while i < len(argv):
+                arg = argv[i]
+                if arg == "--env" and i + 1 < len(argv):
+                    value = argv[i + 1]
+                    # Shared isolation env stays; profile home env is profile-owned.
+                    if value.startswith("HOME=") or value.startswith("XDG_CACHE_HOME="):
+                        out.extend([arg, value])
+                    i += 2
+                    continue
+                if arg == "--mount" and i + 1 < len(argv):
+                    mount = argv[i + 1]
+                    if ",dst=/workspace," in mount:
+                        out.extend([arg, mount])
+                    i += 2
+                    continue
+                if arg == "<IMAGE>":
+                    out.append(arg)
+                    # Trailing agent argv is entirely profile-owned.
+                    break
+                out.append(arg)
+                i += 1
+            return out
+
+        self.assertEqual(isolation_core(codex_i), isolation_core(claude_i))
+        self.assertEqual(isolation_core(codex_p), isolation_core(claude_p))
+
+    def test_api_key_opt_in_forwards_only_declared_env(self):
+        (self.config / "config.toml").write_text(
+            plugin.DEFAULT_CONFIG.replace(
+                "[claude]\nhome = \"claude\"\n",
+                "[claude]\nhome = \"claude\"\nforward_api_key = true\n",
+            )
+        )
+        # Auth file absent; API key path must satisfy check and launch.
+        (self.config / "claude" / ".credentials.json").unlink()
+        worker = self.state / "workers" / "TEST-001"
+        (worker / "repo" / ".git").mkdir(parents=True)
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "network": "online",
+        }))
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-key", "OTHER_SECRET": "nope"}):
+            errors = plugin.check(require_auth=True, profile=plugin.CLAUDE_PROFILE)
+            self.assertEqual([e for e in errors if "authentication" in e], [])
+            home = self.config / "claude"
+            session, snaps = plugin.fresh_agent_home(
+                home, "TEST-001", plugin.CLAUDE_PROFILE, allow_missing_auth=True,
+            )
+            self.assertEqual(snaps, {})
+            argv = plugin.open_command(
+                "TEST-001", ["claude"], fresh=True, agent_home=session,
+                profile=plugin.CLAUDE_PROFILE,
+            )
+        env_pairs = [
+            argv[i + 1]
+            for i, value in enumerate(argv)
+            if value == "--env" and i + 1 < len(argv)
+        ]
+        self.assertIn("ANTHROPIC_API_KEY=sk-test-key", env_pairs)
+        self.assertNotIn("OTHER_SECRET=nope", env_pairs)
+        # Without opt-in, host key must not appear.
+        (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG)
+        (self.config / "claude" / ".credentials.json").write_text(
+            json.dumps(VALID_CLAUDE_AUTH) + "\n"
+        )
+        (self.config / "claude" / ".credentials.json").chmod(0o600)
+        session2, _ = plugin.fresh_agent_home(
+            self.config / "claude", "TEST-001", plugin.CLAUDE_PROFILE,
+        )
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-key"}):
+            argv2 = plugin.open_command(
+                "TEST-001", ["claude"], fresh=True, agent_home=session2,
+                profile=plugin.CLAUDE_PROFILE,
+            )
+        env_pairs2 = [
+            argv2[i + 1]
+            for i, value in enumerate(argv2)
+            if value == "--env" and i + 1 < len(argv2)
+        ]
+        self.assertNotIn("ANTHROPIC_API_KEY=sk-test-key", env_pairs2)
 
 
 if __name__ == "__main__":
