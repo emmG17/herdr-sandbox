@@ -30,6 +30,9 @@ class ExecuteWorkerTests(unittest.TestCase):
         self.state = root / "state"
         self.state.mkdir()
         (self.config / "codex").mkdir()
+        (self.config / "codex" / "auth.json").write_text(
+            '{"tokens":{"access_token":"test","refresh_token":"test"}}\n'
+        )
         (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG)
 
         self.source = root / "source"
@@ -91,7 +94,8 @@ class ExecuteWorkerTests(unittest.TestCase):
         ):
             self.assertIn(required, command)
         self.assertEqual(command[-5:], ["codex", "exec", "--sandbox", "danger-full-access", "write a file"])
-        # Shared dedicated home (configured plugin home), not a per-launch temp path.
+        # execute_command without agent_home mounts the configured dedicated home;
+        # execute_worker passes a per-launch session home instead.
         mount = next(arg for arg in command if arg.startswith("type=bind,src=") and ",dst=/codex," in arg)
         self.assertIn(str((self.config / "codex").resolve()), mount)
 
@@ -112,7 +116,7 @@ class ExecuteWorkerTests(unittest.TestCase):
                 patch.object(plugin.sys, "stderr", new_callable=io.StringIO) as stderr:
             result = plugin.execute_worker("TEST-001", "write persisted.txt")
 
-        check.assert_called_once_with(require_auth=True)
+        check.assert_called_once_with(require_auth=True, profile=plugin.DEFAULT_PROFILE)
         self.assertEqual(result["exit_status"], 0)
         self.assertTrue(result["run_id"].startswith("run-"))
         self.assertEqual(result["head"], worker_head)
@@ -210,9 +214,9 @@ class ExecuteWorkerTests(unittest.TestCase):
         stderr = io.StringIO()
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "execute", "--prompt", "one-shot prompt"]), \
                 patch.object(plugin.sys, "stderr", stderr), \
-                patch.object(plugin, "hs_codex", return_value=0) as hs_codex:
+                patch.object(plugin, "hs_agent", return_value=0) as hs_agent:
             self.assertEqual(plugin.main(), 0)
-        hs_codex.assert_called_once_with([], prompt="one-shot prompt")
+        hs_agent.assert_called_once_with(plugin.DEFAULT_PROFILE, [], prompt="one-shot prompt")
         self.assertIn("[execute] is deprecated and ignored", stderr.getvalue())
 
     def test_execute_without_prompt_does_not_read_execute_config(self):
@@ -222,7 +226,7 @@ class ExecuteWorkerTests(unittest.TestCase):
         stderr = io.StringIO()
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "execute"]), \
                 patch.object(plugin.sys, "stderr", stderr), \
-                patch.object(plugin, "hs_codex", side_effect=AssertionError("should not launch")):
+                patch.object(plugin, "hs_agent", side_effect=AssertionError("should not launch")):
             self.assertEqual(plugin.main(), 1)
         message = stderr.getvalue()
         self.assertIn("[execute] is deprecated and ignored", message)
@@ -234,9 +238,9 @@ class ExecuteWorkerTests(unittest.TestCase):
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "codex", "--prompt", "-"]), \
                 patch.object(plugin.sys, "stdin", io.StringIO("stdin task\n")), \
                 patch.object(plugin.sys, "stderr", stderr), \
-                patch.object(plugin, "hs_codex", return_value=7) as hs_codex:
+                patch.object(plugin, "hs_agent", return_value=7) as hs_agent:
             self.assertEqual(plugin.main(), 7)
-        hs_codex.assert_called_once_with([], prompt="-")
+        hs_agent.assert_called_once_with(plugin.DEFAULT_PROFILE, [], prompt="-")
 
     def test_resolve_prompt_argument_reads_stdin_for_dash(self):
         with patch.object(plugin.sys, "stdin", io.StringIO("from stdin\n")):
@@ -257,8 +261,8 @@ class ExecuteWorkerTests(unittest.TestCase):
                     "log_location": "/tmp/output.log",
                 }) as execute, \
                 patch.object(plugin, "print_execution_result") as printed:
-            self.assertEqual(plugin.hs_codex([], prompt="do the task"), 12)
-        execute.assert_called_once_with("TEST-001", "do the task")
+            self.assertEqual(plugin.hs_agent(plugin.DEFAULT_PROFILE, [], prompt="do the task"), 12)
+        execute.assert_called_once_with("TEST-001", "do the task", profile=plugin.DEFAULT_PROFILE)
         printed.assert_called_once()
 
     def test_hs_codex_prompt_fetch_failure_after_success_returns_one(self):
@@ -276,7 +280,7 @@ class ExecuteWorkerTests(unittest.TestCase):
                     "log_location": "/tmp/output.log",
                 }), \
                 patch.object(plugin, "print_execution_result"):
-            self.assertEqual(plugin.hs_codex([], prompt="do the task"), 1)
+            self.assertEqual(plugin.hs_agent(plugin.DEFAULT_PROFILE, [], prompt="do the task"), 1)
 
     def test_hs_codex_prompt_fetch_failure_preserves_nonzero_agent_exit(self):
         with patch.object(plugin, "prepare_hs_worker", return_value=("TEST-001", self.state)), \
@@ -293,7 +297,7 @@ class ExecuteWorkerTests(unittest.TestCase):
                     "log_location": "/tmp/output.log",
                 }), \
                 patch.object(plugin, "print_execution_result"):
-            self.assertEqual(plugin.hs_codex([], prompt="do the task"), 9)
+            self.assertEqual(plugin.hs_agent(plugin.DEFAULT_PROFILE, [], prompt="do the task"), 9)
 
     def test_hs_codex_prompt_propagates_negative_signal_exit_status(self):
         with patch.object(plugin, "prepare_hs_worker", return_value=("TEST-001", self.state)), \
@@ -310,12 +314,12 @@ class ExecuteWorkerTests(unittest.TestCase):
                     "log_location": "/tmp/output.log",
                 }), \
                 patch.object(plugin, "print_execution_result"):
-            self.assertEqual(plugin.hs_codex([], prompt="do the task"), -15)
+            self.assertEqual(plugin.hs_agent(plugin.DEFAULT_PROFILE, [], prompt="do the task"), -15)
 
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "codex", "--prompt", "signal"]), \
-                patch.object(plugin, "hs_codex", return_value=-9) as hs_codex:
+                patch.object(plugin, "hs_agent", return_value=-9) as hs_agent:
             self.assertEqual(plugin.main(), -9)
-        hs_codex.assert_called_once_with([], prompt="signal")
+        hs_agent.assert_called_once_with(plugin.DEFAULT_PROFILE, [], prompt="signal")
 
     def test_execute_worker_reuses_fetch_git_snapshot(self):
         snapshot = {
@@ -350,8 +354,8 @@ class ExecuteWorkerTests(unittest.TestCase):
         with patch.object(plugin, "prepare_hs_worker", return_value=("TEST-001", self.state)), \
                 patch.object(plugin.sys, "stderr", stderr), \
                 patch.object(plugin, "execute_worker", side_effect=AssertionError("should not run")):
-            self.assertEqual(plugin.hs_codex(["--foo"], prompt="task"), 1)
-        self.assertIn("Do not pass extra Codex arguments with --prompt", stderr.getvalue())
+            self.assertEqual(plugin.hs_agent(plugin.DEFAULT_PROFILE, ["--foo"], prompt="task"), 1)
+        self.assertIn("Do not pass extra codex arguments with --prompt", stderr.getvalue())
 
 
 if __name__ == "__main__":

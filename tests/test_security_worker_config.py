@@ -51,6 +51,9 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
         self.state = root / "state"
         self.state.mkdir()
         (self.config / "codex").mkdir()
+        (self.config / "codex" / "auth.json").write_text(
+            '{"tokens":{"access_token":"test","refresh_token":"test"}}\n'
+        )
         (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG)
         
         # Set environment
@@ -401,11 +404,12 @@ class TestGitQueryCommandHardening(unittest.TestCase):
             worker_id="TEST-001",
             image="localhost/herdr-codex-worker:latest",
             repo=Path("/tmp/worker-repo"),
-            codex_home=Path("/tmp/codex-home"),
+            agent_home=Path("/tmp/codex-home"),
             network="online",
             cpus=4,
             memory="8g",
             pids=1024,
+            profile=plugin.DEFAULT_PROFILE,
         )
         command = plugin.build_worker_git_query_command(runtime, base_commit="a" * 40)
         self.assertNotIn("--name", command)
