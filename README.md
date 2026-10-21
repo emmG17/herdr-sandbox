@@ -26,9 +26,10 @@ Podman/Docker sockets. It uses `--userns=keep-id`, drops capabilities, enables
 repository as cwd or `-C` target. Worker `.git/config` is attacker-controlled  
 and could execute arbitrary commands through settings like `core.fsmonitor` or  
 `core.hooksPath`. Instead it reads refs from confined files under the worker  
-`.git`, imports results through a verified git bundle built in a temporary  
-bare repo, and runs status/log/diff queries inside the sandbox container. See  
-`docs/security-host-git.md`.
+`.git`, imports results through a verified git bundle built from copied loose  
+objects and packs (indexes regenerated on the host), and runs status/log/diff  
+in one hardened query container per worker (no session name, no network, no  
+Codex mount, workspace read-only). See `docs/security-host-git.md`.
 
 This is container isolation, not a VM: containers share the host Linux kernel.
 Do not use it for hostile-code workloads or where kernel-vulnerability
