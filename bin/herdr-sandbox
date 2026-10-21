@@ -1716,6 +1716,11 @@ def warn_deprecated_integration_config(config_dir):
             "or run `hs inspect` in the worker's pane.",
             file=sys.stderr,
         )
+    if "execute" in config:
+        print(
+            "Note: [execute] is deprecated and ignored; use `hs codex --prompt \"...\"`.",
+            file=sys.stderr,
+        )
 
 
 def open_options(config_dir):
@@ -1728,20 +1733,6 @@ def open_options(config_dir):
         raise ValueError(f"Expected an [open] table in {config_file}.")
     if "id" in options and not isinstance(options["id"], str):
         raise ValueError(f"Set [open].id to a string in {config_file}.")
-    return options
-
-
-def execute_options(config_dir):
-    """Read the fixed inputs used by the non-prompting Herdr execute action."""
-    config_file = config_dir / "config.toml"
-    with config_file.open("rb") as stream:
-        config = tomllib.load(stream)
-    options = config.get("execute", {})
-    if not isinstance(options, dict):
-        raise ValueError(f"Expected an [execute] table in {config_file}.")
-    for key in ("id", "prompt"):
-        if key in options and not isinstance(options[key], str):
-            raise ValueError(f"Set [execute].{key} to a string in {config_file}.")
     return options
 
 
@@ -1859,7 +1850,12 @@ def open_command(worker_id, command=None, fresh=False, codex_home=None):
 
 
 def execute_command(worker_id, prompt):
-    """Build the shared runtime's noninteractive Codex invocation for a worker."""
+    """Build the shared runtime's noninteractive Codex invocation for a worker.
+
+    Uses the shared dedicated Codex home (not a per-launch temp home). Long
+    noninteractive runs can refresh tokens in place; a temp home would discard
+    those writes. Issue #11 owns the token-refresh policy for all profiles.
+    """
     return podman_runtime(worker_id).noninteractive_command(prompt)
 
 
@@ -1989,6 +1985,8 @@ def _start_execution_result(worker_dir, worker_id):
         "head": None,
         "dirty": None,
         "git_status": None,
+        "result_branch": None,
+        "commit_count": None,
         "result_location": str(result_path),
         "log_location": str(log_path),
         # Keep the original result field as an alias for callers of execute_worker.
@@ -2048,7 +2046,12 @@ def _stream_process(process, log_path):
 
 
 def execute_worker(worker_id, prompt):
-    """Run one Codex prompt with live output and a durable per-run result."""
+    """Run one Codex prompt with live output and a durable per-run result.
+
+    After the agent exits, fetch into ``sandbox/<id>`` and take post-run HEAD and
+    commit count from the source repository against that ref. Host git never uses
+    the worker clone as cwd or ``-C``.
+    """
     _, state_dir = paths()
     _, worker_dir = worker_storage(worker_id, state_dir)
     errors = check(require_auth=True)
@@ -2085,10 +2088,28 @@ def execute_worker(worker_id, prompt):
         _write_worker_status(worker_dir, "failed")
         raise
 
-    repo = worker_dir / "repo"
-    success, head, error = _safe_read_worker_head(repo)
     status = "completed" if exit_status == 0 else "failed"
-    head_value = head if success else "unavailable"
+    head_value = "unavailable"
+    result_branch = None
+    commit_count = None
+    try:
+        fetch_result = fetch_worker(worker_id, state_dir)
+        head_value = fetch_result["commit"]
+        result_branch = fetch_result["branch"]
+        commit_count = fetch_result["commit_count"]
+        if fetch_result.get("dirty_warning"):
+            print(fetch_result["dirty_warning"], file=sys.stderr)
+        if fetch_result.get("head_moved_notice"):
+            print(fetch_result["head_moved_notice"], file=sys.stderr)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        print(
+            f"Worker {worker_id} was left un-fetched. "
+            f"Switch away from sandbox/{worker_id} if it is checked out, then run: hs fetch {worker_id}",
+            file=sys.stderr,
+        )
+        _write_worker_status(worker_dir, status)
+
     snapshot = _query_worker_git_snapshot(worker_id)
     if snapshot["error"]:
         git_status_value = f"(unavailable: {snapshot['error']})"
@@ -2105,8 +2126,9 @@ def execute_worker(worker_id, prompt):
         head=head_value,
         dirty=dirty_value,
         git_status=git_status_value,
+        result_branch=result_branch,
+        commit_count=commit_count,
     )
-    _write_worker_status(worker_dir, status)
     return {
         **result_record,
         "stdout": output["stdout"],
@@ -2118,11 +2140,16 @@ def print_execution_result(result):
     """Print the final durable result summary after output was streamed live."""
     result_location = result.get("result_location", "-")
     log_location = result.get("log_location", result.get("output_location", "-"))
+    result_branch = result.get("result_branch") or "-"
+    commit_count = result.get("commit_count")
+    commit_count_text = "-" if commit_count is None else str(commit_count)
     print(
         f"Worker: {result['worker_id']}\n"
         f"Run: {result.get('run_id', '-')}\n"
         f"Exit status: {result['exit_status']}\n"
         f"HEAD: {result['head']}\n"
+        f"Result branch: {result_branch}\n"
+        f"Commit count: {commit_count_text}\n"
         f"Dirty: {result['dirty']}\n"
         f"Git status: {result['git_status'] or 'clean'}\n"
         f"Result: {result_location}\n"
@@ -3008,23 +3035,15 @@ def create_options(config_dir):
     return options
 
 
-def resolve_execute_inputs(worker_id, prompt, config_dir):
-    """Resolve one complete invocation or the configured Herdr action inputs.
-
-    A one-shot invocation must provide both values. Refusing to combine a
-    direct value with a configured value prevents a stale config entry from
-    silently changing the meaning of an invocation.
-    """
-    supplied = worker_id is not None or prompt is not None
-    if supplied:
-        if worker_id is None:
-            raise ValueError("Worker ID is required with a direct task prompt. Pass `execute --id WORKER_ID --prompt PROMPT`.")
-        if prompt is None:
-            raise ValueError("Task prompt is required with a direct worker ID. Pass `execute --id WORKER_ID --prompt PROMPT`.")
-        return worker_id, prompt
-
-    options = execute_options(config_dir)
-    return options.get("id"), options.get("prompt")
+def resolve_prompt_argument(prompt):
+    """Resolve ``--prompt`` text, including ``--prompt -`` reading stdin."""
+    if prompt is None:
+        raise ValueError('Task prompt is required. Pass --prompt "..." (or --prompt - to read stdin).')
+    if prompt == "-":
+        prompt = sys.stdin.read()
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("Task prompt must be a nonempty string.")
+    return prompt
 
 
 def create_worker(worker_id, repo=None, base_ref="HEAD", agent="codex"):
@@ -3162,17 +3181,14 @@ def resolve_source_repo_from_cwd():
     return Path(result.stdout.strip()).resolve()
 
 
-def hs_codex(codex_args):
+def prepare_hs_worker(agent="codex"):
+    """Shared launcher setup: root check, GC, dirty refuse, create or reuse worker.
+
+    Returns ``(worker_id, state_dir)``. Prints one-line errors to stderr and
+    returns ``(None, None)`` when launch must abort with exit status 1.
     """
-    hs codex entrypoint: create or reuse worker and launch Codex.
-    
-    This is the main RFC phase 1 command that works from any pane without
-    requiring HERDR_PLUGIN_CONFIG_DIR/HERDR_PLUGIN_STATE_DIR to be set by
-    an action.
-    """
-    # Security checks first
     check_root()
-    
+
     config_dir, state_dir = paths()
 
     # Opportunistic GC must never fail the launch.
@@ -3182,31 +3198,28 @@ def hs_codex(codex_args):
         sweep_stale_codex_sessions(codex_home, state_dir=state_dir)
     except Exception as exc:  # noqa: BLE001 - launch must not fail because of session sweep
         print(f"Codex session sweep skipped: {exc}", file=sys.stderr)
-    
-    # Resolve source repository from cwd
+
     try:
         source_repo = resolve_source_repo_from_cwd()
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
-        return 1
-    
-    # Check for dirty tree
+        return None, None
+
     if check_dirty_tree(source_repo):
-        print(f"Refusing: source repository has uncommitted or untracked changes: {source_repo}", file=sys.stderr)
-        return 1
-    
-    # Ensure image exists (lazy build)
+        print(
+            f"Refusing: source repository has uncommitted or untracked changes: {source_repo}",
+            file=sys.stderr,
+        )
+        return None, None
+
     try:
         ensure_image_exists(config_dir)
     except Exception as exc:
         print(f"Image build failed: {exc}", file=sys.stderr)
-        return 1
-    
-    # Check for reusable worker
-    agent = "codex"
+        return None, None
+
     worker_id, head_moved_notice = find_reusable_worker(source_repo, agent, state_dir)
-    
-    # Create worker if no reusable one found
+
     if worker_id is None:
         try:
             worker_dir = create_worker(None, str(source_repo), "HEAD", agent)
@@ -3214,15 +3227,49 @@ def hs_codex(codex_args):
             print(f"Created worker: {worker_id}", file=sys.stderr)
         except Exception as exc:
             print(f"Worker creation failed: {exc}", file=sys.stderr)
-            return 1
+            return None, None
     else:
         print(f"Reusing worker: {worker_id}", file=sys.stderr)
         if head_moved_notice:
             print(head_moved_notice, file=sys.stderr)
-    
-    # Launch Codex with fresh session, then fetch results into sandbox/<id>.
+
+    return worker_id, state_dir
+
+
+def hs_codex(codex_args, prompt=None):
+    """hs codex entrypoint: create or reuse a worker and launch Codex.
+
+    Without ``prompt``, opens an interactive session (per-launch temp Codex home)
+    then auto-fetches into ``sandbox/<id>``. With ``prompt``, runs noninteractive
+    ``codex exec`` on the shared dedicated Codex home, writes
+    ``runs/<run-id>/result.json`` / ``output.log``, auto-fetches, and returns the
+    agent's exit status.
+    """
+    worker_id, state_dir = prepare_hs_worker("codex")
+    if worker_id is None:
+        return 1
+
+    if prompt is not None:
+        extra = [arg for arg in (codex_args or []) if arg != "--"]
+        if extra:
+            print(
+                "Do not pass extra Codex arguments with --prompt; "
+                "use interactive `hs codex` without --prompt.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            prompt = resolve_prompt_argument(prompt)
+            result = execute_worker(worker_id, prompt)
+        except (ValueError, OSError) as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        print_execution_result(result)
+        return result["exit_status"]
+
+    # Interactive: fresh session home, then fetch results into sandbox/<id>.
     try:
-        command = ["codex"] + codex_args
+        command = ["codex"] + list(codex_args or [])
         exit_code = open_worker(worker_id, command, fresh=True)
     except Exception as exc:
         print(f"Worker launch failed: {exc}", file=sys.stderr)
@@ -3316,14 +3363,22 @@ def main():
     pane_open_parser.add_argument("--placement", help="Pane placement: overlay, split, or tab (default: overlay)")
     pane_open_parser.add_argument("--target-pane", help="Target pane for split placement (for example, w1:p1)")
     pane_open_parser.add_argument("--direction", help="Split direction: right or down")
-    execute_parser = commands.add_parser("execute", help="Run one noninteractive Codex task in a sandbox worker")
-    execute_parser.add_argument("worker_id", nargs="?", help="Worker ID")
-    execute_parser.add_argument("prompt", nargs="?", help="Task prompt")
-    execute_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
-    execute_parser.add_argument("--prompt", dest="option_prompt", help="Task prompt (for direct use)")
+    execute_parser = commands.add_parser(
+        "execute",
+        help="Alias of codex --prompt: run one noninteractive Codex task (deprecated name; use hs codex --prompt)",
+    )
+    execute_parser.add_argument(
+        "--prompt",
+        dest="option_prompt",
+        help='Task prompt (use "-" to read stdin)',
+    )
     workers_parser = commands.add_parser("workers", help=argparse.SUPPRESS)
     workers_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     codex_parser = commands.add_parser("codex", help="Create or reuse worker and launch Codex (RFC phase 1)")
+    codex_parser.add_argument(
+        "--prompt",
+        help='Run noninteractively with this task prompt (use "-" to read stdin)',
+    )
     codex_parser.add_argument("codex_args", nargs=argparse.REMAINDER, help="Arguments to pass to codex")
     args = parser.parse_args()
     try:
@@ -3428,19 +3483,15 @@ def main():
             command = build_herdr_pane_open_command(args.placement, args.target_pane, args.direction)
             return subprocess.run(command, check=False).returncode
         elif args.command == "execute":
-            worker_id = args.worker_id if args.worker_id is not None else args.option_worker_id
-            prompt = args.prompt if args.prompt is not None else args.option_prompt
-            config_dir, _ = paths()
-            worker_id, prompt = resolve_execute_inputs(worker_id, prompt, config_dir)
-            if not worker_id:
-                raise ValueError("Worker ID is required. Pass `execute WORKER_ID PROMPT` or set [execute].id in the plugin config.")
-            if not prompt:
-                raise ValueError("Task prompt is required. Pass `execute WORKER_ID PROMPT` or set [execute].prompt in the plugin config.")
-            result = execute_worker(worker_id, prompt)
-            print_execution_result(result)
-            return result["exit_status"]
+            if args.option_prompt is None:
+                raise ValueError(
+                    'Task prompt is required. Pass `execute --prompt "..."` '
+                    "(or --prompt - to read stdin). "
+                    "`execute` is an alias of `hs codex --prompt`; [execute] config is ignored."
+                )
+            return hs_codex([], prompt=args.option_prompt)
         elif args.command == "codex":
-            return hs_codex(args.codex_args)
+            return hs_codex(args.codex_args, prompt=args.prompt)
         else:
             errors = check(args.repo or context_repo(), args.execution)
             if errors:
