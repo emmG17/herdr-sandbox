@@ -1611,6 +1611,8 @@ def fetch_worker(worker_id, state_dir=None):
         "base_commit": base_commit,
         "current_head": current_head,
         "head_moved": head_moved,
+        "source_repo": str(source),
+        "worker_id": worker_id,
     }
     if dirty_warning:
         result["dirty_warning"] = dirty_warning
@@ -1622,15 +1624,49 @@ def fetch_worker(worker_id, state_dir=None):
     return result
 
 
+def _review_git_commands(source_repo, base, worker_id):
+    """Build quoted ``git -C <source>`` review commands for ``sandbox/<id>``.
+
+    Always targets a validated ``sandbox/<id>`` branch (never unchecked
+    ``result_branch`` metadata). Quotes every shell-sensitive argument.
+    """
+    worker_id = validate_worker_id(worker_id)
+    branch = validate_sandbox_result_branch(f"sandbox/{worker_id}")
+    quoted_source = shlex.quote(str(source_repo))
+    quoted_base = shlex.quote(str(base))
+    quoted_branch = shlex.quote(branch)
+    return (
+        branch,
+        [
+            f"  git -C {quoted_source} log {quoted_base}..{quoted_branch}",
+            f"  git -C {quoted_source} diff {quoted_base}...{quoted_branch}",
+        ],
+        quoted_source,
+        quoted_branch,
+    )
+
+
 def format_fetch_result(result):
     """Format the fetched branch, commit count, and plain-git review commands."""
-    branch = result.get("branch", "-")
+    worker_id = result.get("worker_id")
+    if not worker_id:
+        branch = result.get("branch") or ""
+        if isinstance(branch, str) and branch.startswith("sandbox/"):
+            worker_id = branch[len("sandbox/"):]
+        else:
+            raise ValueError("Fetch result is missing worker_id for review commands.")
+    source_repo = result.get("source_repo")
+    if not isinstance(source_repo, str) or not source_repo:
+        raise ValueError("Fetch result is missing source_repo for review commands.")
     files = "\n".join(result["changed_files"]) or "(none)"
     stat = result["diff_stat"] or "(no changes)"
     count = result.get("commit_count")
     count_line = f"Commits: {count}" if count is not None else "Commits: -"
     base = result.get("base_commit") or "BASE"
     base_short = base[:12] if isinstance(base, str) and len(base) >= 12 else base
+    branch, review_cmds, quoted_source, quoted_branch = _review_git_commands(
+        source_repo, base_short, worker_id
+    )
     lines = [
         f"Branch: {branch}",
         count_line,
@@ -1647,10 +1683,9 @@ def format_fetch_result(result):
         lines.append("Log: (no commits beyond base; sandbox ref still created)")
     lines.extend([
         "Review:",
-        f"  git log {base_short}..{branch}",
-        f"  git diff {base_short}...{branch}",
+        *review_cmds,
         "Integrate:",
-        f"  git merge {branch}",
+        f"  git -C {quoted_source} merge {quoted_branch}",
         "  # or rebase onto that branch / apply selected commits",
         "Changed files:",
         files,
@@ -2561,15 +2596,39 @@ def inspect_worker(worker_id, state_dir=None):
     return _worker_record(worker_dir, detail=True)
 
 
-def cwd_repo_root():
-    """Resolve the Git repository root for the current working directory, or None."""
-    result = run("git", "rev-parse", "--show-toplevel")
-    if result.returncode:
+def cwd_repo_root(state_dir=None):
+    """Resolve the source Git root for cwd by walking for ``.git`` (no host git).
+
+    Never runs ``git`` against the process cwd: that path may be a worker clone
+    whose ``.git/config`` is attacker-controlled. If the discovered root lies
+    under ``state_workers_dir()``, treat it as not a source repo and return None
+    so inspect requires an explicit worker ID.
+    """
+    try:
+        current = Path.cwd().resolve()
+    except OSError:
         return None
-    top = result.stdout.strip()
-    if not top:
+    root = None
+    for candidate in (current, *current.parents):
+        git_entry = candidate / ".git"
+        try:
+            if git_entry.exists():
+                root = candidate
+                break
+        except OSError:
+            continue
+    if root is None:
         return None
-    return Path(top).resolve()
+    try:
+        workers_dir = state_workers_dir(state_dir).resolve()
+    except (OSError, ValueError, TypeError):
+        return root
+    try:
+        if root == workers_dir or root.is_relative_to(workers_dir):
+            return None
+    except (OSError, ValueError):
+        return None
+    return root
 
 
 def _list_worker_ids(state_dir=None):
@@ -2631,10 +2690,11 @@ def resolve_inspect_worker(worker_id=None, state_dir=None):
             "HERDR_PANE_ID is unset; pass an explicit worker ID "
             f"(candidates: {candidate_text})."
         )
-    source = cwd_repo_root()
+    source = cwd_repo_root(state_dir=state_dir)
     if source is None:
         raise ValueError(
-            "Current directory is not inside a Git repository; pass an explicit worker ID "
+            "Current directory is not inside a source Git repository "
+            "(worker clones under plugin state are not valid); pass an explicit worker ID "
             f"(candidates: {candidate_text})."
         )
     matches = _workers_for_pane_and_repo(pane_id, source, state_dir)
@@ -2695,12 +2755,13 @@ def format_workers(records):
 
 def format_worker(record):
     result_branch = _display(record.get("result_branch"))
-    review_branch = record.get("result_branch") or f"sandbox/{record['id']}"
     base = _review_base_ref(record)
+    source = record["source_repo"]
+    _, review_cmds, _, _ = _review_git_commands(source, base, record["id"])
     lines = [
         f"Worker: {record['id']}",
         f"Agent: {_display(record.get('agent'))}",
-        f"Source: {record['source_repo']}",
+        f"Source: {source}",
         f"Pane: {_display(record.get('pane_id'))}",
         f"Result branch: {result_branch}",
         f"Worker clone: {record['repository']}",
@@ -2730,9 +2791,8 @@ def format_worker(record):
         lines.extend(["Issues:"] + [f"- {issue}" for issue in record["issues"]])
     lines.extend([
         "",
-        f"Review (run in source repo {record['source_repo']}):",
-        f"  git log {base}..{review_branch}",
-        f"  git diff {base}...{review_branch}",
+        f"Review (run in source repo {source}):",
+        *review_cmds,
         "",
         "Git log:",
         record["git_log"] or "(no commits)",

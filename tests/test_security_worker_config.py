@@ -5,8 +5,10 @@ Verifies that host-side git operations never execute commands from worker config
 like core.fsmonitor, core.hooksPath, diff textconv, core.sshCommand, etc.
 """
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -190,6 +192,24 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
             inspection = plugin.inspect_worker(worker_id, self.state)
 
         self.assertEqual(inspection["id"], worker_id)
+        self.assert_no_markers()
+
+    def test_inspect_cli_from_worker_cwd_does_not_execute_worker_config(self):
+        """chdir into a malicious worker clone must not run host git on it."""
+        worker_id, worker_dir = self.create_malicious_worker()
+        worker_repo = worker_dir / "repo"
+        stderr = io.StringIO()
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}), \
+                contextlib.chdir(worker_repo), \
+                patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
+                contextlib.redirect_stderr(stderr), \
+                patch.object(plugin, "container_status", return_value="not-found"), \
+                patch.object(plugin, "_query_worker_git_snapshot") as query:
+            self.assertEqual(plugin.main(), 1)
+            query.assert_not_called()
+        message = stderr.getvalue()
+        self.assertIn("not inside a source Git repository", message)
+        self.assertIn(worker_id, message)
         self.assert_no_markers()
 
     def test_fetch_does_not_execute_worker_config(self):

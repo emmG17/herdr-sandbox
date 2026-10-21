@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import tomllib
@@ -116,10 +117,11 @@ class FetchTests(unittest.TestCase):
         review = plugin.format_fetch_result(result)
         self.assertIn("Branch: sandbox/TEST-001", review)
         self.assertIn("Commits: 1", review)
-        self.assertIn("git log ", review)
+        quoted_source = shlex.quote(str(self.source))
+        self.assertIn(f"git -C {quoted_source} log ", review)
         self.assertIn("..sandbox/TEST-001", review)
-        self.assertIn("git diff ", review)
-        self.assertIn("git merge sandbox/TEST-001", review)
+        self.assertIn(f"git -C {quoted_source} diff ", review)
+        self.assertIn(f"git -C {quoted_source} merge sandbox/TEST-001", review)
 
         with patch.object(plugin, "remove_worker_container"):
             self.assertTrue(plugin.destroy_worker("TEST-001"))
@@ -265,6 +267,8 @@ class FetchTests(unittest.TestCase):
             "changed_files": ["one.py"],
             "diff_stat": " one.py | 1 +\n",
             "base_commit": "b" * 40,
+            "source_repo": str(self.source),
+            "worker_id": "configured",
         }
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "fetch", "configured"]), \
                 patch.object(plugin, "fetch_worker", return_value=result) as fetch, \
@@ -276,6 +280,8 @@ class FetchTests(unittest.TestCase):
         self.assertIn("Commits: 2", text)
         self.assertIn("Commit: " + "a" * 40, text)
         self.assertIn("Changed files:\none.py", text)
+        quoted_source = shlex.quote(str(self.source))
+        self.assertIn(f"git -C {quoted_source} log ", text)
 
     def test_fetch_action_reads_configured_id(self):
         (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + '\n[fetch]\nid = "configured"\n')
@@ -287,6 +293,8 @@ class FetchTests(unittest.TestCase):
             "changed_files": ["one.py"],
             "diff_stat": " one.py | 1 +\n",
             "base_commit": "b" * 40,
+            "source_repo": str(self.source),
+            "worker_id": "configured",
         }
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "fetch"]), \
                 patch.object(plugin, "fetch_worker", return_value=result) as fetch, \

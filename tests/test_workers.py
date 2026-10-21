@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -91,6 +92,8 @@ class WorkerInspectionTests(unittest.TestCase):
         self.assertIn("TEST-001", rendered)
         self.assertIn("codex", rendered)
         self.assertIn("w1:p1", rendered)
+        self.assertIn("STATUS", rendered)
+        self.assertIn("CREATED", rendered)
         self.assertNotIn("DIRTY", rendered)
         self.assertNotIn("LATEST", rendered)
 
@@ -135,8 +138,9 @@ class WorkerInspectionTests(unittest.TestCase):
         self.assertIn("Git status:", rendered)
         self.assertIn("Git diff", rendered)
         self.assertIn("Review (run in source repo", rendered)
-        self.assertIn(f"git log base..sandbox/TEST-001", rendered)
-        self.assertIn(f"git diff base...sandbox/TEST-001", rendered)
+        quoted_source = shlex.quote(str(self.source))
+        self.assertIn(f"git -C {quoted_source} log base..sandbox/TEST-001", rendered)
+        self.assertIn(f"git -C {quoted_source} diff base...sandbox/TEST-001", rendered)
 
     def test_live_container_overrides_persisted_lifecycle_status(self):
         worker = self.create_worker()
@@ -286,7 +290,7 @@ class WorkerInspectionTests(unittest.TestCase):
         self.create_worker("OTHER-002")
 
         with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p9"}), \
-                patch.object(plugin, "cwd_repo_root", return_value=self.source.resolve()), \
+                contextlib.chdir(self.source), \
                 patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(plugin.main(), 0)
@@ -302,7 +306,7 @@ class WorkerInspectionTests(unittest.TestCase):
             self.create_worker("TWO-002", agent="claude")
 
         with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}), \
-                patch.object(plugin, "cwd_repo_root", return_value=self.source.resolve()), \
+                contextlib.chdir(self.source), \
                 patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
                 contextlib.redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(plugin.main(), 1)
@@ -311,6 +315,50 @@ class WorkerInspectionTests(unittest.TestCase):
         self.assertIn("ONE-001", message)
         self.assertIn("TWO-002", message)
 
+    def test_inspect_without_id_errors_when_pane_has_zero_matches(self):
+        with patch.dict(os.environ, {
+            "HERDR_PANE_ID": "w1:p1",
+            "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_SOCKET_PATH": "/tmp/herdr.sock",
+        }):
+            self.create_worker("OTHER-001")
+
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p-missing"}), \
+                contextlib.chdir(self.source), \
+                patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(plugin.main(), 1)
+        message = stderr.getvalue()
+        self.assertIn("No worker found for pane w1:p-missing", message)
+        self.assertIn("OTHER-001", message)
+
+    def test_inspect_without_id_errors_when_cwd_is_outside_git_repo(self):
+        self.create_worker("ONLY-001")
+        outside = Path(self.temp.name) / "not-a-repo"
+        outside.mkdir()
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}), \
+                contextlib.chdir(outside), \
+                patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(plugin.main(), 1)
+        message = stderr.getvalue()
+        self.assertIn("not inside a source Git repository", message)
+        self.assertIn("ONLY-001", message)
+
+    def test_inspect_config_id_alone_is_ignored(self):
+        self.create_worker("REAL-001")
+        (self.config / "config.toml").write_text(
+            plugin.DEFAULT_CONFIG + '\n[inspect]\nid = "REAL-001"\n'
+        )
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(plugin.main(), 1)
+        message = stderr.getvalue()
+        self.assertIn("[inspect] is deprecated and ignored", message)
+        self.assertIn("HERDR_PANE_ID is unset", message)
+        self.assertIn("REAL-001", message)
+
     def test_inspect_ignores_sole_worker_fallback(self):
         self.create_worker("ONLY-001")
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
@@ -318,6 +366,21 @@ class WorkerInspectionTests(unittest.TestCase):
             self.assertEqual(plugin.main(), 1)
         self.assertIn("HERDR_PANE_ID is unset", stderr.getvalue())
         self.assertIn("ONLY-001", stderr.getvalue())
+
+    def test_inspect_review_commands_ignore_malicious_result_branch_metadata(self):
+        worker = self.create_worker()
+        metadata_path = worker / "worker.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["result_branch"] = "sandbox/$(touch /tmp/pwned);evil"
+        metadata_path.write_text(json.dumps(metadata))
+        record = plugin.inspect_worker("TEST-001")
+        rendered = plugin.format_worker(record)
+        quoted_source = shlex.quote(str(self.source))
+        self.assertIn(f"git -C {quoted_source} log base..sandbox/TEST-001", rendered)
+        review_block = rendered.split("Review", 1)[1].split("Git log", 1)[0]
+        self.assertNotIn("$(touch", review_block)
+        self.assertNotIn(";evil", review_block)
+        self.assertIn("sandbox/TEST-001", review_block)
 
     def test_manifest_exposes_list_and_inspect_actions(self):
         manifest = tomllib.loads((SCRIPT.parent.parent / "herdr-plugin.toml").read_text())
