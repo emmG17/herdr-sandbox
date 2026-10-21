@@ -1613,6 +1613,8 @@ def fetch_worker(worker_id, state_dir=None):
         "head_moved": head_moved,
         "source_repo": str(source),
         "worker_id": worker_id,
+        # Reused by execute_worker so post-run accounting does not query twice.
+        "git_snapshot": snapshot,
     }
     if dirty_warning:
         result["dirty_warning"] = dirty_warning
@@ -2092,11 +2094,13 @@ def execute_worker(worker_id, prompt):
     head_value = "unavailable"
     result_branch = None
     commit_count = None
+    snapshot = None
     try:
         fetch_result = fetch_worker(worker_id, state_dir)
         head_value = fetch_result["commit"]
         result_branch = fetch_result["branch"]
         commit_count = fetch_result["commit_count"]
+        snapshot = fetch_result.get("git_snapshot")
         if fetch_result.get("dirty_warning"):
             print(fetch_result["dirty_warning"], file=sys.stderr)
         if fetch_result.get("head_moved_notice"):
@@ -2110,7 +2114,8 @@ def execute_worker(worker_id, prompt):
         )
         _write_worker_status(worker_dir, status)
 
-    snapshot = _query_worker_git_snapshot(worker_id)
+    if snapshot is None:
+        snapshot = _query_worker_git_snapshot(worker_id)
     if snapshot["error"]:
         git_status_value = f"(unavailable: {snapshot['error']})"
         dirty_value = None
@@ -3265,7 +3270,11 @@ def hs_codex(codex_args, prompt=None):
             print(exc, file=sys.stderr)
             return 1
         print_execution_result(result)
-        return result["exit_status"]
+        exit_status = result["exit_status"]
+        # Mirror interactive mode: a failed auto-fetch must not report success.
+        if result.get("result_branch") is None:
+            return exit_status if exit_status else 1
+        return exit_status
 
     # Interactive: fresh session home, then fetch results into sandbox/<id>.
     try:
