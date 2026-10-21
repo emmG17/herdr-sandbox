@@ -155,15 +155,23 @@ Host orchestrators should spawn sandboxed workers through `hs`, not bare
 tiled panes so `HERDR_PANE_ID` is set and the pane can reuse one worker.
 Plugin popup panes lack `HERDR_PANE_ID`, so every launch gets a new worker.
 
+Do **not** run bare `hs inspect` from the orchestrator pane: without an ID it
+resolves against the caller's `HERDR_PANE_ID` and cwd, not the worker pane.
+When you need the process exit code, run `hs <agent> --prompt` directly;
+`herdr pane run` does not return it (use `herdr pane read` or
+`runs/<run-id>/result.json` instead).
+
 ```sh
 herdr pane split --current --direction right --cwd "$PWD" --no-focus
-herdr pane run <pane> "hs claude"    # or: "hs codex" / "hs claude --prompt \"...\""
+herdr pane run <pane> "hs claude"    # or: "hs codex"
 herdr agent wait <pane> --until done
-# Then in the source repo:
-git log main..sandbox/<id>
-git diff main...sandbox/<id>
+# In the source repo — discover first, then inspect by ID:
 hs ls
+# Find PANE=<pane>; require STATUS=fetched and RESULT=sandbox/<id>
 hs inspect <id>
+# Use Base: and the printed Review lines (or the Review: lines from auto-fetch)
+git log <base>..sandbox/<id>
+git diff <base>...sandbox/<id>
 hs rm <id>    # optional; GC also runs on pane close and at launch
 ```
 
