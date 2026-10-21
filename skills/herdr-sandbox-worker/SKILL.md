@@ -1,11 +1,11 @@
 ---
 name: herdr-sandbox-worker
-description: Operates the Herdr Sandbox Workers plugin to have Codex work autonomously in an isolated disposable Git clone, then review and explicitly integrate the result. Use when a task should be delegated to a rootless-Podman sandbox worker, or when creating, running, inspecting, fetching, cherry-picking, or destroying a `dev.herdr.sandbox` worker.
+description: Operates the Herdr Sandbox Workers plugin to have Codex work autonomously in an isolated disposable Git clone, then review and integrate the result with plain git. Use when a task should be delegated to a rootless-Podman sandbox worker, or when creating, running, inspecting, fetching, or destroying a `dev.herdr.sandbox` worker.
 ---
 
 # Herdr Sandbox Worker
 
-Use `dev.herdr.sandbox` when the task benefits from an isolated Codex worker. Herdr is the control plane: it creates the clone, starts Codex, exposes evidence for review, and performs any integration. The worker only owns its disposable clone.
+Use `dev.herdr.sandbox` when the task benefits from an isolated Codex worker. Herdr is the control plane: it creates the clone, starts Codex, and exposes evidence for review. The worker only owns its disposable clone. Integration is ordinary git on `sandbox/<id>`.
 
 ## Preconditions
 
@@ -62,21 +62,17 @@ herdr plugin action invoke check --plugin dev.herdr.sandbox
    herdr plugin action invoke fetch --plugin dev.herdr.sandbox
    ```
 
-   `fetch` only updates the source repository's `FETCH_HEAD`; it never merges a worker change. Treat the reported full SHA and changed-file list as review evidence.
+   `fetch` force-updates `refs/heads/sandbox/<id>` in the source repository and
+   prints plain-git review and integration commands. It never merges into your
+   current branch.
 
-4. Integrate only an approved full 40-character SHA. Add the selected worker and SHA to the plugin configuration, then invoke the explicit integration action.
-
-   ```toml
-   [cherry_pick]
-   id = "WORKER-001"
-   commit = "0123456789abcdef0123456789abcdef01234567"
-   ```
+4. Integrate an approved result with ordinary git in the source checkout:
 
    ```sh
-   herdr plugin action invoke cherry-pick --plugin dev.herdr.sandbox
+   git log main..sandbox/<id>
+   git diff main...sandbox/<id>
+   git merge sandbox/<id>    # or cherry-pick or rebase
    ```
-
-   The source checkout must be clean. Resolve any cherry-pick conflict in that checkout with Git's normal `cherry-pick --continue` or `--abort` flow.
 
 5. After retaining or discarding the result, select the worker in `[destroy].id` and remove its disposable state.
 
@@ -86,7 +82,7 @@ herdr plugin action invoke check --plugin dev.herdr.sandbox
 
 ## Worker selection and configuration
 
-With multiple workers, configure worker IDs in the plugin config at `$(herdr plugin config-dir dev.herdr.sandbox)/config.toml`: `[fetch]`, `[inspect]`, `[open]`, `[execute]`, `[cherry_pick]`, or `[destroy]`. `[open].id` selects the worker for the interactive `start-codex` pane. Use `list` to recover IDs and lifecycle state.
+With multiple workers, configure worker IDs in the plugin config at `$(herdr plugin config-dir dev.herdr.sandbox)/config.toml`: `[fetch]`, `[inspect]`, `[open]`, `[execute]`, or `[destroy]`. `[open].id` selects the worker for the interactive `start-codex` pane. Use `list` to recover IDs and lifecycle state.
 
 Herdr 0.9.0 runs plugin actions in their invoking workspace and cannot let an
 action dynamically create or move its own pane. Use the manifest `start-codex`
@@ -102,4 +98,4 @@ Set `[runtime].network = "offline"` only for self-contained tasks. Use the defau
 
 The worker has broad permissions *inside* its container, but only its clone at `/workspace` and the dedicated `/codex` home are mounted. It has no host home, normal Codex home, SSH/GPG/cloud credentials, source-repository write access, or container-engine socket.
 
-Do not treat isolation as a VM boundary: avoid untrusted or hostile workloads. Before relying on a new environment, run the repository's disposable-worker security test. If any access expected to be denied succeeds, preserve the worker, do not fetch or cherry-pick it, and escalate the finding.
+Do not treat isolation as a VM boundary: avoid untrusted or hostile workloads. Before relying on a new environment, run the repository's disposable-worker security test. If any access expected to be denied succeeds, preserve the worker, do not fetch or integrate it, and escalate the finding.

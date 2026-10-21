@@ -87,7 +87,7 @@ missing container does not block identity reporting.
 `tests/test_security_worker_config.py` covers:
 
 - Malicious `core.fsmonitor` / hooks / textconv / sshCommand markers for list,
-  inspect, fetch, cherry-pick, and post-run HEAD reads
+  inspect, fetch, and post-run HEAD reads
 - Packed-refs resolution and fetch
 - Symlinked refs and objects rejected; source left without sandbox ref or
   alternates
