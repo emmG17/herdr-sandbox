@@ -210,24 +210,23 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
         sandbox_branch = f"sandbox/{worker_id}"
         git("-C", self.source, "rev-parse", "--verify", f"refs/heads/{sandbox_branch}")
 
-    def test_cherry_pick_does_not_execute_worker_config(self):
-        """Test that 'cherry-pick' command never executes worker config."""
-        # Create worker with a commit already made (before malicious config is added)
+    def test_plain_git_merge_after_fetch_does_not_execute_worker_config(self):
+        """Fetch then merge in the source repo must never read worker .git/config."""
         worker_id, worker_dir = self.create_malicious_worker(make_worker_change=True)
-        
-        # Read the commit SHA from the ref file (not using git command in worker repo)
         worker_repo = worker_dir / "repo"
         worker_ref_file = worker_repo / ".git" / "refs" / "heads" / f"agent/{worker_id}"
         worker_commit = worker_ref_file.read_text().strip()
-        
-        # Fetch first
-        plugin.fetch_worker(worker_id, self.state)
+
+        result = plugin.fetch_worker(worker_id, self.state)
+        self.assertEqual(result["commit"], worker_commit)
         self.assert_no_markers()
-        
-        # Cherry-pick
-        result = plugin.cherry_pick_worker(worker_id, worker_commit, self.state)
-        self.assertIsNotNone(result["integrated_commit"])
+
+        git("-C", self.source, "merge", "--no-edit", f"sandbox/{worker_id}")
         self.assert_no_markers()
+        self.assertEqual(
+            git("-C", self.source, "rev-parse", "HEAD"),
+            worker_commit,
+        )
 
     def test_execute_post_run_does_not_execute_worker_config(self):
         """Test that post-run HEAD reading never executes worker config."""
