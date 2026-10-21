@@ -126,12 +126,23 @@ one worker, `start-codex`, `inspect`, and `fetch` select it automatically; when
 several workers exist, configure `[open].id` in `config.toml` for the pane.
 
 `fetch` writes `refs/heads/sandbox/<id>` and prints the same review and
-integration commands. After keeping or discarding the result, configure
-`[destroy].id` and remove the worker:
+integration commands. After keeping or discarding the result, remove the
+worker explicitly or let GC clean it up:
 
 ```sh
-herdr plugin action invoke destroy --plugin dev.herdr.sandbox
+hs rm <id>
+hs gc
 ```
+
+Closing a Herdr pane triggers a `pane.closed` plugin event that runs
+`hs gc --from-event` for that pane's fetched workers. Each `hs codex` launch
+also runs a short opportunistic GC. GC never deletes or rewrites refs in the
+source repository (including `sandbox/*` branches).
+
+Configure retention with `[gc].max_age` (default `7d`). An unfetched worker
+older than `max_age` is fetched first and deleted only on success; otherwise
+GC skips it with a one-line warning. Workers with a running container are
+never collected. `pane.exited` is not a GC trigger.
 
 List durable worker state at any time:
 
@@ -243,6 +254,13 @@ PID limits are set in `[resources]`; isolation flags and mounts are fixed.
 network = "offline"
 ```
 
+Worker retention:
+
+```toml
+[gc]
+max_age = "7d"
+```
+
 ## Advanced use and troubleshooting
 
 For noninteractive automation, configure `[execute].id` and `[execute].prompt`
@@ -260,7 +278,7 @@ HERDR_PLUGIN_CONFIG_DIR=/path/to/config HERDR_PLUGIN_STATE_DIR=/path/to/state \
 python3 bin/herdr-sandbox create --id WORKER-001 --repo /path/to/source-repo --base main
 ```
 
-### One-off execute and destroy inputs
+### One-off execute and remove inputs
 
 Herdr 0.9.0 plugin actions have fixed command arguments. `herdr plugin action
 invoke` does not forward arguments after the action ID, so a command such as
@@ -278,6 +296,8 @@ SANDBOX_LAUNCHER="$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox"
 
 "$SANDBOX_LAUNCHER" fetch WORKER-001
 
+"$SANDBOX_LAUNCHER" rm --id WORKER-001
+# destroy --id remains an alias of rm until thin action wrappers land
 "$SANDBOX_LAUNCHER" destroy --id WORKER-001
 ```
 
@@ -285,7 +305,7 @@ These direct invocations are one-shot overrides: each command requires all of
 its inputs and does not read that action's config table. The launcher safely
 binds the Herdr-provided config and state directories to the plugin script and
 forwards arguments directly, without shell evaluation. It still uses the same
-hardened runtime, worker-path validation, and destroy ordering as the
+hardened runtime, worker-path validation, and remove ordering as the
 corresponding Herdr action. After `fetch`, integrate with plain git on
 `sandbox/<id>`. Rerun setup/bootstrap after changing the plugin installation so
 the launcher refreshes its bound script path.
@@ -295,16 +315,16 @@ The plugin waits for the Codex process it starts, but it cannot add a separate
 whether the caller waits for and displays an action's live output. If that
 control-plane invocation is asynchronous or does not forward the stream, use
 `list` or `inspect` after the run; the persisted result and log remain the
-source of truth. Worker cleanup is unchanged: `destroy` removes the worker
-directory, including its run history.
+source of truth. Worker cleanup: `rm` / `destroy --id` removes the worker
+directory, including its run history. Prefer `hs gc` for routine cleanup.
 
 - **Podman unavailable or running as root:** repair rootless Podman and check
   `podman info --format '{{.Host.Security.Rootless}}'` returns `true`.
 - **Worker image missing:** run `bootstrap` or `build-image`, then `check`.
 - **Codex authentication missing:** rerun the dedicated `CODEX_HOME=...` login;
   never copy credentials from `~/.codex`.
-- **Worker failed or stale:** use `inspect` and `list`; its files remain until
-  you explicitly destroy it.
+- **Worker failed or stale:** use `inspect` and `list`; use `hs rm <id>` or
+  wait for `hs gc` after fetch.
 - **Task needs network:** use the online profile; offline workers cannot fetch
   dependencies or contact model APIs.
 

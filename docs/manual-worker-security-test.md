@@ -84,8 +84,8 @@ diff - /tmp/security-test-head.txt < <(git rev-parse HEAD)
 # Verify sentinel file unchanged
 cat source-sentinel.txt
 
-# Destroy the test worker
-hs destroy --id <WORKER-ID>
+# Remove the test worker
+hs rm --id <WORKER-ID>
 
 # Clean up test repository
 cd /

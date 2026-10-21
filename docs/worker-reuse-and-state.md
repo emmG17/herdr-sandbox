@@ -220,15 +220,28 @@ The plugin:
 
 **Rationale:**
 - **Preserves work**: The worker may have uncommitted changes or state
-- **Explicit control**: User can destroy the worker if they want a fresh one at current HEAD
+- **Explicit control**: User can remove the worker if they want a fresh one at current HEAD
 - **Consistent**: Matches the fetch-time behavior (proceed with notice)
 - **Transparent**: User is informed of the base commit mismatch
 
 **To start fresh at current HEAD:**
 ```bash
-hs destroy <worker-id>
+hs rm <worker-id>
 hs codex  # Creates new worker at current HEAD
 ```
+
+## Garbage collection
+
+- `hs gc` removes workers whose status is `fetched` and whose pane no longer
+  exists (`herdr pane get`), or that are older than `[gc].max_age` (default `7d`).
+- **max_age + unfetched:** attempt `fetch_worker` first; delete only on success;
+  otherwise skip with a one-line warning naming the worker.
+- Running containers are never collected. `pane.exited` is not a GC trigger.
+- A `pane.closed` `[[events]]` hook runs `gc --from-event` (strict
+  `HERDR_PLUGIN_EVENT_JSON` parse) for that pane's fetched workers.
+- Each `hs <agent>` launch runs opportunistic GC under the state lock with a
+  2s budget; GC failures never fail the launch.
+- GC never deletes or rewrites any ref in the source repository.
 
 ### Example Scenarios
 
