@@ -3,6 +3,7 @@
 
 import argparse
 import codecs
+import errno
 import fcntl
 import json
 import os
@@ -1528,31 +1529,56 @@ def _rel_under_allowlist_entry(rel, entry):
     return rel_parts[: len(entry_parts)] == entry_parts
 
 
-def _symlink_target_within_allowlist(link_path, allowlist_root):
-    """Return True when a relative symlink resolves inside ``allowlist_root``.
+def _relative_symlink_stays_in_allowlist(allowlist_root, link_relpath, raw_target):
+    """Return True when a relative symlink target stays inside ``allowlist_root``.
 
-    Absolute symlink targets are never allowed. Resolution follows the final
-    target; the target must stay inside the same allowlisted top-level entry
-    (so pnpm links within ``node_modules`` keep working).
+    Absolute targets are refused. Containment is checked with lexical
+    ``os.path.normpath`` from the symlink's directory (fd-relative path), without
+    following other symlinks — so pnpm links within ``node_modules`` keep
+    working while escapes to ``../.env`` / ``../.git`` do not.
     """
-    link_path = Path(link_path)
-    allowlist_root = Path(allowlist_root).resolve()
-    try:
-        raw = os.readlink(link_path)
-    except OSError:
+    if not isinstance(raw_target, str) or not raw_target or os.path.isabs(raw_target):
         return False
-    if os.path.isabs(raw):
-        return False
-    candidate = link_path.parent / raw
+    root = os.path.normpath(str(allowlist_root))
+    link_dir = os.path.join(root, os.path.dirname(link_relpath)) if link_relpath else root
+    if not os.path.dirname(link_relpath):
+        link_dir = root
+    candidate = os.path.normpath(os.path.join(link_dir, raw_target))
     try:
-        resolved = candidate.resolve()
-    except (OSError, RuntimeError):
-        return False
-    try:
-        resolved.relative_to(allowlist_root)
-        return True
+        common = os.path.commonpath([root, candidate])
     except ValueError:
         return False
+    return common == root
+
+
+def _reflink_fd_to_path(src_fd, dst, src_stat=None):
+    """FICLONE from an open source fd to ``dst`` (O_CREAT|O_EXCL|O_NOFOLLOW)."""
+    dst = Path(dst)
+    if src_stat is None:
+        src_stat = os.fstat(src_fd)
+    if not stat.S_ISREG(src_stat.st_mode):
+        raise OSError("Reflink source must be a regular file")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        dst_fd = os.open(str(dst), flags, stat.S_IMODE(src_stat.st_mode))
+    except FileExistsError as exc:
+        raise OSError(f"Reflink destination already exists: {dst}") from exc
+    try:
+        try:
+            fcntl.ioctl(dst_fd, _FICLONE, src_fd)
+        except OSError:
+            try:
+                os.unlink(dst)
+            except OSError:
+                pass
+            raise
+        try:
+            os.fsync(dst_fd)
+        except OSError:
+            pass
+    finally:
+        os.close(dst_fd)
 
 
 def reflink_file(src, dst):
@@ -1566,35 +1592,12 @@ def reflink_file(src, dst):
     """
     src = Path(src)
     dst = Path(dst)
-    dst.parent.mkdir(parents=True, exist_ok=True)
     src_fd = os.open(str(src), os.O_RDONLY | os.O_NOFOLLOW)
     try:
         src_stat = os.fstat(src_fd)
         if not stat.S_ISREG(src_stat.st_mode):
             raise OSError(f"Reflink source must be a regular file: {src}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-        try:
-            dst_fd = os.open(str(dst), flags, stat.S_IMODE(src_stat.st_mode))
-        except FileExistsError as exc:
-            raise OSError(f"Reflink destination already exists: {dst}") from exc
-        try:
-            try:
-                fcntl.ioctl(dst_fd, _FICLONE, src_fd)
-            except OSError:
-                os.close(dst_fd)
-                dst_fd = -1
-                try:
-                    os.unlink(dst)
-                except OSError:
-                    pass
-                raise
-            try:
-                os.fsync(dst_fd)
-            except OSError:
-                pass
-        finally:
-            if dst_fd >= 0:
-                os.close(dst_fd)
+        _reflink_fd_to_path(src_fd, dst, src_stat)
     finally:
         os.close(src_fd)
 
@@ -1719,12 +1722,41 @@ def _iter_untracked_and_ignored_rels(source):
             yield rel
 
 
+def _index_git_dir_inodes(source, forbidden):
+    """Add ``(st_dev, st_ino)`` for every regular file under ``source/.git``.
+
+    Walks with ``followlinks=False`` so symlink directories under ``.git`` are not
+    entered. Indexes config, hooks, objects, and other metadata so a hardlink
+    from ``.git`` into an allowlisted tree cannot be reflinked into the worker.
+    """
+    git_path = Path(source) / ".git"
+    try:
+        st = git_path.lstat()
+    except OSError:
+        return
+    if stat.S_ISREG(st.st_mode):
+        forbidden.add((st.st_dev, st.st_ino))
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        return
+    for dirpath, _dirnames, filenames in os.walk(git_path, followlinks=False):
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                pst = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(pst.st_mode):
+                forbidden.add((pst.st_dev, pst.st_ino))
+
+
 def _forbidden_hardlink_inodes(source, copy_untracked):
     """Return ``{(st_dev, st_ino)}`` for files that must not be reflinked via allowlist.
 
     Includes every untracked/ignored regular file outside the allowlist (so a
-    ``.env`` hardlinked into ``node_modules`` is refused) and tracked regular
-    files outside allowlisted subtrees when cheap to collect. Directories are
+    ``.env`` hardlinked into ``node_modules`` is refused), tracked regular files
+    outside allowlisted subtrees, and every regular file under ``source/.git``
+    (so hardlinked git config/objects cannot ride along). Directories are
     skipped. pnpm/npm hardlinks that stay entirely inside the allowlist are kept.
     """
     source = Path(source).resolve()
@@ -1752,72 +1784,172 @@ def _forbidden_hardlink_inodes(source, copy_untracked):
             continue
         add_if_regular(rel)
 
+    _index_git_dir_inodes(source, forbidden)
     return forbidden
 
 
-def _copy_allowlisted_entry(src, dst, allowlist_root, forbidden_inodes):
-    """Copy one path under an allowlisted tree without following unsafe symlinks.
-
-    Absolute symlinks are never recreated. Relative symlinks are recreated only
-    when their fully resolved target stays inside the same allowlisted top-level
-    entry. Nested ``.git`` directories are skipped at walk time as a second layer
-    after config validation. Files whose ``(dev, ino)`` appear in
-    ``forbidden_inodes`` (hardlinks to non-allowlisted paths such as ``.env``)
-    are skipped with one stderr line each.
-    """
-    src = Path(src)
+def _prepare_dst_path(dst):
+    """Remove a preexisting destination path so O_EXCL reflink/symlink can proceed."""
     dst = Path(dst)
-    allowlist_root = Path(allowlist_root).resolve()
-    if src.is_symlink():
-        raw = os.readlink(src)
-        if os.path.isabs(raw) or not _symlink_target_within_allowlist(src, allowlist_root):
-            print(
-                f"reflink: skipping symlink outside allowlist entry {allowlist_root.name}: {src}",
-                file=sys.stderr,
-            )
-            return
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.exists() or dst.is_symlink():
-            if dst.is_dir() and not dst.is_symlink():
-                shutil.rmtree(dst)
-            else:
-                dst.unlink()
-        os.symlink(raw, dst)
-        return
-    if src.name == ".git":
-        # Second layer: never copy a nested .git even if validation was bypassed.
-        return
-    if src.is_dir():
-        dst.mkdir(parents=True, exist_ok=True)
-        with os.scandir(src) as entries:
-            for entry in entries:
-                _copy_allowlisted_entry(
-                    Path(entry.path),
-                    dst / entry.name,
-                    allowlist_root,
-                    forbidden_inodes,
-                )
-        return
-    if src.is_file():
-        try:
-            st = src.lstat()
-        except OSError as exc:
-            print(f"reflink: skipping unreadable allowlisted file {src}: {exc}", file=sys.stderr)
+    if dst.exists() or dst.is_symlink():
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+
+
+def _copy_allowlisted_file_fd(dir_fd, name, dst, relpath, allowlist_root, forbidden_inodes):
+    """Open ``name`` under ``dir_fd`` with O_NOFOLLOW and reflink if allowed."""
+    file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        st = os.fstat(file_fd)
+        if not stat.S_ISREG(st.st_mode):
             return
         if (st.st_dev, st.st_ino) in forbidden_inodes:
             print(
-                f"reflink: skipping hardlink to non-allowlisted path: {src}",
+                f"reflink: skipping hardlink to non-allowlisted path: "
+                f"{allowlist_root / relpath}",
                 file=sys.stderr,
             )
             return
-        if dst.exists() or dst.is_symlink():
-            if dst.is_dir() and not dst.is_symlink():
-                shutil.rmtree(dst)
-            else:
-                dst.unlink()
-        reflink_file(src, dst)
+        _prepare_dst_path(dst)
+        _reflink_fd_to_path(file_fd, dst, st)
+    finally:
+        os.close(file_fd)
+
+
+def _copy_allowlisted_symlink_fd(dir_fd, name, dst, relpath, allowlist_root):
+    """Recreate a relative symlink only when its lexical target stays in-entry."""
+    raw = os.readlink(name, dir_fd=dir_fd)
+    if not _relative_symlink_stays_in_allowlist(allowlist_root, relpath, raw):
+        print(
+            f"reflink: skipping symlink outside allowlist entry {Path(allowlist_root).name}: "
+            f"{allowlist_root / relpath}",
+            file=sys.stderr,
+        )
         return
-    # Skip sockets, devices, and other non-file types.
+    _prepare_dst_path(dst)
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(raw, dst)
+
+
+def _walk_allowlist_fd(dir_fd, dst_dir, allowlist_root, rel_prefix, forbidden_inodes):
+    """Recursively copy one allowlisted directory via directory fds and O_NOFOLLOW.
+
+    Children are classified with ``DirEntry.is_* (follow_symlinks=False)``. Directories
+    are reopened with ``O_RDONLY|O_DIRECTORY|O_NOFOLLOW`` (so a TOCTOU swap to a
+    symlink targeting ``../.git`` fails closed). Nested ``.git`` names are skipped.
+    Every opened fd is closed, including on error.
+    """
+    dst_dir = Path(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    with os.scandir(dir_fd) as entries:
+        children = list(entries)
+    for entry in children:
+        name = entry.name
+        if name == ".git":
+            continue
+        child_rel = f"{rel_prefix}/{name}" if rel_prefix else name
+        child_dst = dst_dir / name
+        try:
+            is_link = entry.is_symlink()
+            is_dir = entry.is_dir(follow_symlinks=False)
+            is_file = entry.is_file(follow_symlinks=False)
+        except OSError as exc:
+            print(
+                f"reflink: skipping unreadable allowlisted entry "
+                f"{allowlist_root / child_rel}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        if is_link:
+            _copy_allowlisted_symlink_fd(dir_fd, name, child_dst, child_rel, allowlist_root)
+            continue
+        if is_dir:
+            child_fd = -1
+            try:
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=dir_fd,
+                )
+            except OSError as exc:
+                # Directory swapped for a symlink (e.g. to ../.git) or vanished.
+                print(
+                    f"reflink: skipping allowlisted directory after open failed "
+                    f"{allowlist_root / child_rel}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                _walk_allowlist_fd(
+                    child_fd,
+                    child_dst,
+                    allowlist_root,
+                    child_rel,
+                    forbidden_inodes,
+                )
+            finally:
+                os.close(child_fd)
+            continue
+        if is_file:
+            try:
+                _copy_allowlisted_file_fd(
+                    dir_fd, name, child_dst, child_rel, allowlist_root, forbidden_inodes
+                )
+            except OSError as exc:
+                print(
+                    f"reflink: skipping unreadable allowlisted file "
+                    f"{allowlist_root / child_rel}: {exc}",
+                    file=sys.stderr,
+                )
+            continue
+        # Skip sockets, devices, and other non-file types.
+
+
+def _copy_allowlisted_path_fd(src, dst, allowlist_root, forbidden_inodes):
+    """Copy an allowlisted file or directory tree using O_NOFOLLOW directory fds."""
+    src = Path(src)
+    dst = Path(dst)
+    allowlist_root = Path(allowlist_root)
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        root_fd = os.open(str(src), dir_flags)
+    except OSError as dir_exc:
+        # Not a directory (or symlink/file): treat as a single regular file.
+        if src.name == ".git":
+            return
+        file_fd = -1
+        try:
+            file_fd = os.open(str(src), os.O_RDONLY | os.O_NOFOLLOW)
+            st = os.fstat(file_fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(
+                    f"[workspace].copy_untracked entry must be a regular file or "
+                    f"directory (got {src})"
+                ) from dir_exc
+            if (st.st_dev, st.st_ino) in forbidden_inodes:
+                print(
+                    f"reflink: skipping hardlink to non-allowlisted path: {src}",
+                    file=sys.stderr,
+                )
+                return
+            _prepare_dst_path(dst)
+            _reflink_fd_to_path(file_fd, dst, st)
+        except OSError as file_exc:
+            if file_exc.errno in {errno.ELOOP, errno.EOPNOTSUPP}:
+                raise ValueError(
+                    f"[workspace].copy_untracked entry must not be a symlink: {src.name}"
+                ) from file_exc
+            raise
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+        return
+    try:
+        _walk_allowlist_fd(root_fd, dst, allowlist_root, "", forbidden_inodes)
+    finally:
+        os.close(root_fd)
 
 
 def copy_allowlisted_untracked(source, clone, copy_untracked):
@@ -1828,14 +1960,17 @@ def copy_allowlisted_untracked(source, clone, copy_untracked):
     for entry in copy_untracked:
         entry = validate_copy_untracked_entry(entry)
         src = source / entry
-        if src.is_symlink():
+        try:
+            st = src.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
             raise ValueError(
                 f"[workspace].copy_untracked entry must not be a symlink: {entry}"
             )
-        if not src.exists():
-            continue
         if not _path_is_within(src, source):
             raise ValueError(f"copy_untracked path escapes source repository: {entry}")
+        # Lexical/real path of the entry root (entry itself is not a symlink).
         allowlist_root = src.resolve()
         try:
             allowlist_root.relative_to(source)
@@ -1846,7 +1981,7 @@ def copy_allowlisted_untracked(source, clone, copy_untracked):
                 f"[workspace].copy_untracked entry must sit strictly under the source "
                 f"(got {entry!r})."
             )
-        _copy_allowlisted_entry(src, clone / entry, allowlist_root, forbidden)
+        _copy_allowlisted_path_fd(src, clone / entry, allowlist_root, forbidden)
 
 
 def _herdr_bin():

@@ -413,11 +413,14 @@ With a successful probe:
   resolved target stays inside that same top-level entry (pnpm links within
   `node_modules` keep working). Absolute symlinks and links to `.env`, `.git`,
   or anywhere else outside that entry are skipped with one stderr line each.
-- Hardlinks from allowlisted files to non-allowlisted untracked/ignored paths
-  (or to tracked files outside the allowlist) are skipped with one stderr line
-  each, so a `.env` hardlinked into `node_modules` does not reach the worker.
+- Hardlinks from allowlisted files to non-allowlisted untracked/ignored paths,
+  to tracked files outside the allowlist, or to any regular file under
+  `source/.git` are skipped with one stderr line each, so a `.env` or
+  `.git/config` hardlinked into `node_modules` does not reach the worker.
   Hardlinks that stay entirely inside the allowlist (common with pnpm/npm) are
-  kept.
+  kept. Allowlisted trees are walked with directory fds and
+  `O_NOFOLLOW`/`O_DIRECTORY` so a directory swapped for a symlink to `../.git`
+  fails closed instead of copying git metadata.
 - Gitlinks/submodules are not populated; create prints one stderr notice listing
   skipped paths.
 - Reflinked files get new inodes; a write in the worker must not change the

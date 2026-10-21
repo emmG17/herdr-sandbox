@@ -77,16 +77,31 @@ def _reflink_test_root():
     return None
 
 
-def _copy2_as_reflink(src, dst):
-    """Test double: regular copy that preserves the reflink_file contract."""
-    src = Path(src)
+def _copy2_from_fd(src_fd, dst, src_stat=None):
+    """Test double for ``_reflink_fd_to_path`` on filesystems without FICLONE."""
     dst = Path(dst)
-    if src.is_symlink():
-        raise OSError(f"Reflink source must be a regular file: {src}")
+    st = src_stat if src_stat is not None else os.fstat(src_fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError("Reflink source must be a regular file")
     if dst.exists() or dst.is_symlink():
         raise OSError(f"Reflink destination already exists: {dst}")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    with open(dst, "wb") as out:
+        offset = 0
+        remaining = st.st_size
+        while remaining > 0:
+            chunk = os.pread(src_fd, min(1024 * 1024, remaining), offset)
+            if not chunk:
+                break
+            out.write(chunk)
+            offset += len(chunk)
+            remaining -= len(chunk)
+    os.chmod(dst, stat.S_IMODE(st.st_mode))
+
+
+def _patch_reflink_copy():
+    """Patch the fd-based reflink primitive used by allowlist copies."""
+    return patch.object(plugin, "_reflink_fd_to_path", side_effect=_copy2_from_fd)
 
 
 class WorkspaceSettingsTests(unittest.TestCase):
@@ -183,8 +198,7 @@ class ReflinkHelpersTests(unittest.TestCase):
         dest = self.root / "dest"
         dest.mkdir()
         stderr = io.StringIO()
-        with patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink), \
-                patch.object(plugin.sys, "stderr", stderr):
+        with _patch_reflink_copy(), patch.object(plugin.sys, "stderr", stderr):
             plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
 
         self.assertTrue((dest / "node_modules" / "keep.js").is_file())
@@ -200,7 +214,7 @@ class ReflinkHelpersTests(unittest.TestCase):
         (self.source / "node_modules").symlink_to(outside)
         dest = self.root / "dest"
         dest.mkdir()
-        with patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink):
+        with _patch_reflink_copy():
             with self.assertRaisesRegex(ValueError, "must not be a symlink"):
                 plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
 
@@ -222,8 +236,7 @@ class ReflinkHelpersTests(unittest.TestCase):
         dest = self.root / "dest"
         dest.mkdir()
         stderr = io.StringIO()
-        with patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink), \
-                patch.object(plugin.sys, "stderr", stderr):
+        with _patch_reflink_copy(), patch.object(plugin.sys, "stderr", stderr):
             plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
 
         self.assertTrue((dest / "node_modules" / ".bin" / "tool").is_symlink())
@@ -247,13 +260,81 @@ class ReflinkHelpersTests(unittest.TestCase):
         dest = self.root / "dest"
         dest.mkdir()
         stderr = io.StringIO()
-        with patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink), \
-                patch.object(plugin.sys, "stderr", stderr):
+        with _patch_reflink_copy(), patch.object(plugin.sys, "stderr", stderr):
             plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
 
         self.assertTrue((dest / "node_modules" / "pkg" / "index.js").is_file())
         self.assertFalse((dest / "node_modules" / "pkg" / "leaked.env").exists())
         self.assertIn("skipping hardlink", stderr.getvalue())
+
+    def test_hardlink_from_git_config_and_object_skipped(self):
+        mods = self.source / "node_modules" / "pkg"
+        mods.mkdir(parents=True)
+        (mods / "index.js").write_text("deps\n")
+        git_config = self.source / ".git" / "config"
+        self.assertTrue(git_config.is_file())
+        os.link(git_config, mods / "stolen-config")
+        objects = self.source / ".git" / "objects"
+        object_file = next(
+            path for path in objects.rglob("*")
+            if path.is_file() and not path.name.startswith("pack")
+        )
+        os.link(object_file, mods / "stolen-object")
+
+        dest = self.root / "dest"
+        dest.mkdir()
+        stderr = io.StringIO()
+        with _patch_reflink_copy(), patch.object(plugin.sys, "stderr", stderr):
+            plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
+
+        self.assertTrue((dest / "node_modules" / "pkg" / "index.js").is_file())
+        self.assertFalse((dest / "node_modules" / "pkg" / "stolen-config").exists())
+        self.assertFalse((dest / "node_modules" / "pkg" / "stolen-object").exists())
+        self.assertGreaterEqual(stderr.getvalue().count("skipping hardlink"), 2)
+
+    def test_dir_to_dotgit_symlink_swap_fails_closed(self):
+        """Simulate TOCTOU: directory becomes symlink to ../.git between check and open."""
+        mods = self.source / "node_modules"
+        mods.mkdir()
+        (mods / "keep.js").write_text("keep\n")
+        trap = mods / "trap"
+        trap.mkdir()
+        (trap / "innocent.txt").write_text("ok\n")
+        # Plant distinctive git metadata we must never copy.
+        hook = self.source / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\necho leaked-hook\n")
+
+        dest = self.root / "dest"
+        dest.mkdir()
+        real_open = os.open
+
+        def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+            wants_dir = bool(flags & os.O_DIRECTORY) and bool(flags & os.O_NOFOLLOW)
+            if dir_fd is not None and path == "trap" and wants_dir and trap.is_dir() and not trap.is_symlink():
+                shutil.rmtree(trap)
+                trap.symlink_to("../.git")
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        stderr = io.StringIO()
+        with _patch_reflink_copy(), \
+                patch.object(plugin.os, "open", side_effect=racing_open), \
+                patch.object(plugin.sys, "stderr", stderr):
+            plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
+
+        self.assertTrue((dest / "node_modules" / "keep.js").is_file())
+        # No git metadata from the swapped ../.git must land under dest.
+        self.assertFalse((dest / "node_modules" / "trap").exists() or (dest / "node_modules" / "trap").is_symlink())
+        trap_dest = dest / "node_modules" / "trap"
+        if trap_dest.exists():
+            self.assertFalse((trap_dest / "hooks" / "pre-commit").exists())
+            self.assertFalse((trap_dest / "config").exists())
+            self.assertFalse((trap_dest / "objects").exists())
+        self.assertNotIn("leaked-hook", "".join(
+            p.read_text() for p in dest.rglob("*") if p.is_file()
+        ))
+        self.assertIn("open failed", stderr.getvalue())
 
     def test_reflink_file_refuses_symlink_source_with_nofollow(self):
         target = self.root / "target.txt"
@@ -334,8 +415,7 @@ class ReflinkCreateTests(unittest.TestCase):
         source_hook = self.source / ".git" / "hooks" / "pre-commit"
         source_hook.write_text("#!/bin/sh\necho source-only-hook\n")
         source_hook.chmod(source_hook.stat().st_mode | stat.S_IXUSR)
-        with patch.object(plugin, "probe_reflink", return_value=True), \
-                patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink):
+        with patch.object(plugin, "probe_reflink", return_value=True), _patch_reflink_copy():
             worker = plugin.create_worker("REFLINK-001", str(self.source))
         clone = worker / "repo"
         self.assertEqual((clone / "value.txt").read_text(), "tracked\n")
@@ -357,8 +437,7 @@ class ReflinkCreateTests(unittest.TestCase):
 
     def test_create_worker_refuses_dirty_tree_for_reflink(self):
         (self.source / "dirty.txt").write_text("uncommitted\n")
-        with patch.object(plugin, "probe_reflink", return_value=True), \
-                patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink):
+        with patch.object(plugin, "probe_reflink", return_value=True), _patch_reflink_copy():
             with self.assertRaisesRegex(ValueError, "uncommitted or untracked"):
                 plugin.create_worker("DIRTY-001", str(self.source))
         self.assertFalse((self.state / "workers" / "DIRTY-001").exists())
@@ -366,8 +445,7 @@ class ReflinkCreateTests(unittest.TestCase):
     def test_tracked_bytes_come_from_objects_not_assume_unchanged_worktree(self):
         git("-C", self.source, "update-index", "--assume-unchanged", "value.txt")
         (self.source / "value.txt").write_text("worktree-leaked-bytes\n")
-        with patch.object(plugin, "probe_reflink", return_value=True), \
-                patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink):
+        with patch.object(plugin, "probe_reflink", return_value=True), _patch_reflink_copy():
             worker = plugin.create_worker("OBJECTS-001", str(self.source))
         clone = worker / "repo"
         self.assertEqual((clone / "value.txt").read_text(), "tracked\n")
@@ -377,8 +455,7 @@ class ReflinkCreateTests(unittest.TestCase):
         # Simulate a worktree that does not match the blob (e.g. line-ending tools).
         (self.source / "value.txt").write_bytes(b"tracked\r\n")
         git("-C", self.source, "update-index", "--assume-unchanged", "value.txt")
-        with patch.object(plugin, "probe_reflink", return_value=True), \
-                patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink):
+        with patch.object(plugin, "probe_reflink", return_value=True), _patch_reflink_copy():
             worker = plugin.create_worker("CRLF-001", str(self.source))
         self.assertEqual((worker / "repo" / "value.txt").read_bytes(), b"tracked\n")
 
@@ -387,7 +464,7 @@ class ReflinkCreateTests(unittest.TestCase):
         os.link(self.source / ".env", leaked)
         stderr = io.StringIO()
         with patch.object(plugin, "probe_reflink", return_value=True), \
-                patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink), \
+                _patch_reflink_copy(), \
                 patch.object(plugin.sys, "stderr", stderr):
             worker = plugin.create_worker("HARDLINK-001", str(self.source))
         clone = worker / "repo"
@@ -468,6 +545,22 @@ class RealReflinkCreateTests(unittest.TestCase):
             worker = plugin.create_worker("REAL-HARDLINK-001", str(self.source))
         self.assertFalse((worker / "repo" / "node_modules" / "pkg" / "leaked.env").exists())
         self.assertIn("skipping hardlink", stderr.getvalue())
+
+    def test_real_reflink_skips_git_hardlinks_inside_allowlist(self):
+        mods = self.source / "node_modules" / "pkg"
+        os.link(self.source / ".git" / "config", mods / "stolen-config")
+        object_file = next(
+            path for path in (self.source / ".git" / "objects").rglob("*")
+            if path.is_file() and len(path.name) == 38
+        )
+        os.link(object_file, mods / "stolen-object")
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "stderr", stderr):
+            worker = plugin.create_worker("REAL-GITLINK-001", str(self.source))
+        clone = worker / "repo"
+        self.assertFalse((clone / "node_modules" / "pkg" / "stolen-config").exists())
+        self.assertFalse((clone / "node_modules" / "pkg" / "stolen-object").exists())
+        self.assertGreaterEqual(stderr.getvalue().count("skipping hardlink"), 2)
 
 
 class ProbeCrossFilesystemTests(unittest.TestCase):
