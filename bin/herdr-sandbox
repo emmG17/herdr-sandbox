@@ -894,10 +894,21 @@ def _herdr_bin():
     return None
 
 
+def _structured_pane_not_found(payload):
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("error"), dict)
+        and payload["error"].get("code") == "pane_not_found"
+    )
+
+
 def pane_exists(pane_id):
     """Return True/False when pane existence is known; None when it cannot be determined.
 
     Uses `herdr pane get <pane_id>` (verified in docs/herdr-pane-lifecycle.md).
+    Only a structured JSON error with code ``pane_not_found`` means the pane is
+    gone. Substrings like "not found" (command missing, socket down, etc.) are
+    treated as unknown so GC never deletes on a soft failure.
     """
     if not isinstance(pane_id, str) or not pane_id.strip():
         return False
@@ -907,27 +918,24 @@ def pane_exists(pane_id):
     result = run(herdr, "pane", "get", pane_id.strip())
     stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
-    combined = f"{stdout}\n{stderr}".strip()
-    if result.returncode == 0:
+    saw_json = False
+    for raw in (stdout, stderr):
+        if not raw:
+            continue
         try:
-            payload = json.loads(stdout) if stdout else {}
+            payload = json.loads(raw)
         except json.JSONDecodeError:
-            return True
-        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
-            code = payload["error"].get("code")
-            if code == "pane_not_found":
-                return False
-            return None
-        return True
-    try:
-        payload = json.loads(stdout) if stdout else {}
-    except json.JSONDecodeError:
-        payload = {}
-    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
-        if payload["error"].get("code") == "pane_not_found":
+            continue
+        saw_json = True
+        if _structured_pane_not_found(payload):
             return False
-    if "pane_not_found" in combined.lower() or "not found" in combined.lower():
-        return False
+        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+            return None
+        if result.returncode == 0 and isinstance(payload, dict):
+            return True
+    if result.returncode == 0 and not saw_json:
+        # Successful non-JSON output: treat as present rather than guessing gone.
+        return True
     return None
 
 
@@ -959,7 +967,16 @@ def _parse_created_at(value):
 
 
 def _worker_container_running(worker_id):
+    """True only when Podman reports an actively running worker container."""
     return container_status(worker_id) == "running"
+
+
+GC_COLLECTIBLE_CONTAINER_STATUSES = frozenset({"not-found", "exited", "stopped"})
+
+
+def _container_status_collectible(status):
+    """Fail closed: GC may delete only when the container is clearly absent or stopped."""
+    return status in GC_COLLECTIBLE_CONTAINER_STATUSES
 
 
 def _delete_worker_directory(worker_dir, workers_dir):
@@ -1099,23 +1116,99 @@ def _try_fetch_before_gc(worker_id, state_dir, warnings):
         return False
 
 
+def _source_sandbox_commit(source_repo, worker_id):
+    """Read refs/heads/sandbox/<id> from the source repo (host git on source only)."""
+    source = Path(source_repo).expanduser().resolve()
+    result = run(
+        "git",
+        "-C",
+        str(source),
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        f"refs/heads/sandbox/{worker_id}^{{commit}}",
+    )
+    if result.returncode:
+        return None
+    sha = (result.stdout or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+        return None
+    return sha
+
+
+def _tip_matches_fetched(worker_id, worker_dir, metadata):
+    """True when agent/<id> tip and source sandbox/<id> both equal fetched_commit."""
+    fetched = metadata.get("fetched_commit")
+    if not isinstance(fetched, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", fetched):
+        return False
+    repo = Path(worker_dir) / "repo"
+    try:
+        tip = _safe_read_worker_ref(repo, f"agent/{worker_id}")
+    except ValueError:
+        return False
+    if tip is None or tip.lower() != fetched.lower():
+        return False
+    source = metadata.get("source_repo")
+    if not isinstance(source, str) or not source:
+        return False
+    sandbox = _source_sandbox_commit(source, worker_id)
+    return sandbox is not None and sandbox.lower() == fetched.lower()
+
+
+def _prepare_worker_for_collection(worker_id, worker_dir, metadata, *, allow_fetch, state_dir, warnings):
+    """Require a current fetch before GC deletion.
+
+    Status ``fetched`` alone is not enough: the worker may have kept committing.
+    Compare ``agent/<id>`` and ``refs/heads/sandbox/<id>`` to ``fetched_commit``.
+    On mismatch, explicit GC may re-fetch; event/opportunistic paths skip.
+    """
+    if metadata.get("status") != "fetched":
+        return False, metadata
+    if _tip_matches_fetched(worker_id, worker_dir, metadata):
+        return True, metadata
+    if not allow_fetch:
+        warnings.append(
+            f"Skipping worker {worker_id}: tip moved since last fetch "
+            "(status is fetched but agent tip or sandbox ref does not match fetched_commit)."
+        )
+        return False, metadata
+    if not _try_fetch_before_gc(worker_id, state_dir, warnings):
+        return False, metadata
+    try:
+        metadata = _read_worker_metadata(worker_dir)
+    except ValueError as exc:
+        warnings.append(f"Skipping worker {worker_id}: {exc}")
+        return False, metadata
+    if metadata.get("status") != "fetched" or not _tip_matches_fetched(worker_id, worker_dir, metadata):
+        warnings.append(
+            f"Skipping worker {worker_id}: re-fetch did not leave tip matching sandbox/{worker_id}."
+        )
+        return False, metadata
+    return True, metadata
+
+
 def gc_collect_workers(
     state_dir=None,
     config_dir=None,
     pane_id=None,
     opportunistic=False,
+    allow_fetch=None,
     deadline=None,
     now=None,
 ):
     """Collect eligible workers without rewriting refs in any source repository.
 
-    max_age rule for unfetched workers: attempt fetch first; delete only on
-    success; otherwise skip with a one-line warning naming the worker.
+    max_age rule for unfetched workers (explicit ``hs gc`` only): attempt fetch
+    first; delete only on success; otherwise skip with a one-line warning.
+    Opportunistic and pane-event paths never fetch; they leave stale unfetched
+    workers for explicit ``hs gc``.
     """
     removed = []
     warnings = []
     skipped = []
     now = now or datetime.now(timezone.utc)
+    if allow_fetch is None:
+        allow_fetch = not opportunistic and pane_id is None
     if config_dir is None:
         config_dir, _ = paths()
     settings = gc_settings(config_dir)
@@ -1147,9 +1240,15 @@ def gc_collect_workers(
             if not fetched_and_pane_gone and not stale:
                 continue
             if stale and status != "fetched":
+                if not allow_fetch:
+                    warnings.append(
+                        f"Skipping unfetched worker {worker_id}: "
+                        "leave fetch-before-GC to explicit hs gc."
+                    )
+                    skipped.append(worker_id)
+                    continue
                 if not _try_fetch_before_gc(worker_id, state_dir, warnings):
                     continue
-                # Re-read status after fetch.
                 try:
                     metadata = _read_worker_metadata(entry)
                 except ValueError as exc:
@@ -1161,9 +1260,25 @@ def gc_collect_workers(
                     )
                     continue
 
-        if _worker_container_running(worker_id):
+        ready, metadata = _prepare_worker_for_collection(
+            worker_id,
+            entry,
+            metadata,
+            allow_fetch=allow_fetch,
+            state_dir=state_dir,
+            warnings=warnings,
+        )
+        if not ready:
             skipped.append(worker_id)
-            warnings.append(f"Skipping worker {worker_id}: container is running.")
+            continue
+
+        container = container_status(worker_id)
+        if not _container_status_collectible(container):
+            skipped.append(worker_id)
+            warnings.append(
+                f"Skipping worker {worker_id}: container status {container!r} "
+                "is not safely collectible."
+            )
             continue
         try:
             if destroy_worker(worker_id, state_dir=state_dir, force=True, warn_unfetched=False):
@@ -1176,18 +1291,30 @@ def gc_collect_workers(
 
 
 def opportunistic_gc(state_dir=None, config_dir=None):
-    """Best-effort GC at launch: hold the state lock, bound time, never raise."""
+    """Best-effort GC at launch: non-blocking lock, no fetch, time-bounded, never raise."""
     try:
         if state_dir is None or config_dir is None:
             config_dir, state_dir = paths()
         deadline = time.monotonic() + GC_OPPORTUNISTIC_BUDGET_SECONDS
-        with StateLock(state_dir):
-            result = gc_collect_workers(
-                state_dir=state_dir,
-                config_dir=config_dir,
-                opportunistic=True,
-                deadline=deadline,
-            )
+        try:
+            with StateLock(state_dir, blocking=False):
+                if time.monotonic() >= deadline:
+                    return {
+                        "removed": [],
+                        "warnings": ["Opportunistic GC skipped: budget exhausted before work."],
+                        "skipped": [],
+                    }
+                result = gc_collect_workers(
+                    state_dir=state_dir,
+                    config_dir=config_dir,
+                    opportunistic=True,
+                    allow_fetch=False,
+                    deadline=deadline,
+                )
+        except BlockingIOError:
+            message = "Opportunistic GC skipped: state lock busy."
+            print(message, file=sys.stderr)
+            return {"removed": [], "warnings": [message], "skipped": []}
         for warning in result["warnings"]:
             print(warning, file=sys.stderr)
         if result["removed"]:
@@ -2496,22 +2623,35 @@ def _state_lock_path(state_dir=None):
 
 
 class StateLock:
-    """Exclusive file lock for state store operations."""
+    """Exclusive file lock for state store operations.
 
-    def __init__(self, state_dir=None):
+    When ``blocking`` is False, acquire with ``LOCK_NB`` and raise
+    ``BlockingIOError`` immediately if another holder owns the lock so
+    opportunistic GC never stalls a launch.
+    """
+
+    def __init__(self, state_dir=None, blocking=True):
         self.lock_path = _state_lock_path(state_dir)
         self.lock_file = None
+        self.blocking = blocking
 
     def __enter__(self):
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_file = self.lock_path.open("a")
-        fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX)
+        flags = fcntl.LOCK_EX if self.blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(self.lock_file.fileno(), flags)
+        except BlockingIOError:
+            self.lock_file.close()
+            self.lock_file = None
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.lock_file:
             fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
             self.lock_file.close()
+            self.lock_file = None
         return False
 
 
@@ -2993,11 +3133,14 @@ def main():
                 if pane:
                     raise ValueError("Pass either --pane or --from-event, not both.")
                 pane = parse_plugin_event_json(os.environ.get("HERDR_PLUGIN_EVENT_JSON"))
+            # Explicit full `hs gc` may fetch-before-delete; pane/event paths must not.
+            allow_fetch = pane is None and not args.from_event
             with StateLock(state_dir):
                 result = gc_collect_workers(
                     state_dir=state_dir,
                     config_dir=config_dir,
                     pane_id=pane,
+                    allow_fetch=allow_fetch,
                 )
             for warning in result["warnings"]:
                 print(warning, file=sys.stderr)
