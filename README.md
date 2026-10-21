@@ -18,15 +18,14 @@ selected commits) after you review that branch.
 
 Agents use full in-container permissions (Codex: `danger-full-access`; Claude
 Code: `--dangerously-skip-permissions`). Rootless Podman is the security
-boundary: agent launches (`hs <agent>`, `--prompt`, `start-*`) mount only the
-worker repository at `/workspace` and a per-launch session home at `/codex` or
-`/claude` (auth artifacts only). They do not mount your normal `~/.codex`,
-`~/.claude`, `~/.claude.json`, host home, SSH/GPG/cloud credentials, or
-Podman/Docker sockets. A non-fresh bash `open` still mounts the whole
-configured plugin agent home (issue #29). Isolation uses `--userns=keep-id`,
-drops capabilities, enables `no-new-privileges`, and a read-only container
-root. Host environment variables are never forwarded into the container
-implicitly.
+boundary: agent launches (`hs <agent>`, `--prompt`, `start-*` panes) mount only
+the worker repository at `/workspace` and a per-launch session home at `/codex`
+or `/claude` (auth artifacts only). They never mount the configured plugin
+agent home wholesale, nor your normal `~/.codex`, `~/.claude`, `~/.claude.json`,
+host home, SSH/GPG/cloud credentials, or Podman/Docker sockets. Isolation uses
+`--userns=keep-id`, drops capabilities, enables `no-new-privileges`, and a
+read-only container root. Host environment variables are never forwarded into
+the container implicitly.
 
 **Host-side Git operations**: The plugin never runs git commands with a worker  
 repository as cwd or `-C` target. Worker `.git/config` is attacker-controlled  
@@ -103,13 +102,13 @@ and [`CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/env-vars)).
 `hs login claude` therefore also sets `HOME` to a dedicated plugin-owned
 directory under the plugin state dir (`login-homes/claude`, mode `0700`) so the
 host CLI cannot create or modify the real `~/.claude.json`. That login HOME is
-a sibling of worker state, not under the Claude agent home (the agent home can
-be bind-mounted wholesale on non-fresh opens; per-launch sessions only copy
-auth files). Codex leaves host `HOME` unchanged because `CODEX_HOME` already
-redirects its state. Login refuses normal user homes (`~/.codex`, `~/.claude`)
-and banned host paths such as `~/.claude.json`. After `hs login claude`, the
-manual security test still `cmp`s the host `~/.claude.json` as a regression
-check (see `docs/manual-worker-security-test.md`).
+a sibling of worker state, not under the Claude agent home (workers only mount
+per-launch session homes that copy auth files). Codex leaves host `HOME`
+unchanged because `CODEX_HOME` already redirects its state. Login refuses
+normal user homes (`~/.codex`, `~/.claude`) and banned host paths such as
+`~/.claude.json`. After `hs login claude`, the manual security test still
+`cmp`s the host `~/.claude.json` as a regression check (see
+`docs/manual-worker-security-test.md`).
 
 Then, in a Herdr pane containing the Git repository you want to change:
 
@@ -179,25 +178,15 @@ The shipped skill `skills/herdr-sandbox-worker/SKILL.md` documents this loop
 for agents. There is no duplicate under `.agents/skills/` (that tree only
 holds Beads guidance).
 
-Alternatively, use the plugin actions:
+Herdr actions are thin wrappers over the same `hs` commands (`list` → `hs ls`,
+`inspect` → `hs inspect`, `fetch` → `hs fetch`, `gc` → `hs gc`, `rm` → `hs rm`).
+The `start-codex` / `start-claude` panes run `hs codex` / `hs claude`. Setup
+actions (`setup`, `bootstrap`, `build-image`, `check`) stay as direct script
+commands. `inspect` and `fetch` without an ID resolve the worker from the
+action's pane context (`HERDR_PANE_ID` plus the cwd source repo).
 
-```sh
-herdr plugin action invoke create --plugin dev.herdr.sandbox
-herdr plugin pane open --plugin dev.herdr.sandbox --entrypoint start-codex --placement overlay
-herdr plugin action invoke inspect --plugin dev.herdr.sandbox
-herdr plugin action invoke fetch --plugin dev.herdr.sandbox
-```
-
-`create` generates a worker ID and clones the workspace repository.
-`start-codex` opens a fresh Codex session in that disposable clone. With exactly
-one worker, `start-codex` and `fetch` select it automatically; when several
-workers exist, configure `[open].id` in `config.toml` for the pane. `inspect`
-resolves the current pane's worker (or requires an explicit ID)—it no longer
-reads `[inspect].id`.
-
-`fetch` writes `refs/heads/sandbox/<id>` and prints the same review and
-integration commands. After keeping or discarding the result, remove the
-worker explicitly or let GC clean it up:
+After keeping or discarding a result, remove the worker explicitly or let GC
+clean it up:
 
 ```sh
 hs rm <id>
@@ -295,12 +284,12 @@ selected worker clone at `/workspace`, sets the container workdir to
 `/workspace`, and starts the agent with profile-owned flags (Codex:
 `--cd /workspace`; Claude Code: `--dangerously-skip-permissions`, with
 `CLAUDE_CONFIG_DIR` pointing at the mounted `/claude` home). Both interactive
-`hs <agent>` / `start-<agent>` and noninteractive `hs <agent> --prompt "..."`
-(plus the thin `execute --prompt` alias for Codex) use the same per-launch
-temporary plugin-owned agent home that contains only auth artifacts
-(`auth.json` for Codex; `.credentials.json` for Claude). The session directory
-is removed when the agent exits, so history from another worker or workspace
-cannot be resumed. For Claude, `--prompt` maps to `-p`.
+`hs <agent>` / `start-<agent>` panes and noninteractive `hs <agent> --prompt "..."`
+use the same per-launch temporary plugin-owned agent home that contains only
+auth artifacts (`auth.json` for Codex; `.credentials.json` for Claude). The
+session directory is removed when the agent exits, so history from another
+worker or workspace cannot be resumed. For Claude, `--prompt` maps to `-p`.
+The configured plugin agent home is never bind-mounted into a worker.
 
 Optional Claude API-key auth: set `[claude].forward_api_key = true` and export
 `ANTHROPIC_API_KEY` on the host. Podman then receives `--env ANTHROPIC_API_KEY`
@@ -445,41 +434,29 @@ agent's exit status. Every run also writes `runs/<run-id>/result.json` and
 `runs/<run-id>/output.log` under the worker directory. `result.json` keeps its
 existing keys and adds `result_branch` and `commit_count` (computed in the
 **source** repo against the fetched `sandbox/<id>` ref). `hs inspect` exposes
-the latest run; `hs ls` stays limited to the RFC columns. `[execute]` in
-`config.toml` is ignored with a one-line deprecation notice. `execute --prompt`
-remains a thin alias until thin action wrappers land.
-
-You may configure action-specific IDs for `fetch` or the interactive
-`start-codex` pane via `[open].id` when multiple workers exist. Direct script
-use requires Herdr's own paths; do not invent storage locations:
-
-```sh
-HERDR_PLUGIN_CONFIG_DIR=/path/to/config HERDR_PLUGIN_STATE_DIR=/path/to/state \
-python3 bin/herdr-sandbox create --id WORKER-001 --repo /path/to/source-repo --base main
-```
+the latest run; `hs ls` stays limited to the RFC columns. Legacy per-action
+tables in an old `config.toml` (`[open]`, `[execute]`, and the rest) are
+ignored with a single deprecation notice.
 
 ### One-off prompt and remove inputs
 
-Herdr 0.9.0 plugin actions have fixed command arguments. `herdr plugin action
-invoke` does not forward arguments after the action ID, so the plugin `execute`
-action cannot receive a per-run prompt until thin action wrappers land (#15).
-Until then, prefer `hs codex --prompt "..."` on `PATH` or the bound launcher
-with `execute --prompt`.
+Prefer `hs` on `PATH` (or the bound launcher under the plugin config directory)
+for per-run prompts and cleanup. Herdr 0.9.0 plugin actions have fixed command
+arguments and do not forward extras after the action ID, so prompts go through
+`hs <agent> --prompt`, not a config table.
 
-Setup/bootstrap creates an executable launcher at the plugin config directory,
-which can be found without discovering Herdr's state directory:
+Setup/bootstrap creates an executable launcher at the plugin config directory:
 
 ```sh
 SANDBOX_LAUNCHER="$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox"
 
 hs codex --prompt "Implement the requested change and run the relevant tests."
-# Thin alias (same launcher path):
-"$SANDBOX_LAUNCHER" execute --prompt "Implement the requested change and run the relevant tests."
+# Same path via the bound launcher:
+"$SANDBOX_LAUNCHER" codex --prompt "Implement the requested change and run the relevant tests."
 
 "$SANDBOX_LAUNCHER" fetch WORKER-001
-
 "$SANDBOX_LAUNCHER" rm --id WORKER-001
-# destroy --id remains an alias of rm until thin action wrappers land
+# destroy --id remains a CLI alias of rm
 "$SANDBOX_LAUNCHER" destroy --id WORKER-001
 ```
 
@@ -490,13 +467,13 @@ ordering as the corresponding Herdr action. After auto-fetch (or `hs fetch`),
 integrate with plain git on `sandbox/<id>`. Rerun setup/bootstrap after changing
 the plugin installation so the launcher refreshes its bound script path.
 
-The plugin waits for the Codex process it starts, but it cannot add a separate
+The plugin waits for the agent process it starts, but it cannot add a separate
 `--wait` or status protocol to Herdr's plugin-action API. Herdr 0.9.0 controls
 whether the caller waits for and displays an action's live output. If that
 control-plane invocation is asynchronous or does not forward the stream, use
-`list` or `inspect` after the run; the persisted result and log remain the
-source of truth. Worker cleanup: `rm` / `destroy --id` removes the worker
-directory, including its run history. Prefer `hs gc` for routine cleanup.
+`hs ls` or `hs inspect` after the run; the persisted result and log remain the
+source of truth. Worker cleanup: `hs rm` removes the worker directory,
+including its run history. Prefer `hs gc` for routine cleanup.
 
 - **Podman unavailable or running as root:** repair rootless Podman and check
   `podman info --format '{{.Host.Security.Rootless}}'` returns `true`.

@@ -41,6 +41,9 @@ class DocumentationTests(unittest.TestCase):
             "herdr plugin action list --plugin dev.herdr.sandbox",
             "## Quick start",
             "herdr plugin action invoke bootstrap --plugin dev.herdr.sandbox",
+            "hs login codex",
+            "hs codex",
+            "hs claude",
             "herdr plugin pane open --plugin dev.herdr.sandbox --entrypoint start-codex --placement overlay",
             "### Pane placement",
             "--target-pane PANE",
@@ -56,11 +59,11 @@ class DocumentationTests(unittest.TestCase):
             "plugin-owned agent home",
             "CODEX_HOME",
             "refs/heads/sandbox/",
-            "Herdr 0.9.0 plugin actions have fixed command arguments",
-            "does not forward arguments after the action ID",
+            "Herdr 0.9.0 plugin actions have fixed command",
+            "do not forward extras after the action ID",
             "SANDBOX_LAUNCHER=\"$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox\"",
             "hs codex --prompt",
-            "\"$SANDBOX_LAUNCHER\" execute --prompt",
+            "\"$SANDBOX_LAUNCHER\" codex --prompt",
             "\"$SANDBOX_LAUNCHER\" fetch WORKER-001",
             "\"$SANDBOX_LAUNCHER\" rm --id WORKER-001",
             "\"$SANDBOX_LAUNCHER\" destroy --id WORKER-001",
@@ -68,7 +71,6 @@ class DocumentationTests(unittest.TestCase):
             "hs gc",
             "hs ls",
             "hs inspect",
-            "hs login codex",
             "hs login claude",
             "CLAUDE_CONFIG_DIR",
             "ANTHROPIC_API_KEY",
@@ -79,6 +81,9 @@ class DocumentationTests(unittest.TestCase):
             "git diff main...sandbox/<id>",
             "git merge sandbox/<id>",
             "forwards arguments directly, without shell evaluation",
+            "never mount the configured plugin",
+            "agent home wholesale",
+            "never bind-mounted into a worker",
             "## Customize the worker image",
             "network = \"offline\"",
             "## Help, feedback, and changes",
@@ -90,12 +95,15 @@ class DocumentationTests(unittest.TestCase):
             "skills/herdr-sandbox-worker/SKILL.md",
             "STATUS=fetched",
             "hs inspect <id>",
+            "thin wrappers over the same `hs` commands",
         )
         for item in required:
             with self.subTest(item=item):
                 self.assertIn(item, readme)
 
-        orch = readme.split("### Orchestrator agents on the host", 1)[1].split("Alternatively, use the plugin actions:", 1)[0]
+        orch = readme.split("### Orchestrator agents on the host", 1)[1]
+        # Stop before the next H2 so later examples cannot satisfy orchestrator rules.
+        orch = orch.split("\n## ", 1)[0]
         self.assertLess(orch.index("hs ls"), orch.index("git log"))
         self.assertLess(orch.index("hs ls"), orch.index("hs inspect <id>"))
         self.assertNotRegex(orch, r"(?m)^hs inspect\s*$")
@@ -159,9 +167,10 @@ class DocumentationTests(unittest.TestCase):
             "/codex",
             "/claude",
             "per-launch session home",
-            "#29",
+            "configured plugin agent home wholesale",
             "description: Spawns sandboxed Codex or Claude Code workers",
         )
+        self.assertNotIn("#29", skill)
         for item in required:
             with self.subTest(item=item):
                 self.assertIn(item, skill)

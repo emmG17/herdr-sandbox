@@ -15,13 +15,13 @@ from tests.helpers import git
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "herdr-sandbox"
-loader = importlib.machinery.SourceFileLoader("herdr_sandbox_destroy", str(SCRIPT))
+loader = importlib.machinery.SourceFileLoader("herdr_sandbox_rm", str(SCRIPT))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 plugin = importlib.util.module_from_spec(spec)
 loader.exec_module(plugin)
 
 
-class DestroyTests(unittest.TestCase):
+class RmTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -153,22 +153,25 @@ class DestroyTests(unittest.TestCase):
             plugin.destroy_worker("TEST-001", warn_unfetched=True)
         self.assertIn("never fetched", stderr.getvalue())
 
-    def test_destroy_is_alias_of_rm_and_ignores_destroy_config(self):
+    def test_destroy_cli_alias_of_rm_ignores_destroy_config(self):
         (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + '\n[destroy]\nid = "configured"\n')
         stderr = io.StringIO()
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "destroy"]), \
                 patch.object(plugin.sys, "stderr", stderr):
             self.assertEqual(plugin.main(), 1)
-        self.assertIn("Worker ID is required", stderr.getvalue())
+        message = stderr.getvalue()
+        self.assertIn("Worker ID is required", message)
+        self.assertIn("legacy per-action config tables", message)
+        self.assertIn("[destroy]", message)
         self.assertNotIn("destroy_options", dir(plugin))
 
-    def test_manifest_exposes_destroy_as_rm_alias(self):
+    def test_manifest_exposes_rm_via_hs_not_destroy_action(self):
         with (SCRIPT.parent.parent / "herdr-plugin.toml").open("rb") as stream:
             manifest = tomllib.load(stream)
-        action = next(action for action in manifest["actions"] if action["id"] == "destroy")
-        self.assertEqual(action["command"], ["python3", "bin/herdr-sandbox", "destroy"])
+        ids = {action["id"] for action in manifest["actions"]}
+        self.assertNotIn("destroy", ids)
         rm = next(action for action in manifest["actions"] if action["id"] == "rm")
-        self.assertEqual(rm["command"], ["python3", "bin/herdr-sandbox", "rm"])
+        self.assertEqual(rm["command"], ["python3", "bin/hs", "rm"])
 
     def test_direct_id_removes_worker(self):
         self.create_worker()

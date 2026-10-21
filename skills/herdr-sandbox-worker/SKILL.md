@@ -126,8 +126,6 @@ Rootless Podman is the isolation boundary (not a VM). Agent launches (`hs <agent
 - the worker clone at `/workspace` (read-write), and
 - a **per-launch session home** at `/codex` or `/claude` that contains only authentication artifacts copied from the dedicated plugin agent home.
 
-They do not mount the host home, normal `~/.codex` / `~/.claude` / `~/.claude.json`, SSH/GPG/cloud credentials, the source repository as writable, or Podman/Docker sockets. Capabilities are dropped, `no-new-privileges` is set, the container root is read-only, and `--userns=keep-id` is used. Host environment variables are never forwarded into the container implicitly (except the optional explicit `ANTHROPIC_API_KEY` inherit when `[claude].forward_api_key` is enabled).
-
-Caveat (tracked in issue #29): a non-fresh bash `open` (interactive shell into an existing worker) still bind-mounts the **whole** configured plugin agent home at `/codex` or `/claude`, not a session home. Prefer `hs <agent>` / `--prompt` for delegated work; do not treat a bash `open` session as auth-only.
+They do not mount the host home, the configured plugin agent home wholesale, normal `~/.codex` / `~/.claude` / `~/.claude.json`, SSH/GPG/cloud credentials, the source repository as writable, or Podman/Docker sockets. Capabilities are dropped, `no-new-privileges` is set, the container root is read-only, and `--userns=keep-id` is used. Host environment variables are never forwarded into the container implicitly (except the optional explicit `ANTHROPIC_API_KEY` inherit when `[claude].forward_api_key` is enabled).
 
 Do not use this for untrusted or hostile workloads. Before relying on a new environment, run the repository's disposable-worker security test. If any access expected to be denied succeeds, preserve the worker, do not fetch or integrate it, and escalate the finding.

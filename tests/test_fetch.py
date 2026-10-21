@@ -1,3 +1,4 @@
+import contextlib
 import importlib.machinery
 import importlib.util
 import io
@@ -283,24 +284,42 @@ class FetchTests(unittest.TestCase):
         quoted_source = shlex.quote(str(self.source))
         self.assertIn(f"git -C {quoted_source} log ", text)
 
-    def test_fetch_action_reads_configured_id(self):
+    def test_legacy_fetch_table_is_ignored_with_single_notice(self):
         (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + '\n[fetch]\nid = "configured"\n')
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "list"]), \
+                patch.object(plugin.sys, "stderr", stderr):
+            self.assertEqual(plugin.main(), 0)
+        message = stderr.getvalue()
+        self.assertEqual(message.count("legacy per-action config tables"), 1)
+        self.assertIn("[fetch]", message)
+        self.assertNotIn("fetch_options", dir(plugin))
+
+    def test_fetch_without_id_resolves_pane_worker(self):
+        with patch.dict(os.environ, {
+            "HERDR_PANE_ID": "w1:p9",
+            "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_SOCKET_PATH": "/tmp/herdr.sock",
+        }):
+            worker, worker_head = self.create_committed_worker("PANE-001")
         result = {
-            "commit": "a" * 40,
-            "branch": "sandbox/configured",
+            "commit": worker_head,
+            "branch": "sandbox/PANE-001",
             "commit_count": 1,
             "log_oneline": "",
-            "changed_files": ["one.py"],
-            "diff_stat": " one.py | 1 +\n",
+            "changed_files": [],
+            "diff_stat": "",
             "base_commit": "b" * 40,
             "source_repo": str(self.source),
-            "worker_id": "configured",
+            "worker_id": "PANE-001",
         }
-        with patch.object(plugin.sys, "argv", [str(SCRIPT), "fetch"]), \
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p9"}), \
+                contextlib.chdir(self.source), \
+                patch.object(plugin.sys, "argv", [str(SCRIPT), "fetch"]), \
                 patch.object(plugin, "fetch_worker", return_value=result) as fetch, \
                 patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(plugin.main(), 0)
-        fetch.assert_called_once_with("configured")
+        fetch.assert_called_once_with("PANE-001")
 
     def test_hs_codex_fetches_after_agent_exit(self):
         worker = plugin.create_worker("AUTO-001", str(self.source))
@@ -383,7 +402,7 @@ class FetchTests(unittest.TestCase):
         with (SCRIPT.parent.parent / "herdr-plugin.toml").open("rb") as stream:
             manifest = tomllib.load(stream)
         action = next(action for action in manifest["actions"] if action["id"] == "fetch")
-        self.assertEqual(action["command"], ["python3", "bin/herdr-sandbox", "fetch"])
+        self.assertEqual(action["command"], ["python3", "bin/hs", "fetch"])
 
 
 if __name__ == "__main__":
