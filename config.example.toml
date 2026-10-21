@@ -26,9 +26,10 @@ home = "codex"
 
 [claude]
 home = "claude"
-# Explicit opt-in only: when true, forward the host's ANTHROPIC_API_KEY into the
-# container as --env. Host env is never forwarded implicitly. Do not put the
-# key in this file, the repo, or the image.
+# Explicit opt-in only: when true, pass --env ANTHROPIC_API_KEY with no value so
+# Podman inherits it from the hs process environment (secret never on argv).
+# Host env is never forwarded implicitly. Do not put the key in this file,
+# the repo, or the image.
 # forward_api_key = false
 
 # Interactive pane worker selection for start-codex/open when several workers exist.

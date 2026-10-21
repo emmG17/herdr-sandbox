@@ -84,6 +84,9 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("hs claude --prompt", procedure)
         self.assertIn("hs login claude", procedure)
         self.assertIn("~/.claude.json", procedure)
+        self.assertIn("does **not**", procedure)
+        self.assertIn("relocate the separate global", procedure)
+        self.assertIn("cmp /tmp/claude-json-before-login ~/.claude.json", procedure)
 
 
 if __name__ == "__main__":

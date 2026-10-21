@@ -88,26 +88,35 @@ class AgentProfileTests(unittest.TestCase):
         before = (home / "auth.json").read_bytes()
         session, snaps = plugin.fresh_agent_home(home, "W1", plugin.DEFAULT_PROFILE)
         (session / "auth.json").write_text("not-json\n")
-        self.assertEqual(
-            plugin.write_back_auth_files(
-                home, session, plugin.DEFAULT_PROFILE, snaps, state_dir=self.state,
-            ),
-            [],
-        )
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "stderr", stderr):
+            self.assertEqual(
+                plugin.write_back_auth_files(
+                    home, session, plugin.DEFAULT_PROFILE, snaps, state_dir=self.state,
+                ),
+                [],
+            )
+        self.assertIn("unreadable or invalid JSON", stderr.getvalue())
         (session / "auth.json").write_text(json.dumps({"tokens": "bad"}) + "\n")
-        self.assertEqual(
-            plugin.write_back_auth_files(
-                home, session, plugin.DEFAULT_PROFILE, snaps, state_dir=self.state,
-            ),
-            [],
-        )
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "stderr", stderr):
+            self.assertEqual(
+                plugin.write_back_auth_files(
+                    home, session, plugin.DEFAULT_PROFILE, snaps, state_dir=self.state,
+                ),
+                [],
+            )
+        self.assertIn("invalid auth JSON shape", stderr.getvalue())
         (session / "auth.json").write_text(json.dumps({"unrelated": True}) + "\n")
-        self.assertEqual(
-            plugin.write_back_auth_files(
-                home, session, plugin.DEFAULT_PROFILE, snaps, state_dir=self.state,
-            ),
-            [],
-        )
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "stderr", stderr):
+            self.assertEqual(
+                plugin.write_back_auth_files(
+                    home, session, plugin.DEFAULT_PROFILE, snaps, state_dir=self.state,
+                ),
+                [],
+            )
+        self.assertIn("invalid auth JSON shape", stderr.getvalue())
         self.assertEqual((home / "auth.json").read_bytes(), before)
 
     def test_write_back_refuses_symlinks(self):
@@ -691,7 +700,8 @@ class AgentProfileTests(unittest.TestCase):
         (worker / "worker.json").write_text(json.dumps({
             "id": "TEST-001", "status": "created", "network": "online",
         }))
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-key", "OTHER_SECRET": "nope"}):
+        secret = "sk-test-key-must-never-appear-on-argv"
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": secret, "OTHER_SECRET": "nope"}):
             errors = plugin.check(require_auth=True, profile=plugin.CLAUDE_PROFILE)
             self.assertEqual([e for e in errors if "authentication" in e], [])
             home = self.config / "claude"
@@ -703,14 +713,27 @@ class AgentProfileTests(unittest.TestCase):
                 "TEST-001", ["claude"], fresh=True, agent_home=session,
                 profile=plugin.CLAUDE_PROFILE,
             )
+        # Inherit form: --env NAME with no value. Secret must not appear anywhere.
+        joined = "\0".join(argv)
+        self.assertNotIn(secret, joined)
+        for arg in argv:
+            self.assertNotIn(secret, arg)
         env_pairs = [
             argv[i + 1]
             for i, value in enumerate(argv)
             if value == "--env" and i + 1 < len(argv)
         ]
-        self.assertIn("ANTHROPIC_API_KEY=sk-test-key", env_pairs)
+        self.assertIn("ANTHROPIC_API_KEY", env_pairs)
+        self.assertNotIn(f"ANTHROPIC_API_KEY={secret}", env_pairs)
         self.assertNotIn("OTHER_SECRET=nope", env_pairs)
-        # Without opt-in, host key must not appear.
+        self.assertNotIn("OTHER_SECRET", env_pairs)
+        # Runtime-forced env still present and after the inherit name.
+        self.assertIn("HOME=/tmp/home", env_pairs)
+        self.assertLess(
+            env_pairs.index("ANTHROPIC_API_KEY"),
+            env_pairs.index("HOME=/tmp/home"),
+        )
+        # Without opt-in, host key must not appear (name or value).
         (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG)
         (self.config / "claude" / ".credentials.json").write_text(
             json.dumps(VALID_CLAUDE_AUTH) + "\n"
@@ -719,17 +742,112 @@ class AgentProfileTests(unittest.TestCase):
         session2, _ = plugin.fresh_agent_home(
             self.config / "claude", "TEST-001", plugin.CLAUDE_PROFILE,
         )
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-key"}):
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": secret}):
             argv2 = plugin.open_command(
                 "TEST-001", ["claude"], fresh=True, agent_home=session2,
                 profile=plugin.CLAUDE_PROFILE,
             )
+        self.assertNotIn(secret, "\0".join(argv2))
         env_pairs2 = [
             argv2[i + 1]
             for i, value in enumerate(argv2)
             if value == "--env" and i + 1 < len(argv2)
         ]
-        self.assertNotIn("ANTHROPIC_API_KEY=sk-test-key", env_pairs2)
+        self.assertNotIn("ANTHROPIC_API_KEY", env_pairs2)
+        self.assertNotIn(f"ANTHROPIC_API_KEY={secret}", env_pairs2)
+
+    def test_container_env_rejects_reserved_and_unsafe_values(self):
+        base = dict(
+            name="toy",
+            home_dirname="toy",
+            mount_point="/toy",
+            home_env_var="TOY_HOME",
+            auth_files=(),
+            login_argv=("toy",),
+            interactive_bin="toy",
+            interactive_prefix=(),
+            forbidden_user_args=(),
+            herdr_agent="toy",
+            normal_user_home=".toy",
+            noninteractive_prefix=(),
+        )
+
+        class _ToyProfile(plugin.AgentProfile):
+            def validate_auth_data(self, data):
+                return False
+
+        cases = [
+            (("HOME", "/evil"), r"reserved"),
+            (("XDG_CACHE_HOME", "/evil"), r"reserved"),
+            (("GIT_OPTIONAL_LOCKS", "1"), r"reserved"),
+            (("TOY_HOME", "/evil"), r"reserved"),
+            (("HERDR_AGENT", "toy"), r"reserved"),
+            (("HERDR_PANE_ID", "w1:p1"), r"reserved"),
+            (("BAD-KEY", "x"), r"match|container_env key"),
+            (("1BAD", "x"), r"match|container_env key"),
+            (("OK", "line\nbreak"), r"CR, LF, or NUL"),
+            (("OK", "line\rbreak"), r"CR, LF, or NUL"),
+            (("OK", "nul\0byte"), r"CR, LF, or NUL"),
+        ]
+        for container_env, pattern in cases:
+            with self.subTest(container_env=container_env):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    _ToyProfile(**base, container_env=(container_env,))
+
+        with self.assertRaisesRegex(ValueError, r"reserved|api_key_env"):
+            _ToyProfile(**base, api_key_env="HOME")
+        with self.assertRaisesRegex(ValueError, r"reserved|api_key_env"):
+            _ToyProfile(**base, api_key_env="HERDR_SECRET")
+        # Valid extras are accepted; runtime still emits forced env last.
+        profile = _ToyProfile(**base, container_env=(("TOY_FLAG", "1"),))
+        worker = self.state / "workers" / "TEST-001"
+        (worker / "repo" / ".git").mkdir(parents=True)
+        (worker / "worker.json").write_text(json.dumps({
+            "id": "TEST-001", "status": "created", "network": "online",
+        }))
+        # Use a throwaway session dir under config for mount validation.
+        session = self.config / "toy-session"
+        session.mkdir()
+        runtime = plugin.PodmanSandboxRuntime(
+            "TEST-001",
+            "localhost/herdr-codex-worker:latest",
+            worker / "repo",
+            session,
+            "online",
+            4,
+            "8g",
+            1024,
+            profile,
+        )
+        argv = runtime._base_command(interactive=False)
+        env_pairs = [
+            argv[i + 1]
+            for i, value in enumerate(argv)
+            if value == "--env" and i + 1 < len(argv)
+        ]
+        self.assertEqual(env_pairs[0], "TOY_FLAG=1")
+        self.assertEqual(env_pairs[-3:], [
+            "HOME=/tmp/home",
+            "TOY_HOME=/toy",
+            "XDG_CACHE_HOME=/tmp/cache",
+        ])
+
+    def test_claude_auth_requires_oauth_credential_shape(self):
+        self.assertTrue(plugin.CLAUDE_PROFILE.validate_auth_data(VALID_CLAUDE_AUTH))
+        self.assertFalse(plugin.CLAUDE_PROFILE.validate_auth_data({}))
+        self.assertFalse(plugin.CLAUDE_PROFILE.validate_auth_data({"unrelated": True}))
+        self.assertFalse(plugin.CLAUDE_PROFILE.validate_auth_data({
+            "claudeAiOauth": {"accessToken": "only"},
+        }))
+        self.assertFalse(plugin.CLAUDE_PROFILE.validate_auth_data({
+            "claudeAiOauth": {"refreshToken": "only"},
+        }))
+        self.assertFalse(plugin.CLAUDE_PROFILE.validate_auth_data({
+            "claudeAiOauth": {"accessToken": "", "refreshToken": "r"},
+        }))
+        self.assertFalse(plugin.CLAUDE_PROFILE.validate_auth_data({
+            "apiKey": "sk-not-enough",
+        }))
 
 
 if __name__ == "__main__":
