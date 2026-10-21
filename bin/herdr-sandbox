@@ -12,6 +12,7 @@ import re
 import secrets
 import selectors
 import shlex
+import stat
 import shutil
 import subprocess
 import sys
@@ -74,11 +75,21 @@ class AgentProfile:
                 f"Fresh {self.name} sessions must start with the {self.interactive_bin} command."
             )
         for arg in args[1:]:
-            if arg in self.forbidden_user_args or any(
-                arg.startswith(f"{flag}=")
-                for flag in self.forbidden_user_args
-                if flag.startswith("--")
-            ):
+            forbidden = False
+            for flag in self.forbidden_user_args:
+                if flag.startswith("--"):
+                    if arg == flag or arg.startswith(f"{flag}="):
+                        forbidden = True
+                        break
+                elif flag.startswith("-") and not flag.startswith("--"):
+                    # Reject bare -C and glued forms like -C/workspace.
+                    if arg == flag or arg.startswith(flag):
+                        forbidden = True
+                        break
+                elif arg == flag:
+                    forbidden = True
+                    break
+            if forbidden:
                 raise ValueError(
                     f"Fresh {self.name} sessions must use the worker workspace at /workspace."
                 )
@@ -134,10 +145,9 @@ CODEX_PROFILE = _CodexAgentProfile(
     normal_user_home=".codex",
     noninteractive_prefix=("exec", "--sandbox", "danger-full-access"),
 )
-# END AGENT PROFILE: codex
-
 AGENT_PROFILES = {CODEX_PROFILE.name: CODEX_PROFILE}
 DEFAULT_PROFILE = CODEX_PROFILE
+# END AGENT PROFILE: codex
 
 
 def get_profile(name):
@@ -985,15 +995,33 @@ def validate_open_context(worker_id):
         )
 
 
-def _auth_snapshot(path):
-    """Capture content and mtime of a regular auth file; refuse symlinks."""
+def _read_regular_file_nofollow(path):
+    """Read a regular file without following symlinks (O_NOFOLLOW + fstat)."""
     path = Path(path)
-    if path.is_symlink():
-        raise ValueError(f"Auth file must not be a symlink: {path}")
-    if not path.is_file():
-        raise ValueError(f"Auth file is missing: {path}")
-    data = path.read_bytes()
-    mtime_ns = path.stat().st_mtime_ns
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"Cannot open auth file without following symlinks: {path}: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"Auth file must be a regular file: {path}")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks), info.st_mtime_ns
+    finally:
+        os.close(fd)
+
+
+def _auth_snapshot(path):
+    """Capture content of a regular auth file without following symlinks."""
+    path = Path(path)
+    data, mtime_ns = _read_regular_file_nofollow(path)
     return {"path": path, "data": data, "mtime_ns": mtime_ns}
 
 
@@ -1001,15 +1029,17 @@ def fresh_agent_home(agent_home, worker_id, profile):
     """Create a disposable agent home containing auth files but no history.
 
     Returns ``(session_home, launch_snapshots)`` where snapshots map auth file
-    names to the dedicated-home bytes/mtime captured at launch for write-back.
+    names to the dedicated-home bytes captured at launch for compare-and-swap
+    write-back.
     """
     agent_home = Path(agent_home)
     snapshots = {}
     for name in profile.auth_files:
         auth_path = agent_home / name
-        if auth_path.is_symlink() or not auth_path.is_file():
-            raise ValueError(f"{profile.name} authentication is missing in {agent_home}.")
-        snapshots[name] = _auth_snapshot(auth_path)
+        try:
+            snapshots[name] = _auth_snapshot(auth_path)
+        except ValueError as exc:
+            raise ValueError(f"{profile.name} authentication is missing in {agent_home}.") from exc
 
     sessions_dir = agent_home / "sessions"
     if sessions_dir.is_symlink() or (sessions_dir.exists() and not sessions_dir.is_dir()):
@@ -1021,10 +1051,14 @@ def fresh_agent_home(agent_home, worker_id, profile):
         session_home.chmod(0o700)
         for name, snap in snapshots.items():
             dest = session_home / name
-            with open(snap["path"], "rb") as src, open(dest, "wb") as out:
-                out.write(src.read())
+            # Re-read with O_NOFOLLOW so a symlink swap between snapshot and copy is refused.
+            data, _mtime_ns = _read_regular_file_nofollow(snap["path"])
+            if data != snap["data"]:
+                raise ValueError(f"Auth file changed during session home setup: {snap['path']}")
+            with open(dest, "wb") as out:
+                out.write(data)
             dest.chmod(0o600)
-    except (OSError, shutil.Error):
+    except (OSError, shutil.Error, ValueError):
         shutil.rmtree(session_home, ignore_errors=True)
         raise
     if not session_home.resolve().is_relative_to(agent_home.resolve()):
@@ -1062,8 +1096,10 @@ def write_back_auth_files(agent_home, session_home, profile, launch_snapshots, s
     """Write refreshed auth files back into the dedicated home (option a).
 
     Under the state lock, copy each profile auth file from the session home only
-    when it is valid JSON with the expected shape and is newer or different from
-    the launch snapshot. Never follows symlinks; final mode is 0600.
+    when it is valid JSON with the expected shape and its bytes differ from the
+    launch snapshot. Compare-and-swap: if the dedicated destination already
+    differs from the launch snapshot (another session advanced auth), skip the
+    write and log that fact. Never follows symlinks; final mode is 0600.
     """
     agent_home = Path(agent_home)
     session_home = Path(session_home)
@@ -1072,26 +1108,37 @@ def write_back_auth_files(agent_home, session_home, profile, launch_snapshots, s
         for name in profile.auth_files:
             src = session_home / name
             dest = agent_home / name
-            if src.is_symlink() or dest.is_symlink():
-                continue
-            if not src.is_file():
+            if dest.is_symlink():
                 continue
             try:
-                payload = src.read_bytes()
+                payload, _src_mtime_ns = _read_regular_file_nofollow(src)
                 data = json.loads(payload.decode("utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if not profile.validate_auth_data(data):
                 continue
             snap = launch_snapshots.get(name)
             if snap is not None and payload == snap["data"]:
                 continue
+            if snap is not None and dest.exists():
+                try:
+                    current, current_mtime_ns = _read_regular_file_nofollow(dest)
+                except (OSError, ValueError):
+                    continue
+                # Destination advanced past this session's launch snapshot.
+                if current != snap["data"] or current_mtime_ns != snap["mtime_ns"]:
+                    print(
+                        f"Auth write-back skipped for {name}: another session already advanced auth.",
+                        file=sys.stderr,
+                    )
+                    continue
             try:
                 _atomic_write_bytes(dest, payload, mode=0o600)
             except (OSError, ValueError):
                 continue
             written.append(name)
     return written
+
 
 
 def _container_missing(result):
@@ -2117,13 +2164,14 @@ def open_command(worker_id, command=None, fresh=False, agent_home=None, profile=
     return podman_runtime(worker_id, agent_home, profile).interactive_command(command, fresh=fresh)
 
 
-def execute_command(worker_id, prompt, agent_home=None, profile=None):
-    """Build the shared runtime's noninteractive agent invocation for a worker.
+def execute_command(worker_id, prompt, agent_home, profile=None):
+    """Build the noninteractive agent invocation for a per-launch session home.
 
-    Callers that need the per-launch temp home (interactive and ``--prompt``)
-    pass ``agent_home`` from ``fresh_agent_home``. Auth write-back after the
-    session is handled by ``write_back_auth_files``.
+    ``agent_home`` is required (from ``fresh_agent_home``). Auth write-back after
+    the session is handled by ``write_back_auth_files``.
     """
+    if agent_home is None:
+        raise ValueError("execute_command requires an explicit per-launch agent_home.")
     return podman_runtime(worker_id, agent_home, profile).noninteractive_command(prompt)
 
 
