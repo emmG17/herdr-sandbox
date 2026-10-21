@@ -25,8 +25,4 @@ home = "codex"
 # [open]
 # id = "WORKER-001"
 
-# Advanced automation: configure the fixed inputs used by the noninteractive
-# Execute Task action. The interactive quick-start workflow needs no edits here.
-# [execute]
-# id = "WORKER-001"
-# prompt = "Implement the requested change and run the relevant tests."
+# [execute] is removed. Use: hs codex --prompt "..." (or execute --prompt as a thin alias).

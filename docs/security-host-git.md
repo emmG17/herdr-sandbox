@@ -42,10 +42,13 @@ message and leaves the worker un-fetched. Never pass `--update-head-ok` or
 
 Commit counts, changed files, and diff stats are computed only with
 `git -C <source>` against `refs/heads/sandbox/<id>` and the recorded
-`base_commit`. A zero-commit worker still creates the sandbox ref (tip equals
-base) so review commands stay predictable. Uncommitted worker changes, when
-detectable via the hardened query container, produce a warning that they are
-not in the result.
+`base_commit`. Noninteractive `hs codex --prompt` post-run accounting uses the
+same rule: `head` and `commit_count` in `result.json` come from the source repo
+after fetch (for example `git -C <source> rev-list --count <base>..sandbox/<id>`),
+never from host git against the worker clone. A zero-commit worker still creates
+the sandbox ref (tip equals base) so review commands stay predictable.
+Uncommitted worker changes, when detectable via the hardened query container,
+produce a warning that they are not in the result.
 
 The source repository is untouched until step 6. Failure or a crash before that
 fetch leaves no alternates, no dangling `sandbox/<id>` ref, and no dependency
@@ -61,7 +64,7 @@ plus `repack -a -d`, and trusting worker-supplied pack indexes / commit-graphs.
 `_safe_read_worker_branch` parse `.git/HEAD`, loose refs, and `packed-refs`.
 They refuse symlinks and require every path to stay under the worker `.git`.
 
-### Inspect / execute status, log, and diff
+### Inspect / noninteractive status, log, and diff
 
 Those need a live worktree view. `_query_worker_git_snapshot` runs **one**
 short-lived Podman container per worker via `build_worker_git_query_command` /
