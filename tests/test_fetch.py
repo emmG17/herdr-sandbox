@@ -116,7 +116,10 @@ class FetchTests(unittest.TestCase):
         review = plugin.format_fetch_result(result)
         self.assertIn("Branch: sandbox/TEST-001", review)
         self.assertIn("Commits: 1", review)
-        self.assertIn("Review: git log", review)
+        self.assertIn("git log ", review)
+        self.assertIn("..sandbox/TEST-001", review)
+        self.assertIn("git diff ", review)
+        self.assertIn("git merge sandbox/TEST-001", review)
 
         with patch.object(plugin, "remove_worker_container"):
             self.assertTrue(plugin.destroy_worker("TEST-001"))

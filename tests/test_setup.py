@@ -58,7 +58,7 @@ class SetupTests(unittest.TestCase):
                 launcher = config / "herdr-sandbox"
                 cases = [
                     ["execute", "--id", "WORKER-001", "--prompt", "keep $HOME; do not evaluate 'this'"],
-                    ["cherry-pick", "--id", "WORKER-001", "--commit", "a" * 40],
+                    ["fetch", "WORKER-001"],
                     ["destroy", "--id", "WORKER-001"],
                 ]
                 for args in cases:
