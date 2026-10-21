@@ -1661,7 +1661,7 @@ def format_fetch_result(result):
 
 
 def warn_deprecated_integration_config(config_dir):
-    """Ignore a legacy [cherry_pick] table with a one-line notice (never an error)."""
+    """Ignore legacy config tables with a one-line notice (never an error)."""
     config_file = Path(config_dir) / "config.toml"
     if not config_file.is_file():
         return
@@ -1673,6 +1673,12 @@ def warn_deprecated_integration_config(config_dir):
     if "cherry_pick" in config:
         print(
             "Note: [cherry_pick] is deprecated and ignored; integrate with plain git on sandbox/<id>.",
+            file=sys.stderr,
+        )
+    if "inspect" in config:
+        print(
+            "Note: [inspect] is deprecated and ignored; pass `inspect WORKER_ID` "
+            "or run `hs inspect` in the worker's pane.",
             file=sys.stderr,
         )
 
@@ -2390,15 +2396,59 @@ def _latest_result_summary(result):
     return f"{run_id} exit={exit_status} HEAD={head} dirty={dirty}"
 
 
-def _worker_record(worker_dir):
-    """Build a recoverable view by combining worker.json and live reality."""
+def _result_branch_for(metadata, worker_id):
+    """Return the source-repo result branch name, or None when not fetched."""
+    value = metadata.get("result_branch")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if metadata.get("status") == "fetched":
+        return f"sandbox/{worker_id}"
+    return None
+
+
+def _apply_container_status(record, worker_id):
+    """Set container and derived lifecycle status from live Podman state."""
+    record["container"] = container_status(worker_id)
+    if record["container"] == "unavailable":
+        record["issues"].append("Podman is unavailable; container state could not be checked")
+    elif record["container"].startswith("error:"):
+        record["issues"].append(f"Unable to inspect worker container: {record['container'][len('error: '):]}")
+    if record["container"] == "running":
+        record["status"] = "running"
+    elif record["metadata_status"] == "running" and record["container"] == "not-found":
+        record["status"] = "stale"
+        record["issues"].append("Metadata says running but no corresponding container exists")
+    elif record["metadata_status"] == "running" and (
+        record["container"] == "unavailable" or record["container"].startswith("error:")
+    ):
+        record["status"] = "unknown"
+        record["issues"].append("Persisted lifecycle says running, but live container state is unavailable")
+    elif record["container"] in {"exited", "stopped", "created", "paused", "unknown"} and record["metadata_status"] == "running":
+        record["status"] = "stopped"
+    elif record["metadata_status"] in LIFECYCLE_STATES:
+        record["status"] = record["metadata_status"]
+    else:
+        record["status"] = "invalid" if record["issues"] else "unknown"
+
+
+def _worker_record(worker_dir, *, detail=False):
+    """Build a recoverable view from worker.json and live container state.
+
+    List views (`detail=False`) stay fast: they read the state store and call
+    ``container_status`` only. They never start a git-query container.
+    Inspect views (`detail=True`) add sandboxed git reality and the latest run.
+    """
     worker_id = worker_dir.name
     record = {
         "id": worker_id,
         "worker_dir": str(worker_dir),
         "repository": str(worker_dir / "repo"),
         "source_repo": "-",
+        "agent": "-",
+        "pane_id": "-",
+        "result_branch": None,
         "base_ref": "-",
+        "base_commit": None,
         "branch": "-",
         "metadata_branch": "-",
         "created_at": "-",
@@ -2413,6 +2463,7 @@ def _worker_record(worker_dir):
         "git_status": "",
         "git_diff": "",
         "latest_result": None,
+        "actual_branch": None,
         "issues": [],
     }
     if worker_dir.is_symlink() or not worker_dir.is_dir():
@@ -2434,14 +2485,22 @@ def _worker_record(worker_dir):
             metadata = {}
 
     record["source_repo"] = _metadata_value(metadata, "source_repo")
+    record["agent"] = _metadata_value(metadata, "agent")
+    record["pane_id"] = _metadata_value(metadata, "pane_id")
+    record["result_branch"] = _result_branch_for(metadata, worker_id)
     record["base_ref"] = _metadata_value(metadata, "base_ref")
+    base_commit = metadata.get("base_commit")
+    record["base_commit"] = base_commit if isinstance(base_commit, str) and base_commit else None
     record["branch"] = _metadata_value(metadata, "branch")
     record["metadata_branch"] = record["branch"]
     record["created_at"] = _metadata_value(metadata, "created_at")
     record["runtime"] = _metadata_value(metadata, "runtime")
     record["network"] = _metadata_value(metadata, "network")
     record["metadata_status"] = _metadata_value(metadata, "status", "unknown")
-    if record["metadata_status"] not in LIFECYCLE_STATES and record["metadata_status"] != "unknown" and record["metadata_status"] != "fetched":
+    if (
+        record["metadata_status"] not in LIFECYCLE_STATES
+        and record["metadata_status"] != "unknown"
+    ):
         record["issues"].append(f"Unknown persisted lifecycle status: {record['metadata_status']}")
     if metadata and metadata.get("id") != worker_id:
         record["issues"].append(f"Metadata ID does not match state directory ({metadata.get('id', '-')})")
@@ -2450,40 +2509,26 @@ def _worker_record(worker_dir):
     if source is not None and not source.is_dir():
         record["issues"].append(f"Source repository is missing: {source}")
 
-    reality = _git_reality(worker_dir / "repo", metadata, worker_id=worker_id)
-    record.update({key: reality[key] for key in ("head", "dirty", "git_log", "git_status", "git_diff")})
-    record["issues"].extend(reality["issues"])
-    record["latest_result"], result_issue = _latest_result(worker_dir, metadata)
-    if result_issue:
-        record["issues"].append(result_issue)
-    if reality["branch"]:
-        actual_branch = reality["branch"]
-        if record["metadata_branch"] != "-" and record["metadata_branch"] != actual_branch:
-            record["issues"].append(f"Branch differs from metadata ({record['metadata_branch']} vs {actual_branch})")
-        record["branch"] = actual_branch
-        record["actual_branch"] = actual_branch
-    else:
-        record["actual_branch"] = None
+    repo = worker_dir / "repo"
+    if detail:
+        reality = _git_reality(repo, metadata, worker_id=worker_id)
+        record.update({key: reality[key] for key in ("head", "dirty", "git_log", "git_status", "git_diff")})
+        if reality.get("base_commit"):
+            record["base_commit"] = reality["base_commit"]
+        record["issues"].extend(reality["issues"])
+        record["latest_result"], result_issue = _latest_result(worker_dir, metadata)
+        if result_issue:
+            record["issues"].append(result_issue)
+        if reality["branch"]:
+            actual_branch = reality["branch"]
+            if record["metadata_branch"] != "-" and record["metadata_branch"] != actual_branch:
+                record["issues"].append(
+                    f"Branch differs from metadata ({record['metadata_branch']} vs {actual_branch})"
+                )
+            record["branch"] = actual_branch
+            record["actual_branch"] = actual_branch
 
-    record["container"] = container_status(worker_id)
-    if record["container"] == "unavailable":
-        record["issues"].append("Podman is unavailable; container state could not be checked")
-    elif record["container"].startswith("error:"):
-        record["issues"].append(f"Unable to inspect worker container: {record['container'][len('error: '):]}")
-    if record["container"] == "running":
-        record["status"] = "running"
-    elif record["metadata_status"] == "running" and record["container"] == "not-found":
-        record["status"] = "stale"
-        record["issues"].append("Metadata says running but no corresponding container exists")
-    elif record["metadata_status"] == "running" and (record["container"] == "unavailable" or record["container"].startswith("error:")):
-        record["status"] = "unknown"
-        record["issues"].append("Persisted lifecycle says running, but live container state is unavailable")
-    elif record["container"] in {"exited", "stopped", "created", "paused", "unknown"} and record["metadata_status"] == "running":
-        record["status"] = "stopped"
-    elif record["metadata_status"] in LIFECYCLE_STATES:
-        record["status"] = record["metadata_status"]
-    else:
-        record["status"] = "invalid" if record["issues"] else "unknown"
+    _apply_container_status(record, worker_id)
     if any(issue.startswith("Worker repository") for issue in record["issues"]):
         record["status"] = "missing-repo"
     if metadata and not record["issues"] and record["status"] == "invalid":
@@ -2492,21 +2537,115 @@ def _worker_record(worker_dir):
 
 
 def list_workers(state_dir=None):
-    """List persisted workers, including entries whose state has gone stale."""
+    """List persisted workers from the state store without sandboxed git queries."""
     workers_dir = state_workers_dir(state_dir)
     if not workers_dir.exists():
         return []
     if workers_dir.is_symlink() or not workers_dir.is_dir():
         raise ValueError(f"Worker state directory is not a real directory: {workers_dir}")
-    return [_worker_record(entry) for entry in sorted(workers_dir.iterdir(), key=lambda path: path.name) if entry.name not in {".", ".."}]
+    return [
+        _worker_record(entry, detail=False)
+        for entry in sorted(workers_dir.iterdir(), key=lambda path: path.name)
+        if entry.name not in {".", ".."}
+    ]
 
 
 def inspect_worker(worker_id, state_dir=None):
-    """Inspect one worker and expose ordinary Git commands and output."""
+    """Inspect one worker, including sandboxed git reality and review commands."""
     worker_dir = worker_dir_for(worker_id, state_dir)
     if not worker_dir.exists() or worker_dir.is_symlink():
         raise ValueError(f"Worker not found: {worker_id}")
-    return _worker_record(worker_dir)
+    return _worker_record(worker_dir, detail=True)
+
+
+def cwd_repo_root():
+    """Resolve the Git repository root for the current working directory, or None."""
+    result = run("git", "rev-parse", "--show-toplevel")
+    if result.returncode:
+        return None
+    top = result.stdout.strip()
+    if not top:
+        return None
+    return Path(top).resolve()
+
+
+def _list_worker_ids(state_dir=None):
+    """Return sorted valid worker IDs from the state store."""
+    workers_dir = state_workers_dir(state_dir)
+    if not workers_dir.is_dir() or workers_dir.is_symlink():
+        return []
+    return sorted(
+        entry.name
+        for entry in workers_dir.iterdir()
+        if entry.is_dir() and not entry.is_symlink() and WORKER_ID_RE.fullmatch(entry.name)
+    )
+
+
+def _workers_for_pane_and_repo(pane_id, source_repo, state_dir=None):
+    """Find workers matching (pane_id, source_repo) for any agent."""
+    source_repo = Path(source_repo).expanduser().resolve()
+    workers_dir = state_workers_dir(state_dir)
+    if not workers_dir.is_dir() or workers_dir.is_symlink():
+        return []
+    matches = []
+    for entry in sorted(workers_dir.iterdir(), key=lambda path: path.name):
+        if not entry.is_dir() or entry.is_symlink() or not WORKER_ID_RE.fullmatch(entry.name):
+            continue
+        metadata_path = entry / "worker.json"
+        if not metadata_path.is_file():
+            continue
+        try:
+            with metadata_path.open() as stream:
+                metadata = json.load(stream)
+            if not isinstance(metadata, dict):
+                continue
+            if metadata.get("pane_id") != pane_id:
+                continue
+            recorded = metadata.get("source_repo")
+            if not isinstance(recorded, str) or not recorded:
+                continue
+            if Path(recorded).expanduser().resolve() != source_repo:
+                continue
+            matches.append(entry.name)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+    return matches
+
+
+def resolve_inspect_worker(worker_id=None, state_dir=None):
+    """Resolve the inspect target from an explicit ID or the current pane.
+
+    With no ID, match workers for (HERDR_PANE_ID, cwd repo, any agent). Never
+    fall back to ``[inspect].id`` or ``sole_worker_id()``.
+    """
+    if worker_id:
+        return worker_id
+    pane_id, _, _ = _get_pane_context()
+    candidates = _list_worker_ids(state_dir)
+    candidate_text = ", ".join(candidates) if candidates else "(none)"
+    if not pane_id:
+        raise ValueError(
+            "HERDR_PANE_ID is unset; pass an explicit worker ID "
+            f"(candidates: {candidate_text})."
+        )
+    source = cwd_repo_root()
+    if source is None:
+        raise ValueError(
+            "Current directory is not inside a Git repository; pass an explicit worker ID "
+            f"(candidates: {candidate_text})."
+        )
+    matches = _workers_for_pane_and_repo(pane_id, source, state_dir)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(
+            f"No worker found for pane {pane_id} in {source}; pass an explicit worker ID "
+            f"(candidates: {candidate_text})."
+        )
+    raise ValueError(
+        f"Multiple workers match pane {pane_id} in {source}: {', '.join(matches)}. "
+        "Pass an explicit worker ID."
+    )
 
 
 def _display(value, missing="-"):
@@ -2517,26 +2656,51 @@ def _display(value, missing="-"):
     return str(value)
 
 
+def _review_base_ref(record):
+    """Pick a base label for source-repo review commands."""
+    base_ref = record.get("base_ref")
+    if isinstance(base_ref, str) and base_ref and base_ref != "-":
+        return base_ref
+    base_commit = record.get("base_commit")
+    if isinstance(base_commit, str) and base_commit:
+        return base_commit[:12] if len(base_commit) >= 12 else base_commit
+    return "BASE"
+
+
 def format_workers(records):
-    columns = ("ID", "REPOSITORY", "BASE", "BRANCH", "STATUS", "CREATED", "HEAD", "DIRTY", "CONTAINER", "LATEST")
+    """Render `hs ls` columns: id, agent, source, pane, status, result, created."""
+    columns = ("ID", "AGENT", "SOURCE", "PANE", "STATUS", "RESULT", "CREATED")
     rows = [columns]
     for record in records:
         rows.append((
-            record["id"], record["repository"], record["base_ref"], record["branch"], record["status"],
-            record["created_at"], (record["head"] or "-")[:12], _display(record["dirty"]), record["container"],
-            _latest_result_summary(record.get("latest_result")),
+            record["id"],
+            _display(record.get("agent")),
+            _display(record.get("source_repo")),
+            _display(record.get("pane_id")),
+            record["status"],
+            _display(record.get("result_branch")),
+            _display(record.get("created_at")),
         ))
     if len(rows) == 1:
         return "No sandbox workers found."
     widths = [max(len(str(row[index])) for row in rows) for index in range(len(columns))]
-    return "\n".join("  ".join(str(value).ljust(widths[index]) for index, value in enumerate(row)).rstrip() for row in rows)
+    return "\n".join(
+        "  ".join(str(value).ljust(widths[index]) for index, value in enumerate(row)).rstrip()
+        for row in rows
+    )
 
 
 def format_worker(record):
+    result_branch = _display(record.get("result_branch"))
+    review_branch = record.get("result_branch") or f"sandbox/{record['id']}"
+    base = _review_base_ref(record)
     lines = [
         f"Worker: {record['id']}",
-        f"Repository: {record['repository']}",
+        f"Agent: {_display(record.get('agent'))}",
         f"Source: {record['source_repo']}",
+        f"Pane: {_display(record.get('pane_id'))}",
+        f"Result branch: {result_branch}",
+        f"Worker clone: {record['repository']}",
         f"Base: {record['base_ref']}",
         f"Branch: {record['branch']}",
         f"Runtime: {record['runtime']}",
@@ -2562,6 +2726,10 @@ def format_worker(record):
     if record["issues"]:
         lines.extend(["Issues:"] + [f"- {issue}" for issue in record["issues"]])
     lines.extend([
+        "",
+        f"Review (run in source repo {record['source_repo']}):",
+        f"  git log {base}..{review_branch}",
+        f"  git diff {base}...{review_branch}",
         "",
         "Git log:",
         record["git_log"] or "(no commits)",
@@ -3065,11 +3233,14 @@ def main():
         action="store_true",
         help="Read pane_id from HERDR_PLUGIN_EVENT_JSON (pane.closed hook)",
     )
-    list_parser = commands.add_parser("list", help="List persisted sandbox workers")
+    list_parser = commands.add_parser("list", aliases=["ls"], help="List persisted sandbox workers")
     list_parser.add_argument("--json", action="store_true", help="Print structured JSON")
-    inspect_parser = commands.add_parser("inspect", help="Inspect one sandbox worker")
+    inspect_parser = commands.add_parser(
+        "inspect",
+        help="Inspect one sandbox worker (defaults to this pane's worker)",
+    )
     inspect_parser.add_argument("worker_id", nargs="?", help="Worker ID")
-    inspect_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
+    inspect_parser.add_argument("--id", dest="option_worker_id", help="Worker ID")
     inspect_parser.add_argument("--json", action="store_true", help="Print structured JSON")
     open_parser = commands.add_parser("open", help="Open an interactive sandbox worker")
     open_parser.add_argument("worker_id", nargs="?", help="Worker ID")
@@ -3162,29 +3333,18 @@ def main():
                 config_dir,
             )
             print(format_fetch_result(fetch_worker(worker_id)))
-        elif args.command in {"list", "workers"}:
+        elif args.command in {"list", "ls", "workers"}:
             records = list_workers()
             if args.json:
                 print(json.dumps(records, indent=2))
             else:
                 print(format_workers(records))
         elif args.command == "inspect":
-            worker_id = args.worker_id or args.option_worker_id
-            if not worker_id:
-                config_dir, _ = paths()
-                with (config_dir / "config.toml").open("rb") as stream:
-                    config = tomllib.load(stream)
-                inspect_options = config.get("inspect", {})
-                if not isinstance(inspect_options, dict):
-                    raise ValueError(f"Expected an [inspect] table in {config_dir / 'config.toml'}.")
-                worker_id = inspect_options.get("id")
-                if worker_id is not None and not isinstance(worker_id, str):
-                    raise ValueError(f"Set [inspect].id to a string in {config_dir / 'config.toml'}.")
-                if not worker_id:
-                    _, state_dir = paths()
-                    worker_id = sole_worker_id(state_dir)
-            if not worker_id:
-                raise ValueError("Worker ID is required when there is not exactly one worker. Pass `inspect WORKER_ID` or set [inspect].id in the plugin config.")
+            _, state_dir = paths()
+            worker_id = resolve_inspect_worker(
+                args.worker_id or args.option_worker_id,
+                state_dir=state_dir,
+            )
             record = inspect_worker(worker_id)
             if args.json:
                 print(json.dumps(record, indent=2))
