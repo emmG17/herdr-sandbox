@@ -50,8 +50,20 @@ command = ["python3", "bin/herdr-sandbox", "inspect"]
 [[actions]]
 id = "destroy"
 title = "Sandbox: Destroy Worker"
-description = "Stop and remove a worker container and its disposable state"
+description = "Alias of rm: stop and remove a worker (pass --id; [destroy] config removed)"
 command = ["python3", "bin/herdr-sandbox", "destroy"]
+
+[[actions]]
+id = "rm"
+title = "Sandbox: Remove Worker"
+description = "Stop and remove a worker container and its disposable state"
+command = ["python3", "bin/herdr-sandbox", "rm"]
+
+[[actions]]
+id = "gc"
+title = "Sandbox: Garbage-Collect Workers"
+description = "Remove fetched workers whose panes are gone, or workers older than [gc].max_age"
+command = ["python3", "bin/herdr-sandbox", "gc"]
 
 [[actions]]
 id = "fetch"
@@ -76,3 +88,7 @@ id = "execute"
 title = "Sandbox: Execute Task"
 description = "Run a configured Codex task noninteractively in a sandbox worker"
 command = ["python3", "bin/herdr-sandbox", "execute"]
+
+[[events]]
+on = "pane.closed"
+command = ["python3", "bin/herdr-sandbox", "gc", "--from-event"]

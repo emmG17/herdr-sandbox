@@ -13,6 +13,11 @@ cpus = 4
 memory = "8g"
 pids = 1024
 
+[gc]
+# Workers older than this are GC candidates. Unfetched workers are fetched
+# first and deleted only on success; otherwise they are skipped with a warning.
+max_age = "7d"
+
 [codex]
 home = "codex"
 
