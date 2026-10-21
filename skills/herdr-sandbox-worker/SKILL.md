@@ -74,15 +74,20 @@ herdr plugin action invoke check --plugin dev.herdr.sandbox
    git merge sandbox/<id>    # or cherry-pick or rebase
    ```
 
-5. After retaining or discarding the result, select the worker in `[destroy].id` and remove its disposable state.
+5. After retaining or discarding the result, remove the worker or let GC clean it up:
 
    ```sh
-   herdr plugin action invoke destroy --plugin dev.herdr.sandbox
+   hs rm <id>
+   hs gc
    ```
+
+   Closing the Herdr pane also runs GC for that pane's fetched workers via the
+   `pane.closed` hook. `[destroy]` config is removed; `destroy --id` is only an
+   alias of `hs rm`.
 
 ## Worker selection and configuration
 
-With multiple workers, configure worker IDs in the plugin config at `$(herdr plugin config-dir dev.herdr.sandbox)/config.toml`: `[fetch]`, `[inspect]`, `[open]`, `[execute]`, or `[destroy]`. `[open].id` selects the worker for the interactive `start-codex` pane. Use `list` to recover IDs and lifecycle state.
+With multiple workers, configure worker IDs in the plugin config at `$(herdr plugin config-dir dev.herdr.sandbox)/config.toml`: `[fetch]`, `[inspect]`, `[open]`, or `[execute]`. `[open].id` selects the worker for the interactive `start-codex` pane. Use `list` to recover IDs and lifecycle state. Set `[gc].max_age` (default `7d`) for age-based cleanup.
 
 Herdr 0.9.0 runs plugin actions in their invoking workspace and cannot let an
 action dynamically create or move its own pane. Use the manifest `start-codex`

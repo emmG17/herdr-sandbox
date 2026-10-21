@@ -7,6 +7,6 @@ A **worker** is an independent disposable clone stored at `$HERDR_PLUGIN_STATE_D
 Herdr's plugin config directory holds persistent settings and the dedicated Codex home. Herdr's plugin state directory holds disposable worker repositories and their metadata. Plugin actions are fixed commands; the optional `[create]` config table supplies a requested ID, source, and base to the noninteractive create action.
 
 The **Herdr control plane** is the trusted host-side Herdr session and plugin
-actions that create, inspect, fetch, integrate, and destroy workers. A worker
-is not part of that control plane and has no source-repository integration
-authority.
+actions that create, inspect, fetch, integrate, and remove workers (`hs rm` /
+`hs gc`). A worker is not part of that control plane and has no
+source-repository integration authority.
