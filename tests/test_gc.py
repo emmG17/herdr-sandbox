@@ -245,14 +245,101 @@ class GcTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pane_id"):
             plugin.parse_plugin_event_json('{"event":"pane_closed","data":{"type":"pane_closed"}}')
 
+    def test_stale_fetched_status_with_new_worker_commit_survives_gc(self):
+        """Fetch, add a worker commit, close pane, run gc — worker must survive."""
+        self.create_worker("STALE-001", pane_id="w1:p30")
+        self.mark_fetched("STALE-001")
+        worker_repo = self.state / "workers" / "STALE-001" / "repo"
+        (worker_repo / "extra.txt").write_text("more work\n")
+        git("-C", worker_repo, "add", "extra.txt")
+        git("-C", worker_repo, "commit", "-qm", "post-fetch work")
+        tip = git("-C", worker_repo, "rev-parse", "HEAD")
+        metadata = json.loads((self.state / "workers" / "STALE-001" / "worker.json").read_text())
+        self.assertNotEqual(tip, metadata["fetched_commit"])
+        before = self.for_each_ref()
+        with patch.object(plugin, "pane_exists", return_value=False), \
+                patch.object(plugin, "remove_worker_container") as remove:
+            result = plugin.gc_collect_workers(
+                state_dir=self.state,
+                config_dir=self.config,
+                pane_id="w1:p30",
+                allow_fetch=False,
+            )
+        remove.assert_not_called()
+        self.assertNotIn("STALE-001", result["removed"])
+        self.assertTrue((self.state / "workers" / "STALE-001").exists())
+        self.assertTrue(any("tip moved" in warning for warning in result["warnings"]))
+        self.assertEqual(self.for_each_ref(), before)
+
+    def test_pane_exists_non_json_not_found_keeps_worker(self):
+        self.create_worker("NF-001", pane_id="w1:p31")
+        self.mark_fetched("NF-001")
+        herdr = self.root / "fake-herdr"
+        herdr.write_text("#!/bin/sh\necho 'herdr: command not found' >&2\nexit 127\n")
+        herdr.chmod(0o755)
+        with patch.object(plugin, "_herdr_bin", return_value=str(herdr)), \
+                patch.object(plugin, "remove_worker_container") as remove:
+            self.assertIsNone(plugin.pane_exists("w1:p31"))
+            result = plugin.gc_collect_workers(state_dir=self.state, config_dir=self.config)
+        remove.assert_not_called()
+        self.assertNotIn("NF-001", result["removed"])
+        self.assertTrue((self.state / "workers" / "NF-001").exists())
+
+    def test_pane_exists_server_down_keeps_worker(self):
+        self.create_worker("SD-001", pane_id="w1:p32")
+        self.mark_fetched("SD-001")
+        herdr = self.root / "fake-herdr-down"
+        herdr.write_text("#!/bin/sh\necho 'error: server not found' >&2\nexit 1\n")
+        herdr.chmod(0o755)
+        with patch.object(plugin, "_herdr_bin", return_value=str(herdr)), \
+                patch.object(plugin, "remove_worker_container") as remove:
+            self.assertIsNone(plugin.pane_exists("w1:p32"))
+            result = plugin.gc_collect_workers(state_dir=self.state, config_dir=self.config)
+        remove.assert_not_called()
+        self.assertNotIn("SD-001", result["removed"])
+        self.assertTrue((self.state / "workers" / "SD-001").exists())
+
+    def test_pane_exists_only_structured_pane_not_found_is_gone(self):
+        herdr = self.root / "fake-herdr-json"
+        herdr.write_text(
+            "#!/bin/sh\n"
+            "echo '{\"error\":{\"code\":\"pane_not_found\",\"message\":\"pane w1:p1 not found\"}}'\n"
+            "exit 1\n"
+        )
+        herdr.chmod(0o755)
+        with patch.object(plugin, "_herdr_bin", return_value=str(herdr)):
+            self.assertIs(plugin.pane_exists("w1:p1"), False)
+
+    def test_unavailable_podman_never_collected(self):
+        self.create_worker("UNAV-001", pane_id="w1:p33")
+        self.mark_fetched("UNAV-001")
+        with patch.object(plugin, "pane_exists", return_value=False), \
+                patch.object(plugin, "container_status", return_value="unavailable"), \
+                patch.object(plugin, "remove_worker_container") as remove:
+            result = plugin.gc_collect_workers(state_dir=self.state, config_dir=self.config)
+        remove.assert_not_called()
+        self.assertNotIn("UNAV-001", result["removed"])
+        self.assertTrue(any("not safely collectible" in warning for warning in result["warnings"]))
+
+    def test_error_container_status_never_collected(self):
+        self.create_worker("ERR-001", pane_id="w1:p34")
+        self.mark_fetched("ERR-001")
+        with patch.object(plugin, "pane_exists", return_value=False), \
+                patch.object(plugin, "container_status", return_value="error: cannot connect"), \
+                patch.object(plugin, "remove_worker_container") as remove:
+            result = plugin.gc_collect_workers(state_dir=self.state, config_dir=self.config)
+        remove.assert_not_called()
+        self.assertNotIn("ERR-001", result["removed"])
+        self.assertTrue((self.state / "workers" / "ERR-001").exists())
+
     def test_opportunistic_gc_never_fails_launch_and_is_time_bounded(self):
         self.create_worker("OPP-001", pane_id="w1:p13")
         self.mark_fetched("OPP-001")
-        calls = {"lock": 0}
+        calls = {"lock": 0, "blocking": []}
 
         class FakeLock:
-            def __init__(self, state_dir=None):
-                pass
+            def __init__(self, state_dir=None, blocking=True):
+                calls["blocking"].append(blocking)
 
             def __enter__(self):
                 calls["lock"] += 1
@@ -270,7 +357,7 @@ class GcTests(unittest.TestCase):
         deadline_seen = {}
 
         def capture(**kwargs):
-            deadline_seen["deadline"] = kwargs.get("deadline")
+            deadline_seen.update(kwargs)
             return {"removed": [], "warnings": [], "skipped": []}
 
         with patch.object(plugin, "StateLock", FakeLock), \
@@ -278,19 +365,37 @@ class GcTests(unittest.TestCase):
                 patch.object(plugin.time, "monotonic", return_value=100.0):
             plugin.opportunistic_gc(state_dir=self.state, config_dir=self.config)
         self.assertEqual(calls["lock"], 2)
+        self.assertEqual(calls["blocking"], [False, False])
+        self.assertIs(deadline_seen.get("allow_fetch"), False)
         self.assertAlmostEqual(
             deadline_seen["deadline"],
             100.0 + plugin.GC_OPPORTUNISTIC_BUDGET_SECONDS,
         )
 
+    def test_opportunistic_gc_skips_when_lock_held(self):
+        self.create_worker("LOCK-001", pane_id="w1:p35")
+        self.mark_fetched("LOCK-001")
+        started = time.monotonic()
+        with plugin.StateLock(self.state, blocking=True):
+            result = plugin.opportunistic_gc(state_dir=self.state, config_dir=self.config)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(result["removed"], [])
+        self.assertTrue(any("state lock busy" in warning for warning in result["warnings"]))
+        self.assertTrue((self.state / "workers" / "LOCK-001").exists())
+
+    def test_opportunistic_gc_does_not_fetch_before_delete(self):
+        self.create_worker("NOFETCH-001", pane_id="w1:p36")
+        old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        self.mark_created_at("NOFETCH-001", old)
+        with patch.object(plugin, "fetch_worker", side_effect=AssertionError("must not fetch")) as fetch, \
+                patch.object(plugin, "remove_worker_container"):
+            result = plugin.opportunistic_gc(state_dir=self.state, config_dir=self.config)
+        fetch.assert_not_called()
+        self.assertNotIn("NOFETCH-001", result["removed"])
+        self.assertTrue((self.state / "workers" / "NOFETCH-001").exists())
+
     def test_opportunistic_gc_does_not_hold_failure_into_hs_codex(self):
-        stderr = io.StringIO()
-        with patch.object(plugin, "check_root"), \
-                patch.object(plugin, "opportunistic_gc", side_effect=AssertionError("should be swallowed by helper")), \
-                patch.object(plugin, "resolve_source_repo_from_cwd", side_effect=ValueError("not a repo")), \
-                patch.object(plugin.sys, "stderr", stderr):
-            # Force opportunistic_gc itself to catch errors: call the real one with failing lock.
-            pass
         with patch.object(plugin, "StateLock", side_effect=RuntimeError("lock broken")):
             result = plugin.opportunistic_gc(state_dir=self.state, config_dir=self.config)
         self.assertEqual(result["removed"], [])
