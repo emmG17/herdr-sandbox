@@ -171,19 +171,21 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
     def test_list_does_not_execute_worker_config(self):
         """Test that 'list' command never executes worker config."""
         worker_id, _ = self.create_malicious_worker()
-        
-        workers = plugin.list_workers(self.state)
-        
+
+        with patch.object(plugin, "_query_worker_git_in_container", return_value=(0, "", "")):
+            workers = plugin.list_workers(self.state)
+
         self.assertTrue(any(w["id"] == worker_id for w in workers))
         self.assert_no_markers()
 
     def test_inspect_does_not_execute_worker_config(self):
         """Test that 'inspect' command never executes worker config."""
         worker_id, _ = self.create_malicious_worker()
-        
-        with patch.object(plugin, "container_status", return_value="not-found"):
+
+        with patch.object(plugin, "container_status", return_value="not-found"), \
+                patch.object(plugin, "_query_worker_git_in_container", return_value=(0, "", "")):
             inspection = plugin.inspect_worker(worker_id, self.state)
-        
+
         self.assertEqual(inspection["id"], worker_id)
         self.assert_no_markers()
 
@@ -224,19 +226,132 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
         self.assert_no_markers()
 
     def test_execute_post_run_does_not_execute_worker_config(self):
-        """Test that post-run HEAD reading never executes worker config.
-        
-        This test verifies that reading HEAD after execution uses safe file-based
-        reading, not git commands that would honor worker config.
-        """
+        """Test that post-run HEAD reading never executes worker config."""
         worker_id, worker_dir = self.create_malicious_worker()
-        
-        # Verify that inspect (which calls _safe_read_worker_head) doesn't execute config
-        with patch.object(plugin, "container_status", return_value="not-found"):
+
+        with patch.object(plugin, "container_status", return_value="not-found"), \
+                patch.object(plugin, "_query_worker_git_in_container", return_value=(0, "", "")):
             inspection = plugin.inspect_worker(worker_id, self.state)
-        
+
         self.assertEqual(inspection["id"], worker_id)
         self.assertIsNotNone(inspection["head"])
+        self.assert_no_markers()
+
+    def test_packed_refs_are_read_without_host_git(self):
+        """Packed worker refs must resolve without running git in the worker."""
+        worker_id, worker_dir = self.create_malicious_worker(make_worker_change=True)
+        worker_repo = worker_dir / "repo"
+        branch = f"agent/{worker_id}"
+        loose = worker_repo / ".git" / "refs" / "heads" / branch
+        sha = loose.read_text().strip()
+        packed = worker_repo / ".git" / "packed-refs"
+        packed.write_text(f"# pack-refs with: peeled fully-peeled sorted\n{sha} refs/heads/{branch}\n")
+        loose.unlink()
+
+        self.assertEqual(plugin._safe_read_worker_ref(worker_repo, branch), sha)
+        success, head, error = plugin._safe_read_worker_head(worker_repo)
+        self.assertTrue(success, error)
+        self.assertEqual(head, sha)
+
+        result = plugin.fetch_worker(worker_id, self.state)
+        self.assertEqual(result["commit"], sha)
+        self.assert_no_markers()
+
+    def test_symlinked_refs_and_objects_are_rejected(self):
+        """Symlinks under worker .git must not be followed."""
+        worker_id, worker_dir = self.create_malicious_worker(make_worker_change=True)
+        worker_repo = worker_dir / "repo"
+        branch = f"agent/{worker_id}"
+        loose = worker_repo / ".git" / "refs" / "heads" / branch
+        real_sha = loose.read_text().strip()
+        target = self.marker_dir / "evil-ref"
+        target.write_text("0" * 40 + "\n")
+        loose.unlink()
+        loose.symlink_to(target)
+
+        with self.assertRaises(ValueError):
+            plugin._safe_read_worker_ref(worker_repo, branch)
+
+        # Restore a real ref, then poison objects with a symlink.
+        loose.unlink()
+        loose.write_text(real_sha + "\n")
+        objects = worker_repo / ".git" / "objects"
+        evil_objects = self.marker_dir / "evil-objects"
+        evil_objects.mkdir()
+        objects.rename(worker_repo / ".git" / "objects-real")
+        objects.symlink_to(evil_objects)
+        with self.assertRaises(ValueError):
+            plugin.fetch_worker(worker_id, self.state)
+        self.assertFalse((self.source / ".git" / "refs" / "heads" / f"sandbox/{worker_id}").exists())
+        self.assertFalse((self.source / ".git" / "objects" / "info" / "alternates").exists())
+        self.assert_no_markers()
+
+    def test_fetch_failure_leaves_source_unchanged(self):
+        """A failed fetch must not leave alternates or a dangling sandbox ref."""
+        worker_id, worker_dir = self.create_malicious_worker(make_worker_change=True)
+        alternates = self.source / ".git" / "objects" / "info" / "alternates"
+        sandbox_ref = self.source / ".git" / "refs" / "heads" / f"sandbox/{worker_id}"
+        head_before = git("-C", self.source, "rev-parse", "HEAD")
+
+        real_run = subprocess.run
+
+        def fail_bundle_create(command, **kwargs):
+            command = list(command)
+            if command and command[0] == "git" and "bundle" in command and "create" in command:
+                return subprocess.CompletedProcess(command, 1, "", "simulated bundle create failure")
+            return real_run(command, **kwargs)
+
+        with patch.object(plugin.subprocess, "run", side_effect=fail_bundle_create):
+            with self.assertRaises(ValueError):
+                plugin.fetch_worker(worker_id, self.state)
+
+        self.assertEqual(git("-C", self.source, "rev-parse", "HEAD"), head_before)
+        self.assertFalse(sandbox_ref.exists())
+        self.assertFalse(alternates.exists())
+        self.assert_no_markers()
+
+    def test_concurrent_fetches_do_not_corrupt_source(self):
+        """Two fetches must not race on shared source-repo metadata."""
+        import threading
+
+        first_id, _ = self.create_malicious_worker(make_worker_change=True)
+        with patch.object(plugin, "check", return_value=[]):
+            second_dir = plugin.create_worker("MALICIOUS-002", str(self.source))
+        second_repo = second_dir / "repo"
+        safe_env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
+        (second_repo / "second.txt").write_text("second\n")
+        subprocess.run(["git", "-C", str(second_repo), "config", "user.name", "Worker"], env=safe_env, check=True)
+        subprocess.run(["git", "-C", str(second_repo), "config", "user.email", "worker@example.invalid"], env=safe_env, check=True)
+        subprocess.run(["git", "-C", str(second_repo), "add", "second.txt"], env=safe_env, check=True)
+        subprocess.run(["git", "-C", str(second_repo), "commit", "-qm", "second change"], env=safe_env, check=True)
+        config_file = second_repo / ".git" / "config"
+        with config_file.open("a") as stream:
+            stream.write(
+                f"\n[core]\n    fsmonitor = \"touch {self.fsmonitor_marker} && echo\"\n"
+                f"    hooksPath = {self.marker_dir / 'hooks'}\n"
+            )
+
+        errors = []
+
+        def fetch_one(worker_id):
+            try:
+                plugin.fetch_worker(worker_id, self.state)
+            except Exception as exc:  # noqa: BLE001 - collect for assertion
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=fetch_one, args=(first_id,)),
+            threading.Thread(target=fetch_one, args=("MALICIOUS-002",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        git("-C", self.source, "rev-parse", "--verify", f"refs/heads/sandbox/{first_id}")
+        git("-C", self.source, "rev-parse", "--verify", "refs/heads/sandbox/MALICIOUS-002")
+        self.assertFalse((self.source / ".git" / "objects" / "info" / "alternates").exists())
         self.assert_no_markers()
 
 
@@ -244,30 +359,27 @@ class TestGitCommandAudit(unittest.TestCase):
     """Grep-style test to enforce no vulnerable git -C <worker-repo> calls."""
 
     def test_no_git_c_worker_repo_in_main_script(self):
-        """Verify no git commands use worker repo as -C target."""
+        """Verify host worker inspection uses safe helpers, not _git_read."""
         script = Path(__file__).parent.parent / "bin" / "herdr-sandbox"
         content = script.read_text()
-        
-        # Find all _git_read calls (deprecated for worker repos)
-        # Check that _git_read has a deprecation warning
-        self.assertIn(
-            "DEPRECATED: Do not use for worker repos",
-            content,
-            "_git_read must have a deprecation warning"
-        )
-        
-        # Verify safe functions exist
+
+        self.assertIn("DEPRECATED for worker repos", content)
         self.assertIn("def _safe_read_worker_head(", content)
         self.assertIn("def _safe_read_worker_branch(", content)
-        
-        # Verify _git_reality uses safe functions
-        git_reality_start = content.find("def _git_reality(repo, metadata):")
+        self.assertIn("def _safe_read_worker_ref(", content)
+        self.assertIn("def _safe_fetch_from_worker(", content)
+        self.assertIn('["git", "bundle", "verify"', content)
+        # Safe fetch must not mutate the source repo via alternates/repack.
+        self.assertNotIn('alternates_file = source_repo', content)
+        self.assertNotIn('"repack"', content)
+        self.assertNotIn("'repack'", content)
+
+        git_reality_start = content.find("def _git_reality(")
         git_reality_end = content.find("\ndef ", git_reality_start + 1)
         git_reality_body = content[git_reality_start:git_reality_end]
-        
-        # Should call safe functions, not _git_read
         self.assertIn("_safe_read_worker_head", git_reality_body)
         self.assertIn("_safe_read_worker_branch", git_reality_body)
+        self.assertIn("_query_worker_git_in_container", git_reality_body)
         self.assertNotIn("_git_read(repo,", git_reality_body)
         self.assertNotIn("_git_read(worker_repo,", git_reality_body)
 
