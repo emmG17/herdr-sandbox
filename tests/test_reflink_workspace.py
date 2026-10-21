@@ -8,7 +8,6 @@ import json
 import os
 import shutil
 import stat
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -82,6 +81,8 @@ def _copy2_as_reflink(src, dst):
     """Test double: regular copy that preserves the reflink_file contract."""
     src = Path(src)
     dst = Path(dst)
+    if src.is_symlink():
+        raise OSError(f"Reflink source must be a regular file: {src}")
     if dst.exists() or dst.is_symlink():
         raise OSError(f"Reflink destination already exists: {dst}")
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -120,10 +121,34 @@ class WorkspaceSettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "clone' or 'reflink"):
             plugin.workspace_settings(self.config)
 
-        for entry in ("/etc/passwd", "../secret", ".git", ".git/hooks"):
+        for entry in (
+            "/etc/passwd",
+            "../secret",
+            ".git",
+            ".git/hooks",
+            "foo/.git/bar",
+            ".",
+            "./",
+            "",
+            "foo/../bar",
+        ):
             with self.subTest(entry=entry):
                 with self.assertRaises(ValueError):
                     plugin.validate_copy_untracked_entry(entry)
+        # Path collapses a lone '.' segment, so foo/./bar normalizes to foo/bar.
+        self.assertEqual(plugin.validate_copy_untracked_entry("foo/./bar"), "foo/bar")
+
+    def test_rejects_dot_and_nested_git_in_config_parse(self):
+        (self.config / "config.toml").write_text(
+            _config_with_workspace("reflink", ["."])
+        )
+        with self.assertRaises(ValueError):
+            plugin.workspace_settings(self.config)
+        (self.config / "config.toml").write_text(
+            _config_with_workspace("reflink", ["vendor/.git/objects"])
+        )
+        with self.assertRaisesRegex(ValueError, r"\.git"):
+            plugin.workspace_settings(self.config)
 
 
 class ReflinkHelpersTests(unittest.TestCase):
@@ -134,16 +159,12 @@ class ReflinkHelpersTests(unittest.TestCase):
         self.source = self.root / "source"
         self.source.mkdir()
         (self.source / "ok.txt").write_text("ok\n")
-
-    def test_symlink_outside_detection(self):
-        outside = self.root / "outside.txt"
-        outside.write_text("nope\n")
-        link = self.source / "escape"
-        link.symlink_to(outside)
-        self.assertTrue(plugin._symlink_points_outside(link, self.source))
-        inside = self.source / "inside-link"
-        inside.symlink_to("ok.txt")
-        self.assertFalse(plugin._symlink_points_outside(inside, self.source))
+        git("init", "-q", self.source)
+        git("-C", self.source, "config", "user.name", "Test")
+        git("-C", self.source, "config", "user.email", "test@example.invalid")
+        (self.source / ".gitignore").write_text(".env\nnode_modules/\n")
+        git("-C", self.source, "add", "ok.txt", ".gitignore")
+        git("-C", self.source, "commit", "-qm", "init")
 
     def test_copy_allowlist_skips_escaping_symlinks_and_nested_git(self):
         outside = self.root / "secret.env"
@@ -161,15 +182,18 @@ class ReflinkHelpersTests(unittest.TestCase):
 
         dest = self.root / "dest"
         dest.mkdir()
-        with patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink):
+        stderr = io.StringIO()
+        with patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink), \
+                patch.object(plugin.sys, "stderr", stderr):
             plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
 
         self.assertTrue((dest / "node_modules" / "keep.js").is_file())
         self.assertTrue((dest / "node_modules" / "pkg" / "index.js").is_file())
         self.assertFalse((dest / "node_modules" / "leak").exists())
         self.assertFalse((dest / "node_modules" / ".git").exists())
+        self.assertIn("skipping symlink", stderr.getvalue())
 
-    def test_top_level_escaping_symlink_allowlist_entry_skipped(self):
+    def test_top_level_symlink_allowlist_entry_rejected(self):
         outside = self.root / "outside-dir"
         outside.mkdir()
         (outside / "x").write_text("x\n")
@@ -177,8 +201,78 @@ class ReflinkHelpersTests(unittest.TestCase):
         dest = self.root / "dest"
         dest.mkdir()
         with patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink):
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
+
+    def test_relative_symlink_within_allowlist_kept_absolute_and_escape_skipped(self):
+        mods = self.source / "node_modules"
+        pnpm = mods / ".pnpm" / "pkg@1" / "node_modules" / "pkg"
+        pnpm.mkdir(parents=True)
+        (pnpm / "index.js").write_text("pkg\n")
+        bin_dir = mods / ".bin"
+        bin_dir.mkdir()
+        # pnpm-style relative link that stays inside node_modules
+        (bin_dir / "tool").symlink_to("../.pnpm/pkg@1/node_modules/pkg/index.js")
+        # absolute symlink — never recreate
+        (mods / "abs").symlink_to(self.source / "ok.txt")
+        # relative link escaping the allowlist entry to .env
+        (self.source / ".env").write_text("SECRET=1\n")
+        (mods / "to-env").symlink_to("../../.env")
+
+        dest = self.root / "dest"
+        dest.mkdir()
+        stderr = io.StringIO()
+        with patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink), \
+                patch.object(plugin.sys, "stderr", stderr):
             plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
-        self.assertFalse((dest / "node_modules").exists())
+
+        self.assertTrue((dest / "node_modules" / ".bin" / "tool").is_symlink())
+        self.assertEqual(
+            os.readlink(dest / "node_modules" / ".bin" / "tool"),
+            "../.pnpm/pkg@1/node_modules/pkg/index.js",
+        )
+        self.assertFalse((dest / "node_modules" / "abs").exists())
+        self.assertFalse((dest / "node_modules" / "to-env").exists())
+        notices = [line for line in stderr.getvalue().splitlines() if "skipping symlink" in line]
+        self.assertGreaterEqual(len(notices), 2)
+
+    def test_hardlink_to_env_inside_node_modules_skipped(self):
+        (self.source / ".env").write_text("SECRET=do-not-copy\n")
+        mods = self.source / "node_modules" / "pkg"
+        mods.mkdir(parents=True)
+        (mods / "index.js").write_text("deps\n")
+        leaked = mods / "leaked.env"
+        os.link(self.source / ".env", leaked)
+
+        dest = self.root / "dest"
+        dest.mkdir()
+        stderr = io.StringIO()
+        with patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink), \
+                patch.object(plugin.sys, "stderr", stderr):
+            plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
+
+        self.assertTrue((dest / "node_modules" / "pkg" / "index.js").is_file())
+        self.assertFalse((dest / "node_modules" / "pkg" / "leaked.env").exists())
+        self.assertIn("skipping hardlink", stderr.getvalue())
+
+    def test_reflink_file_refuses_symlink_source_with_nofollow(self):
+        target = self.root / "target.txt"
+        target.write_text("data\n")
+        link = self.root / "link.txt"
+        link.symlink_to(target)
+        dest = self.root / "out.txt"
+        with self.assertRaises(OSError):
+            plugin.reflink_file(link, dest)
+        self.assertFalse(dest.exists())
+
+    def test_reflink_file_o_excl_refuses_preexisting_dest(self):
+        src = self.root / "src.txt"
+        src.write_text("data\n")
+        dest = self.root / "out.txt"
+        dest.write_text("existing\n")
+        with self.assertRaises(OSError):
+            plugin.reflink_file(src, dest)
+        self.assertEqual(dest.read_text(), "existing\n")
 
 
 class ReflinkCreateTests(unittest.TestCase):
@@ -208,7 +302,6 @@ class ReflinkCreateTests(unittest.TestCase):
         mods.mkdir(parents=True)
         (mods / "index.js").write_text("deps\n")
         (self.source / ".env").write_text("SECRET=do-not-copy\n")
-        # Escaping symlink inside allowlisted tree
         outside = self.root / "outside-secret"
         outside.write_text("nope\n")
         (self.source / "node_modules" / "escape").symlink_to(outside)
@@ -227,7 +320,7 @@ class ReflinkCreateTests(unittest.TestCase):
         with patch.object(plugin, "probe_reflink", return_value=False), \
                 patch.object(plugin.sys, "stderr", stderr):
             worker = plugin.create_worker("FALLBACK-001", str(self.source))
-        notice = stderr.getvalue().strip().splitlines()
+        notice = [line for line in stderr.getvalue().splitlines() if line.strip()]
         self.assertEqual(len(notice), 1)
         self.assertIn("falling back to clone", notice[0])
         clone = worker / "repo"
@@ -251,35 +344,68 @@ class ReflinkCreateTests(unittest.TestCase):
         self.assertFalse((clone / "node_modules" / "escape").exists())
         alternates = clone / ".git" / "objects" / "info" / "alternates"
         self.assertFalse(alternates.exists())
-        self.assertNotEqual((clone / ".git").resolve(), (self.source / ".git").resolve())
         worker_hook = clone / ".git" / "hooks" / "pre-commit"
         self.assertTrue(
             (not worker_hook.exists())
             or worker_hook.read_text() != source_hook.read_text()
         )
-        # Status: allowlisted ignored paths stay ignored
         status = git("-C", clone, "status", "--porcelain")
         self.assertEqual(status, "")
         self.assertEqual(git("-C", clone, "branch", "--show-current"), "agent/REFLINK-001")
         metadata = json.loads((worker / "worker.json").read_text())
         self.assertEqual(metadata["workspace_strategy"], "reflink")
-        head = git("-C", self.source, "rev-parse", "HEAD")
-        source_object = self.source / ".git" / "objects" / head[:2] / head[2:]
-        clone_object = clone / ".git" / "objects" / head[:2] / head[2:]
-        if source_object.is_file() and clone_object.is_file():
-            self.assertNotEqual(source_object.stat().st_ino, clone_object.stat().st_ino)
+
+    def test_create_worker_refuses_dirty_tree_for_reflink(self):
+        (self.source / "dirty.txt").write_text("uncommitted\n")
+        with patch.object(plugin, "probe_reflink", return_value=True), \
+                patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink):
+            with self.assertRaisesRegex(ValueError, "uncommitted or untracked"):
+                plugin.create_worker("DIRTY-001", str(self.source))
+        self.assertFalse((self.state / "workers" / "DIRTY-001").exists())
+
+    def test_tracked_bytes_come_from_objects_not_assume_unchanged_worktree(self):
+        git("-C", self.source, "update-index", "--assume-unchanged", "value.txt")
+        (self.source / "value.txt").write_text("worktree-leaked-bytes\n")
+        with patch.object(plugin, "probe_reflink", return_value=True), \
+                patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink):
+            worker = plugin.create_worker("OBJECTS-001", str(self.source))
+        clone = worker / "repo"
+        self.assertEqual((clone / "value.txt").read_text(), "tracked\n")
+        self.assertNotEqual((clone / "value.txt").read_text(), "worktree-leaked-bytes\n")
+
+    def test_tracked_bytes_ignore_worktree_autocrlf_mutation(self):
+        # Simulate a worktree that does not match the blob (e.g. line-ending tools).
+        (self.source / "value.txt").write_bytes(b"tracked\r\n")
+        git("-C", self.source, "update-index", "--assume-unchanged", "value.txt")
+        with patch.object(plugin, "probe_reflink", return_value=True), \
+                patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink):
+            worker = plugin.create_worker("CRLF-001", str(self.source))
+        self.assertEqual((worker / "repo" / "value.txt").read_bytes(), b"tracked\n")
+
+    def test_hardlink_env_into_allowlist_skipped_during_create(self):
+        leaked = self.source / "node_modules" / "pkg" / "leaked.env"
+        os.link(self.source / ".env", leaked)
+        stderr = io.StringIO()
+        with patch.object(plugin, "probe_reflink", return_value=True), \
+                patch.object(plugin, "reflink_file", side_effect=_copy2_as_reflink), \
+                patch.object(plugin.sys, "stderr", stderr):
+            worker = plugin.create_worker("HARDLINK-001", str(self.source))
+        clone = worker / "repo"
+        self.assertFalse((clone / "node_modules" / "pkg" / "leaked.env").exists())
+        self.assertFalse((clone / ".env").exists())
+        self.assertIn("skipping hardlink", stderr.getvalue())
 
     def test_rejects_absolute_and_dotdot_allowlist_at_config_parse(self):
         (self.config / "config.toml").write_text(
             _config_with_workspace("reflink", ["/tmp/x"])
         )
-        with self.assertRaisesRegex(ValueError, "relative paths without"):
+        with self.assertRaisesRegex(ValueError, "relative paths"):
             plugin.workspace_settings(self.config)
 
 
 @unittest.skipUnless(_reflink_test_root() is not None, "no reflink-capable test filesystem mounted")
 class RealReflinkCreateTests(unittest.TestCase):
-    """Runs the real FICLONE / cp --reflink=always path on XFS/btrfs when available."""
+    """Runs the real O_NOFOLLOW + FICLONE path on XFS/btrfs when available."""
 
     def setUp(self):
         self.reflink_root = _reflink_test_root()
@@ -324,11 +450,9 @@ class RealReflinkCreateTests(unittest.TestCase):
         self.assertEqual((clone / "node_modules" / "pkg" / "index.js").read_text(), "deps\n")
         self.assertFalse((clone / ".env").exists())
         self.assertFalse((clone / ".git" / "objects" / "info" / "alternates").exists())
-        # Distinct inodes for reflinked allowlisted file
         src_file = self.source / "node_modules" / "pkg" / "index.js"
         dst_file = clone / "node_modules" / "pkg" / "index.js"
         self.assertNotEqual(src_file.stat().st_ino, dst_file.stat().st_ino)
-        # Write in worker must not affect source
         dst_file.write_text("mutated-in-worker\n")
         self.assertEqual(src_file.read_text(), "deps\n")
         status = git("-C", clone, "status", "--porcelain")
@@ -336,13 +460,21 @@ class RealReflinkCreateTests(unittest.TestCase):
         metadata = json.loads((worker / "worker.json").read_text())
         self.assertEqual(metadata["workspace_strategy"], "reflink")
 
+    def test_real_reflink_skips_env_hardlink_inside_allowlist(self):
+        leaked = self.source / "node_modules" / "pkg" / "leaked.env"
+        os.link(self.source / ".env", leaked)
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "stderr", stderr):
+            worker = plugin.create_worker("REAL-HARDLINK-001", str(self.source))
+        self.assertFalse((worker / "repo" / "node_modules" / "pkg" / "leaked.env").exists())
+        self.assertIn("skipping hardlink", stderr.getvalue())
+
 
 class ProbeCrossFilesystemTests(unittest.TestCase):
     def test_probe_fails_across_filesystems_when_possible(self):
         reflink_root = _reflink_test_root()
         if reflink_root is None:
             self.skipTest("no reflink-capable filesystem for cross-device contrast")
-        # Source on XFS, state on default ext4 tmp — reflink must fail.
         with tempfile.TemporaryDirectory(dir=reflink_root) as src_dir, \
                 tempfile.TemporaryDirectory() as state_dir:
             source = Path(src_dir)

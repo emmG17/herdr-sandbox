@@ -19,14 +19,15 @@ pids = 1024
 max_age = "7d"
 
 # Experimental: optional CoW workspace materialization (RFC phase 5 / #14).
-# Default remains "clone". "reflink" probes cp/--reflink (FICLONE) from the
-# source filesystem into the plugin state directory; if that fails (for example
-# state and source on different filesystems, or ext4 without reflink), create
-# falls back to clone with one notice line and does not copy allowlisted paths.
-# copy_untracked is a relative-path allowlist only (no absolute paths, no "..").
-# Untracked files outside the allowlist (e.g. .env) never reach the worker.
-# Symlinks that resolve outside the source are skipped; source .git is never
-# reflinked — worker .git is built like the clone strategy (no alternates).
+# Default remains "clone". "reflink" probes FICLONE (O_NOFOLLOW, no cp fallback)
+# from the source filesystem into the plugin state directory; if that fails
+# (cross-filesystem or no CoW), create falls back to clone with one notice and
+# does not copy allowlisted paths. Tracked files always come from git objects;
+# only copy_untracked paths are reflinked. Allowlist entries must be nonempty
+# relative paths strictly under the source (no ".", "..", absolute, or .git
+# segments). Symlink entries are rejected; absolute / escaping symlinks under a
+# tree are skipped; hardlinks to non-allowlisted paths (e.g. .env) are skipped.
+# Dirty trees are refused inside create_worker when strategy is reflink.
 [workspace]
 strategy = "clone"          # "clone" | "reflink" (experimental)
 copy_untracked = []         # reflink only, e.g. ["node_modules", "target", ".venv"]

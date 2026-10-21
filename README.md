@@ -388,22 +388,42 @@ strategy = "reflink"
 copy_untracked = ["node_modules", "target", ".venv"]
 ```
 
-Before creating a worker, the plugin probes reflink by cloning a temp file from
-the **source** filesystem into the **plugin state** directory. Reflink cannot
-cross filesystems: if state and source are on different devices, or the FS lacks
-CoW clones, create prints one notice line and falls back to `clone` (no
-allowlist copy).
+Allowlisted paths should be gitignored so the source stays clean. Before
+creating a worker, the plugin probes reflink by cloning a temp file from the
+**source** filesystem into the **plugin state** directory using the same
+`O_NOFOLLOW` + `FICLONE` primitive as allowlisted copies (no `cp` fallback).
+Reflink cannot cross filesystems: if state and source are on different devices,
+or the FS lacks CoW clones, create prints one notice line and falls back to
+`clone` (no allowlist copy).
 
-With a successful probe, the worker `.git` is still built like the clone
-strategy (no hardlinked objects, no `alternates`, fresh hooks/config/info — the
-source `.git` is never reflinked). Tracked files come from the source work tree
-via reflink when `base_ref` is `HEAD`; allowlisted untracked/ignored paths are
-reflinked on top. Everything else (including `.env`) stays out. Absolute
-`copy_untracked` entries and paths containing `..` are rejected. Symlinks that
-resolve outside the source are skipped and never followed (including under
-allowlisted trees such as `node_modules`). Reflinked files get new inodes; a
-write in the worker must not change the source. The dirty-tree refusal from the
-launcher still applies.
+With a successful probe:
+
+- Worker `.git` is built like the clone strategy (no hardlinked objects, no
+  `alternates`, fresh hooks/config/info). The source `.git` is never reflinked.
+- **Tracked files always come from git objects** (`checkout-index`), never from
+  the source worktree, so `assume-unchanged`, `autocrlf`, or a swapped path
+  cannot leak worktree bytes into the worker.
+- Only allowlisted untracked/ignored paths are reflinked on top. Everything
+  else (including `.env`) stays out.
+- `copy_untracked` entries must be nonempty relative paths strictly under the
+  source: no absolute paths, no `.` / `./` / empty roots, no `.` or `..`
+  parts, and no `.git` segment at any depth. An allowlist entry that is itself
+  a symlink is rejected. Nested `.git` directories are also skipped at walk time.
+- Relative symlinks under an allowlisted tree are recreated only when their
+  resolved target stays inside that same top-level entry (pnpm links within
+  `node_modules` keep working). Absolute symlinks and links to `.env`, `.git`,
+  or anywhere else outside that entry are skipped with one stderr line each.
+- Hardlinks from allowlisted files to non-allowlisted untracked/ignored paths
+  (or to tracked files outside the allowlist) are skipped with one stderr line
+  each, so a `.env` hardlinked into `node_modules` does not reach the worker.
+  Hardlinks that stay entirely inside the allowlist (common with pnpm/npm) are
+  kept.
+- Gitlinks/submodules are not populated; create prints one stderr notice listing
+  skipped paths.
+- Reflinked files get new inodes; a write in the worker must not change the
+  source.
+- Dirty-tree refusal runs inside `create_worker` whenever
+  `strategy = "reflink"` (not only in the launcher).
 
 ## Advanced use and troubleshooting
 
