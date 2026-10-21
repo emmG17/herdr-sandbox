@@ -39,8 +39,16 @@ DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 # ---------------------------------------------------------------------------
 # Agent profiles. Isolation flags stay on PodmanSandboxRuntime; a profile may
-# only supply agent-specific home/env/argv/auth/forbidden-args/HERDR_AGENT.
+# only supply image install packages, home mount/env, extra container env,
+# interactive/noninteractive argv, auth files / optional API-key env,
+# banned host paths, forbidden args, and HERDR_AGENT.
 # ---------------------------------------------------------------------------
+
+# Config keys allowed under each [agent] table.
+AGENT_CONFIG_KEYS = {"home", "forward_api_key"}
+AGENT_PROFILES = {}
+DEFAULT_PROFILE = None
+
 
 @dataclass(frozen=True)
 class AgentProfile:
@@ -53,14 +61,36 @@ class AgentProfile:
     auth_files: tuple
     login_argv: tuple
     interactive_bin: str
-    workspace_flag: str
+    # Fixed argv inserted after the binary for interactive launches (profile-owned
+    # hook). Examples: workspace flags, in-container permission flags.
+    # The runtime never invents agent flags.
+    interactive_prefix: tuple
     forbidden_user_args: tuple
     herdr_agent: str
     normal_user_home: str
     noninteractive_prefix: tuple
+    # npm packages the shared Containerfile must install for this agent.
+    image_npm_packages: tuple = ()
+    # Extra container --env pairs beyond HOME / home_env_var / XDG_CACHE_HOME.
+    # Values are literals; host env is never forwarded implicitly.
+    container_env: tuple = ()
+    # Extra host paths (relative to Path.home()) refused as the plugin home,
+    # beyond normal_user_home (for example a sibling global config file).
+    banned_host_names: tuple = ()
+    # Optional host env var name for an API-key auth path. Only forwarded into
+    # the container when [agent].forward_api_key = true. Never written into the
+    # repo, image, or config file.
+    api_key_env: str | None = None
 
     def normal_user_home_path(self):
         return (Path.home() / self.normal_user_home).expanduser().resolve()
+
+    def banned_host_paths(self):
+        """Host paths that must never be used as the plugin-owned agent home."""
+        paths = {self.normal_user_home_path()}
+        for name in self.banned_host_names:
+            paths.add((Path.home() / name).expanduser().resolve())
+        return paths
 
     def validate_auth_data(self, data):
         """Return True when auth JSON has the expected object shape for this agent."""
@@ -93,7 +123,7 @@ class AgentProfile:
                 raise ValueError(
                     f"Fresh {self.name} sessions must use the worker workspace at /workspace."
                 )
-        return [self.interactive_bin, self.workspace_flag, "/workspace", *args[1:]]
+        return [self.interactive_bin, *self.interactive_prefix, *args[1:]]
 
     def build_noninteractive_argv(self, prompt):
         if not isinstance(prompt, str) or not prompt.strip():
@@ -139,15 +169,76 @@ CODEX_PROFILE = _CodexAgentProfile(
     auth_files=("auth.json",),
     login_argv=("codex", "login", "--device-auth"),
     interactive_bin="codex",
-    workspace_flag="--cd",
+    interactive_prefix=("--cd", "/workspace"),
     forbidden_user_args=("-C", "--cd"),
     herdr_agent="codex",
     normal_user_home=".codex",
     noninteractive_prefix=("exec", "--sandbox", "danger-full-access"),
+    image_npm_packages=("@openai/codex",),
 )
-AGENT_PROFILES = {CODEX_PROFILE.name: CODEX_PROFILE}
+AGENT_PROFILES[CODEX_PROFILE.name] = CODEX_PROFILE
 DEFAULT_PROFILE = CODEX_PROFILE
 # END AGENT PROFILE: codex
+
+
+# BEGIN AGENT PROFILE: claude
+def _claude_validate_auth_data(data):
+    """Accept Claude Code credential JSON under CLAUDE_CONFIG_DIR/.credentials.json.
+
+    Official storage: https://code.claude.com/docs/en/authentication
+    (Linux: ``.credentials.json`` under ``CLAUDE_CONFIG_DIR``, default ``~/.claude``).
+    """
+    if not isinstance(data, dict) or not data:
+        return False
+    oauth = data.get("claudeAiOauth")
+    if isinstance(oauth, dict):
+        if any(
+            isinstance(oauth.get(key), str) and oauth.get(key).strip()
+            for key in ("accessToken", "refreshToken")
+        ):
+            return True
+    for key in ("apiKey", "primaryApiKey", "accessToken"):
+        if isinstance(data.get(key), str) and data.get(key).strip():
+            return True
+    # Non-empty credential object from /login; shape varies by account type.
+    return any(value not in (None, "", {}, []) for value in data.values())
+
+
+@dataclass(frozen=True)
+class _ClaudeAgentProfile(AgentProfile):
+    def validate_auth_data(self, data):
+        return _claude_validate_auth_data(data)
+
+
+CLAUDE_PROFILE = _ClaudeAgentProfile(
+    name="claude",
+    home_dirname="claude",
+    mount_point="/claude",
+    # https://code.claude.com/docs/en/env-vars — CLAUDE_CONFIG_DIR overrides ~/.claude
+    home_env_var="CLAUDE_CONFIG_DIR",
+    auth_files=(".credentials.json",),
+    login_argv=("claude", "auth", "login"),
+    interactive_bin="claude",
+    interactive_prefix=("--dangerously-skip-permissions",),
+    forbidden_user_args=(),
+    herdr_agent="claude",
+    normal_user_home=".claude",
+    # --prompt maps to -p; full in-container permissions match interactive.
+    noninteractive_prefix=("--dangerously-skip-permissions", "-p"),
+    image_npm_packages=("@anthropic-ai/claude-code",),
+    banned_host_names=(".claude.json",),
+    api_key_env="ANTHROPIC_API_KEY",
+)
+AGENT_PROFILES[CLAUDE_PROFILE.name] = CLAUDE_PROFILE
+# END AGENT PROFILE: claude
+
+
+def all_banned_host_paths():
+    """Union of every registered profile's banned host paths (plus Path.home())."""
+    banned = {Path.home().resolve()}
+    for profile in AGENT_PROFILES.values():
+        banned.update(profile.banned_host_paths())
+    return banned
 
 
 def get_profile(name):
@@ -193,7 +284,8 @@ def resolve_agent_home(config_dir, profile, config=None):
 
     Per-agent convention: default dirname is ``profile.home_dirname`` under the
     config directory. A ``[<agent>].home`` table remains a compatibility
-    override. Every profile's normal user home is refused.
+    override. Every profile's banned host paths (normal user home plus any
+    extra banned_host_names) are refused.
     """
     config_dir = Path(config_dir)
     if config is None:
@@ -205,19 +297,52 @@ def resolve_agent_home(config_dir, profile, config=None):
     elif not isinstance(table, dict):
         raise ValueError(f"Expected [{profile.name}] table in {config_file}.")
     else:
-        _permitted_settings(table, f"[{profile.name}]", {"home"})
+        _permitted_settings(table, f"[{profile.name}]", AGENT_CONFIG_KEYS)
         home = table.get("home", profile.home_dirname)
     if not isinstance(home, str) or home in ("", ".") or Path(home).is_absolute() or ".." in Path(home).parts:
         raise ValueError(f"Set [{profile.name}].home to a relative path inside {config_dir}.")
     agent_home = (config_dir / home).resolve()
     if agent_home == config_dir.resolve() or not agent_home.is_relative_to(config_dir.resolve()):
         raise ValueError(f"{profile.name} home escapes plugin config directory: {agent_home}.")
-    banned = {other.normal_user_home_path() for other in AGENT_PROFILES.values()}
-    if agent_home in banned:
+    if agent_home in all_banned_host_paths():
         raise ValueError(
-            f"The normal user {profile.name} home cannot be used by this plugin."
+            f"The normal user {profile.name} home (or another banned host path) "
+            "cannot be used by this plugin."
         )
     return agent_home
+
+
+def agent_forward_api_key(config, profile):
+    """Return True when ``[agent].forward_api_key`` explicitly opts in.
+
+    Host env vars are never forwarded implicitly. When True and
+    ``profile.api_key_env`` is set, that single variable may be passed into the
+    container as ``--env``. The key itself must never be written into the repo,
+    image, or config file.
+    """
+    if not profile.api_key_env:
+        return False
+    table = config.get(profile.name) if isinstance(config, dict) else None
+    if not isinstance(table, dict):
+        return False
+    value = table.get("forward_api_key", False)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"Set [{profile.name}].forward_api_key to true or false "
+            f"(got {value!r})."
+        )
+    return value
+
+
+def api_key_from_host(profile, host_env=None):
+    """Return a nonempty API key from the host env when the profile declares one."""
+    if not profile.api_key_env:
+        return None
+    env = os.environ if host_env is None else host_env
+    value = env.get(profile.api_key_env)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def load_config(config_dir, profile=None):
@@ -226,12 +351,18 @@ def load_config(config_dir, profile=None):
     config_file, config = _read_config_toml(config_dir)
     runtime = config.get("runtime")
     agent_table = config.get(profile.name)
-    if not isinstance(runtime, dict) or not isinstance(agent_table, dict):
+    if not isinstance(runtime, dict):
         raise ValueError(f"Expected [runtime] and [{profile.name}] tables in {config_file}.")
+    if agent_table is not None and not isinstance(agent_table, dict):
+        raise ValueError(f"Expected [{profile.name}] table in {config_file}.")
+    if isinstance(agent_table, dict):
+        _permitted_settings(agent_table, f"[{profile.name}]", AGENT_CONFIG_KEYS)
     _permitted_settings(runtime, "[runtime]", {"image", "network"})
     image = runtime.get("image")
     if not isinstance(image, str) or not image.strip():
         raise ValueError(f"Set a nonempty [runtime].image in {config_file}.")
+    # Validate forward_api_key type early even when auth is not required yet.
+    agent_forward_api_key(config, profile)
     return image, resolve_agent_home(config_dir, profile, config)
 
 
@@ -773,18 +904,27 @@ def check(repo=None, require_auth=False, profile=None):
         if not state_dir.is_dir():
             errors.append(f"Plugin state directory is missing: {state_dir}. Run the setup action.")
         image, agent_home = load_config(config_dir, profile)
+        _, config = _read_config_toml(config_dir)
         runtime_settings(config_dir)
         if not agent_home.is_dir():
             errors.append(f"Dedicated {profile.name} home is missing: {agent_home}. Run the setup action.")
         elif require_auth:
+            forward = agent_forward_api_key(config, profile)
+            api_key_ok = bool(forward and api_key_from_host(profile))
             missing = [
                 name for name in profile.auth_files
                 if (agent_home / name).is_symlink() or not (agent_home / name).is_file()
             ]
-            if missing:
+            if missing and not api_key_ok:
+                hint = _login_hint(profile, agent_home)
+                if profile.api_key_env:
+                    hint += (
+                        f" Or set [{profile.name}].forward_api_key = true and export "
+                        f"{profile.api_key_env} (never commit the key)."
+                    )
                 errors.append(
                     f"{profile.name} authentication is missing in {agent_home} "
-                    f"({', '.join(missing)}). Run {_login_hint(profile, agent_home)}."
+                    f"({', '.join(missing)}). Run {hint}."
                 )
         if shutil.which("podman") and platform.system() == "Linux":
             result = run("podman", "image", "exists", image)
@@ -1049,23 +1189,33 @@ def _auth_snapshot(path, trusted_root):
     return {"path": path, "data": data}
 
 
-def fresh_agent_home(agent_home, worker_id, profile):
+def fresh_agent_home(agent_home, worker_id, profile, *, allow_missing_auth=False):
     """Create a disposable agent home containing auth files but no history.
 
     Returns ``(session_home, launch_snapshots)`` where snapshots map auth file
     names to the dedicated-home bytes captured at launch for compare-and-swap
-    write-back.
+    write-back. When ``allow_missing_auth`` is True (API-key auth path with
+    explicit ``forward_api_key``), missing auth files are skipped so the
+    session can rely on the forwarded key alone. Never copies from the host
+    home or any banned path.
     """
     agent_home = Path(agent_home)
     if agent_home.is_symlink():
         raise ValueError(f"{profile.name} home must not be a symlink: {agent_home}")
+    if agent_home.resolve() in all_banned_host_paths():
+        raise ValueError(
+            f"Refusing to use banned host path as {profile.name} home: {agent_home}"
+        )
     snapshots = {}
+    missing = []
     for name in profile.auth_files:
         auth_path = agent_home / name
         try:
             snapshots[name] = _auth_snapshot(auth_path, agent_home)
-        except ValueError as exc:
-            raise ValueError(f"{profile.name} authentication is missing in {agent_home}.") from exc
+        except ValueError:
+            missing.append(name)
+    if missing and not allow_missing_auth:
+        raise ValueError(f"{profile.name} authentication is missing in {agent_home}.")
 
     sessions_dir = agent_home / "sessions"
     if sessions_dir.is_symlink() or (sessions_dir.exists() and not sessions_dir.is_dir()):
@@ -2088,10 +2238,15 @@ class PodmanSandboxRuntime:
     Isolation flags (userns, capabilities, read-only root, network policy,
     resource limits, workspace mount, tmp homes) are fixed here. A profile may
     only supply agent-specific env, home mount, and argv values — never network
-    access, devices, capabilities, or extra mounts.
+    access, devices, capabilities, or extra mounts. Host env is never forwarded
+    implicitly; ``forwarded_env`` holds only explicit opt-in pairs (e.g. an
+    API key when ``[agent].forward_api_key = true``).
     """
 
-    def __init__(self, worker_id, image, repo, agent_home, network, cpus, memory, pids, profile):
+    def __init__(
+        self, worker_id, image, repo, agent_home, network, cpus, memory, pids, profile,
+        forwarded_env=None,
+    ):
         self.worker_id = worker_id
         self.image = image
         self.repo = repo
@@ -2101,21 +2256,38 @@ class PodmanSandboxRuntime:
         self.memory = memory
         self.pids = pids
         self.profile = profile
+        self.forwarded_env = dict(forwarded_env or {})
 
     def _base_command(self, interactive=False):
         """Build the shared hardened Podman invocation for both execution modes."""
         profile = self.profile
+        agent_home = self.agent_home.resolve()
+        if agent_home in all_banned_host_paths():
+            raise ValueError(
+                f"Refusing to mount banned host path as {profile.name} home: {agent_home}"
+            )
+        # Profile-owned env first (home + extras), then explicit opt-in forwards.
+        env_pairs = [
+            ("HOME", "/tmp/home"),
+            (profile.home_env_var, profile.mount_point),
+            ("XDG_CACHE_HOME", "/tmp/cache"),
+            *list(profile.container_env),
+            *self.forwarded_env.items(),
+        ]
         invocation = [
             "podman", "run", "--rm",
             "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
             f"--pids-limit={self.pids}", f"--memory={self.memory}", f"--cpus={self.cpus}",
-            "--env", "HOME=/tmp/home",
-            "--env", f"{profile.home_env_var}={profile.mount_point}",
-            "--env", "XDG_CACHE_HOME=/tmp/cache",
-            "--mount", f"type=bind,src={self.repo.resolve()},dst=/workspace,rw",
-            "--mount", f"type=bind,src={self.agent_home.resolve()},dst={profile.mount_point},rw",
-            "--workdir", "/workspace",
         ]
+        for key, value in env_pairs:
+            if not isinstance(key, str) or not key or not isinstance(value, str):
+                raise ValueError(f"Invalid container env pair for {profile.name}: {key!r}")
+            invocation.extend(["--env", f"{key}={value}"])
+        invocation.extend([
+            "--mount", f"type=bind,src={self.repo.resolve()},dst=/workspace,rw",
+            "--mount", f"type=bind,src={agent_home},dst={profile.mount_point},rw",
+            "--workdir", "/workspace",
+        ])
         if interactive:
             invocation.insert(3, "-it")
         invocation.insert(4 if interactive else 3, "--name")
@@ -2159,12 +2331,23 @@ class PodmanSandboxRuntime:
         return self._base_command() + [self.image] + self.profile.build_noninteractive_argv(prompt)
 
 
-def podman_runtime(worker_id, agent_home=None, profile=None):
+def _forwarded_container_env(config, profile, host_env=None):
+    """Build explicit opt-in container env (API key only when configured)."""
+    forwarded = {}
+    if agent_forward_api_key(config, profile):
+        value = api_key_from_host(profile, host_env)
+        if value is not None:
+            forwarded[profile.api_key_env] = value
+    return forwarded
+
+
+def podman_runtime(worker_id, agent_home=None, profile=None, forwarded_env=None):
     """Create the configured runtime only after validating its permitted paths."""
     profile = DEFAULT_PROFILE if profile is None else profile
     validate_worker_id(worker_id)
     config_dir, state_dir = paths()
     image, configured_home = load_config(config_dir, profile)
+    _, config = _read_config_toml(config_dir)
     network, cpus, memory, pids = runtime_settings(config_dir)
     _, worker_dir = worker_storage(worker_id, state_dir)
     repo = worker_dir / "repo"
@@ -2178,8 +2361,15 @@ def podman_runtime(worker_id, agent_home=None, profile=None):
         raise ValueError(f"Fresh {profile.name} home must be inside the dedicated plugin home: {selected_home}")
     if not selected_home.is_dir() or selected_home.is_symlink():
         raise ValueError(f"Dedicated {profile.name} home does not exist: {selected_home}")
+    if selected_home.resolve() in all_banned_host_paths():
+        raise ValueError(
+            f"Refusing to mount banned host path as {profile.name} home: {selected_home}"
+        )
+    if forwarded_env is None:
+        forwarded_env = _forwarded_container_env(config, profile)
     return PodmanSandboxRuntime(
         worker_id, image, repo, selected_home, network, cpus, memory, pids, profile,
+        forwarded_env=forwarded_env,
     )
 
 
@@ -2285,7 +2475,13 @@ def open_worker(worker_id, command=None, fresh=False, profile=None):
     try:
         if fresh:
             _, configured_home = load_config(config_dir, profile)
-            session_home, launch_snapshots = fresh_agent_home(configured_home, worker_id, profile)
+            _, config = _read_config_toml(config_dir)
+            allow_missing = bool(
+                agent_forward_api_key(config, profile) and api_key_from_host(profile)
+            )
+            session_home, launch_snapshots = fresh_agent_home(
+                configured_home, worker_id, profile, allow_missing_auth=allow_missing,
+            )
         invocation = open_command(
             worker_id, command, fresh=fresh, agent_home=session_home, profile=profile,
         )
@@ -2424,7 +2620,13 @@ def execute_worker(worker_id, prompt, profile=None):
     if errors:
         raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
     _, configured_home = load_config(config_dir, profile)
-    session_home, launch_snapshots = fresh_agent_home(configured_home, worker_id, profile)
+    _, config = _read_config_toml(config_dir)
+    allow_missing = bool(
+        agent_forward_api_key(config, profile) and api_key_from_host(profile)
+    )
+    session_home, launch_snapshots = fresh_agent_home(
+        configured_home, worker_id, profile, allow_missing_auth=allow_missing,
+    )
     previous_herdr_agent = os.environ.get("HERDR_AGENT")
     os.environ["HERDR_AGENT"] = profile.herdr_agent
     host_env = profile.host_env()
@@ -3687,7 +3889,8 @@ def hs_agent(profile, agent_args, prompt=None):
 def login_agent(agent_name):
     """Run the profile login with the home env pointed at the plugin-owned home.
 
-    Refuses every registered agent's normal user home.
+    Refuses every registered agent's banned host paths (normal user homes and
+    extras from banned_host_names), and never points login at the host home.
     """
     profile = get_profile(agent_name)
     config_dir, _ = paths()
@@ -3696,11 +3899,10 @@ def login_agent(agent_name):
     except ValueError:
         setup()
     agent_home = resolve_agent_home(config_dir, profile)
-    banned = {other.normal_user_home_path() for other in AGENT_PROFILES.values()}
-    if agent_home in banned or agent_home == Path.home().resolve():
+    if agent_home in all_banned_host_paths():
         raise ValueError(
-            f"Refusing to run login against the normal user {profile.name} home "
-            f"({profile.normal_user_home_path()}). Use the plugin-owned home."
+            f"Refusing to run login against a banned host path for {profile.name} "
+            f"(including {profile.normal_user_home_path()}). Use the plugin-owned home."
         )
     agent_home.mkdir(parents=True, exist_ok=True)
     agent_home.chmod(0o700)
@@ -3791,15 +3993,18 @@ def main():
         help=f"Start {DEFAULT_PROFILE.name} instead of the default shell",
     )
     open_parser.add_argument("session_command", nargs=argparse.REMAINDER, help="Command and arguments to run in the worker")
-    start_name = f"start-{DEFAULT_PROFILE.name}"
-    start_parser = commands.add_parser(
-        start_name,
-        help=f"Start a fresh {DEFAULT_PROFILE.name} session in a sandbox worker",
-    )
-    start_parser.add_argument("--id", help="Worker ID (or configure [open].id)")
+    start_commands = {}
+    for profile in AGENT_PROFILES.values():
+        start_name = f"start-{profile.name}"
+        start_parser = commands.add_parser(
+            start_name,
+            help=f"Start a fresh {profile.name} session in a sandbox worker",
+        )
+        start_parser.add_argument("--id", help="Worker ID (or configure [open].id)")
+        start_commands[start_name] = profile
     pane_open_parser = commands.add_parser(
         "pane-open",
-        help=f"Open the {start_name} pane through Herdr with validated placement",
+        help=f"Open the start-{DEFAULT_PROFILE.name} pane through Herdr with validated placement",
     )
     pane_open_parser.add_argument("--placement", help="Pane placement: overlay, split, or tab (default: overlay)")
     pane_open_parser.add_argument("--target-pane", help="Target pane for split placement (for example, w1:p1)")
@@ -3940,11 +4145,12 @@ def main():
             if command and command[0] == DEFAULT_PROFILE.interactive_bin:
                 return open_worker(worker_id, command, fresh=True, profile=DEFAULT_PROFILE)
             return open_worker(worker_id, command)
-        elif args.command == start_name:
+        elif args.command in start_commands:
+            start_profile = start_commands[args.command]
             config_dir, _ = paths()
             worker_id = resolve_open_worker(args.id, config_dir)
             return open_worker(
-                worker_id, [DEFAULT_PROFILE.interactive_bin], fresh=True, profile=DEFAULT_PROFILE,
+                worker_id, [start_profile.interactive_bin], fresh=True, profile=start_profile,
             )
         elif args.command == "pane-open":
             command = build_herdr_pane_open_command(args.placement, args.target_pane, args.direction)

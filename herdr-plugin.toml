@@ -2,13 +2,13 @@ id = "dev.herdr.sandbox"
 name = "Sandbox Workers"
 version = "0.1.0"
 min_herdr_version = "0.9.0"
-description = "Isolated Codex workers using rootless Podman"
+description = "Isolated Codex and Claude Code workers using rootless Podman"
 platforms = ["linux"]
 
 [[actions]]
 id = "setup"
 title = "Sandbox: Set Up"
-description = "Create plugin configuration and a dedicated Codex home"
+description = "Create plugin configuration and dedicated agent homes"
 command = ["python3", "bin/herdr-sandbox", "setup"]
 
 [[actions]]
@@ -20,7 +20,7 @@ command = ["python3", "bin/herdr-sandbox", "bootstrap"]
 [[actions]]
 id = "build-image"
 title = "Sandbox: Build Image"
-description = "Build the Codex worker image with rootless Podman"
+description = "Build the sandbox worker image with rootless Podman"
 command = ["python3", "bin/herdr-sandbox", "build-image"]
 
 [[actions]]
@@ -82,6 +82,12 @@ id = "start-codex"
 title = "Sandbox: Start Codex"
 placement = "overlay"
 command = ["python3", "bin/herdr-sandbox", "start-codex"]
+
+[[panes]]
+id = "start-claude"
+title = "Sandbox: Start Claude Code"
+placement = "overlay"
+command = ["python3", "bin/herdr-sandbox", "start-claude"]
 
 [[actions]]
 id = "execute"

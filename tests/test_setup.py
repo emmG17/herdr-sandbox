@@ -25,8 +25,10 @@ class SetupTests(unittest.TestCase):
                 plugin.setup()
                 self.assertTrue((config / "config.toml").is_file())
                 self.assertTrue((config / "codex").is_dir())
+                self.assertTrue((config / "claude").is_dir())
                 self.assertTrue(state.is_dir())
                 self.assertTrue((config / "codex").resolve().is_relative_to(config.resolve()))
+                self.assertTrue((config / "claude").resolve().is_relative_to(config.resolve()))
                 self.assertTrue((config / "herdr-sandbox").is_file())
                 self.assertEqual((config / "herdr-sandbox").stat().st_mode & 0o777, 0o700)
 

@@ -19,13 +19,21 @@ pids = 1024
 max_age = "7d"
 
 # Per-agent home under the plugin config directory. Default dirname matches the
-# agent name when omitted. Never point this at a normal user agent home.
+# agent name when omitted. Never point this at a normal user agent home
+# (~/.codex, ~/.claude) or other banned host paths (~/.claude.json).
 [codex]
 home = "codex"
+
+[claude]
+home = "claude"
+# Explicit opt-in only: when true, forward the host's ANTHROPIC_API_KEY into the
+# container as --env. Host env is never forwarded implicitly. Do not put the
+# key in this file, the repo, or the image.
+# forward_api_key = false
 
 # Interactive pane worker selection for start-codex/open when several workers exist.
 # [open]
 # id = "WORKER-001"
 
-# [execute] is removed. Use: hs codex --prompt "..." (or execute --prompt as a thin alias).
-# Authenticate with: hs login codex
+# [execute] is removed. Use: hs codex --prompt "..." or hs claude --prompt "..."
+# Authenticate with: hs login codex  or  hs login claude
