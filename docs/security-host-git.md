@@ -20,7 +20,9 @@ repository or host, including indirectly.
 ### Fetch: temporary bare repo + verified bundle
 
 1. Read the worker tip SHA from loose or packed refs (no git; refuse symlinks;
-   confine paths under the worker `.git`).
+   confine paths under the worker `.git`). The imported worker ref is
+   `refs/heads/agent/<id>` (the branch `create_worker` always creates), not
+   symbolic `HEAD`.
 2. `git init --bare` in a temporary directory.
 3. Copy **only** loose objects (`[0-9a-f]{2}/[0-9a-f]{38}`) and
    `pack/pack-*.pack` files. Skip commit-graphs, multi-pack-indexes, bitmaps,
@@ -28,7 +30,22 @@ repository or host, including indirectly.
 4. Regenerate pack indexes in the temp repo with `git index-pack`.
 5. Write the branch tip, `git bundle create`, then `git bundle verify`.
 6. `git -C <source> fetch` the bundle with `-c fetch.fsckObjects=true` and
-   `-c transfer.fsckObjects=true`.
+   `-c transfer.fsckObjects=true`, using a single forced refspec
+   `+agent/<id>:refs/heads/sandbox/<id>`, plus `--no-tags`,
+   `--no-write-fetch-head`, and `--no-recurse-submodules`.
+
+Before step 6, `validate_sandbox_result_branch` requires a concrete
+`sandbox/<id>` destination (no wildcards). If that branch is checked out in any
+source worktree (`git worktree list --porcelain`), fetch fails with a one-line
+message and leaves the worker un-fetched. Never pass `--update-head-ok` or
+`--prune`.
+
+Commit counts, changed files, and diff stats are computed only with
+`git -C <source>` against `refs/heads/sandbox/<id>` and the recorded
+`base_commit`. A zero-commit worker still creates the sandbox ref (tip equals
+base) so review commands stay predictable. Uncommitted worker changes, when
+detectable via the hardened query container, produce a warning that they are
+not in the result.
 
 The source repository is untouched until step 6. Failure or a crash before that
 fetch leaves no alternates, no dangling `sandbox/<id>` ref, and no dependency

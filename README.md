@@ -12,8 +12,8 @@ not operate directly in your source checkout.
 
 The plugin does not replace Herdr, automatically merge worker changes, or give
 a worker host credentials, container-engine sockets, or source-repository
-write access. `fetch` writes only `FETCH_HEAD`; cherry-picking is a separate,
-explicit action after review.
+write access. `fetch` force-updates only `refs/heads/sandbox/<id>` in the
+source repo; cherry-picking remains a separate, explicit action after review.
 
 Codex uses `danger-full-access` *inside the container*. Rootless Podman is the
 security boundary: the runtime mounts only the worker repository at
@@ -96,8 +96,18 @@ hs codex
 ```
 
 `hs codex` automatically creates or reuses a worker for the current pane and
-launches Codex in the sandbox. It works from any Herdr pane or plain shell
-without requiring action-specific environment variables.
+launches Codex in the sandbox. When the agent exits, it fetches the worker tip
+into `refs/heads/sandbox/<id>` and prints the branch name, commit count, and a
+short log. It works from any Herdr pane or plain shell without requiring
+action-specific environment variables.
+
+Review results with plain git:
+
+```sh
+git log main..sandbox/<id>
+git diff main...sandbox/<id>
+hs fetch <id>   # re-run fetch by hand (for example after switching off a checked-out sandbox branch)
+```
 
 Alternatively, use the plugin actions:
 
@@ -113,8 +123,8 @@ herdr plugin action invoke fetch --plugin dev.herdr.sandbox
 one worker, `start-codex`, `inspect`, and `fetch` select it automatically; when
 several workers exist, configure `[open].id` in `config.toml` for the pane.
 
-Review the fetched commit, changed files, and diff. To integrate it, configure
-the exact 40-character SHA reported by `fetch`:
+Review the fetched branch, changed files, and diff. To integrate via the legacy
+cherry-pick action, configure the exact 40-character SHA reported by `fetch`:
 
 ```toml
 [cherry_pick]

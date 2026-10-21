@@ -182,14 +182,19 @@ When a worker's result is fetched and the source repository HEAD has moved past 
 **Decision: Proceed as-is with notice**
 
 The plugin:
-1. Fetches the worker branch into `refs/heads/sandbox/<id>` as-is
-2. Prints a one-line notice showing both SHAs:
+1. Fetches `refs/heads/agent/<id>` into `refs/heads/sandbox/<id>` as-is
+   (forced update; `--no-write-fetch-head`; still creates the ref when the
+   commit count relative to base is zero)
+2. Prints the branch name, commit count relative to base, a short
+   `git log --oneline`, and a one-line notice showing both SHAs when HEAD moved:
    ```
    Notice: source HEAD has moved from abc123def456 to 789abc012def.
    The worker result is based on the original base commit.
    ```
 3. Does NOT auto-rebase
-4. Does NOT touch the host branch
+4. Does NOT touch the host branch (only `refs/heads/sandbox/<id>` changes)
+5. Fails cleanly if `sandbox/<id>` is checked out in any worktree; re-run with
+   `hs fetch <id>` after switching away
 
 **Rationale:**
 - **Predictable**: The user knows exactly what commit the worker started from

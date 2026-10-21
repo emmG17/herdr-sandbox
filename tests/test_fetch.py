@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +18,12 @@ loader = importlib.machinery.SourceFileLoader("herdr_sandbox_fetch", str(SCRIPT)
 spec = importlib.util.spec_from_loader(loader.name, loader)
 plugin = importlib.util.module_from_spec(spec)
 loader.exec_module(plugin)
+
+
+def source_refs(source):
+    """Return sorted refname\\tsha lines from for-each-ref (heads only)."""
+    output = git("-C", source, "for-each-ref", "--format=%(refname)%09%(objectname)", "refs/heads")
+    return [line for line in output.splitlines() if line]
 
 
 class FetchTests(unittest.TestCase):
@@ -38,6 +45,10 @@ class FetchTests(unittest.TestCase):
         git("-C", self.source, "add", "value.txt")
         git("-C", self.source, "commit", "-qm", "initial")
         self.source_head = git("-C", self.source, "rev-parse", "HEAD")
+        # Default branch name varies by git version; keep a stable main for review commands.
+        current = git("-C", self.source, "branch", "--show-current")
+        if current and current != "main":
+            git("-C", self.source, "branch", "-m", current, "main")
         self.env = patch.dict(os.environ, {
             "HERDR_PLUGIN_CONFIG_DIR": str(self.config),
             "HERDR_PLUGIN_STATE_DIR": str(self.state),
@@ -47,49 +58,264 @@ class FetchTests(unittest.TestCase):
         ready = patch.object(plugin, "check", return_value=[])
         ready.start()
         self.addCleanup(ready.stop)
+        # Avoid Podman in unit tests when probing dirty workers.
+        snapshot = patch.object(plugin, "_query_worker_git_snapshot", return_value={
+            "status_porcelain": "",
+            "log": "",
+            "status_short": "",
+            "diff": "",
+            "error": None,
+        })
+        snapshot.start()
+        self.addCleanup(snapshot.stop)
 
-    def create_committed_worker(self):
-        worker = plugin.create_worker("TEST-001", str(self.source))
+    def create_committed_worker(self, worker_id="TEST-001", contents="worker change\n"):
+        worker = plugin.create_worker(worker_id, str(self.source))
         repo = worker / "repo"
         git("-C", repo, "config", "user.name", "Worker")
         git("-C", repo, "config", "user.email", "worker@example.invalid")
-        (repo / "value.txt").write_text("worker change\n")
+        (repo / "value.txt").write_text(contents)
         (repo / "added.txt").write_text("added\n")
         git("-C", repo, "add", "value.txt", "added.txt")
         git("-C", repo, "commit", "-qm", "worker change")
         return worker, git("-C", repo, "rev-parse", "HEAD")
 
-    def test_fetches_worker_commit_without_changing_source_and_survives_destruction(self):
+    def test_fetches_into_sandbox_ref_without_changing_other_refs(self):
         worker, worker_head = self.create_committed_worker()
+        refs_before = source_refs(self.source)
         branch_before = git("-C", self.source, "branch", "--show-current")
         status_before = git("-C", self.source, "status", "--porcelain")
 
         result = plugin.fetch_worker("TEST-001")
 
         self.assertEqual(result["commit"], worker_head)
-        self.assertEqual(git("-C", self.source, "rev-parse", "FETCH_HEAD"), worker_head)
+        self.assertEqual(result["branch"], "sandbox/TEST-001")
+        self.assertEqual(result["commit_count"], 1)
+        self.assertEqual(
+            git("-C", self.source, "rev-parse", "refs/heads/sandbox/TEST-001"),
+            worker_head,
+        )
+        self.assertIn("worker change", result["log_oneline"])
         self.assertEqual(result["changed_files"], ["added.txt", "value.txt"])
         self.assertIn("added.txt", result["diff_stat"])
         self.assertEqual(git("-C", self.source, "rev-parse", "HEAD"), self.source_head)
         self.assertEqual(git("-C", self.source, "branch", "--show-current"), branch_before)
         self.assertEqual(git("-C", self.source, "status", "--porcelain"), status_before)
 
+        refs_after = source_refs(self.source)
+        added = set(refs_after) - set(refs_before)
+        removed = set(refs_before) - set(refs_after)
+        self.assertEqual(removed, set())
+        self.assertEqual(added, {f"refs/heads/sandbox/TEST-001\t{worker_head}"})
+
+        # FETCH_HEAD must not be required; --no-write-fetch-head is intentional.
+        fetch_head = self.source / ".git" / "FETCH_HEAD"
+        if fetch_head.exists():
+            self.assertNotIn(worker_head, fetch_head.read_text())
+
+        review = plugin.format_fetch_result(result)
+        self.assertIn("Branch: sandbox/TEST-001", review)
+        self.assertIn("Commits: 1", review)
+        self.assertIn("Review: git log", review)
+
         with patch.object(plugin, "remove_worker_container"):
             self.assertTrue(plugin.destroy_worker("TEST-001"))
         self.assertFalse(worker.exists())
-        self.assertEqual(git("-C", self.source, "rev-parse", "FETCH_HEAD"), worker_head)
-        self.assertEqual(git("-C", self.source, "show", "--format=%s", "--no-patch", "FETCH_HEAD"), "worker change")
+        self.assertEqual(
+            git("-C", self.source, "rev-parse", "refs/heads/sandbox/TEST-001"),
+            worker_head,
+        )
+        self.assertEqual(
+            git("-C", self.source, "show", "--format=%s", "--no-patch", "sandbox/TEST-001"),
+            "worker change",
+        )
+        self.assertEqual(
+            git("-C", self.source, "rev-list", "--count", "main..sandbox/TEST-001"),
+            "1",
+        )
 
-    def test_fetch_action_reads_fixed_worker_id_and_reports_review_details(self):
-        (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + '\n[fetch]\nid = "configured"\n')
-        result = {"commit": "a" * 40, "changed_files": ["one.py"], "diff_stat": " one.py | 1 +\n"}
-        with patch.object(plugin.sys, "argv", [str(SCRIPT), "fetch"]), \
+    def test_refetch_force_updates_only_sandbox_ref(self):
+        worker, first_head = self.create_committed_worker()
+        plugin.fetch_worker("TEST-001")
+        refs_mid = source_refs(self.source)
+
+        repo = worker / "repo"
+        (repo / "value.txt").write_text("second change\n")
+        git("-C", repo, "commit", "-qam", "second change")
+        second_head = git("-C", repo, "rev-parse", "HEAD")
+
+        result = plugin.fetch_worker("TEST-001")
+        self.assertEqual(result["commit"], second_head)
+        self.assertEqual(result["commit_count"], 2)
+        self.assertEqual(
+            git("-C", self.source, "rev-parse", "refs/heads/sandbox/TEST-001"),
+            second_head,
+        )
+
+        refs_after = source_refs(self.source)
+        changed = set(refs_after) - set(refs_mid)
+        removed = set(refs_mid) - set(refs_after)
+        # Old sandbox tip line removed; new tip line added; nothing else.
+        self.assertEqual(removed, {f"refs/heads/sandbox/TEST-001\t{first_head}"})
+        self.assertEqual(changed, {f"refs/heads/sandbox/TEST-001\t{second_head}"})
+
+    def test_checked_out_sandbox_branch_fails_cleanly(self):
+        _, worker_head = self.create_committed_worker()
+        plugin.fetch_worker("TEST-001")
+        git("-C", self.source, "switch", "-q", "sandbox/TEST-001")
+        # Advance worker so a successful fetch would move the tip.
+        worker_repo = self.state / "workers" / "TEST-001" / "repo"
+        (worker_repo / "value.txt").write_text("after checkout\n")
+        git("-C", worker_repo, "commit", "-qam", "after checkout")
+        new_head = git("-C", worker_repo, "rev-parse", "HEAD")
+
+        with self.assertRaises(ValueError) as raised:
+            plugin.fetch_worker("TEST-001")
+        message = str(raised.exception)
+        self.assertIn("sandbox/TEST-001 is checked out", message)
+        self.assertIn("hs fetch TEST-001", message)
+
+        self.assertEqual(
+            git("-C", self.source, "rev-parse", "refs/heads/sandbox/TEST-001"),
+            worker_head,
+        )
+        self.assertNotEqual(worker_head, new_head)
+        with (self.state / "workers" / "TEST-001" / "worker.json").open() as stream:
+            metadata = json.load(stream)
+        self.assertEqual(metadata["fetched_commit"], worker_head)
+
+    def test_zero_commits_still_creates_sandbox_ref(self):
+        plugin.create_worker("EMPTY-001", str(self.source))
+        result = plugin.fetch_worker("EMPTY-001")
+        self.assertEqual(result["commit_count"], 0)
+        self.assertEqual(result["commit"], self.source_head)
+        self.assertEqual(
+            git("-C", self.source, "rev-parse", "refs/heads/sandbox/EMPTY-001"),
+            self.source_head,
+        )
+        review = plugin.format_fetch_result(result)
+        self.assertIn("no commits beyond base", review)
+
+    def test_dirty_worker_prints_warning(self):
+        self.create_committed_worker()
+        with patch.object(plugin, "_query_worker_git_snapshot", return_value={
+            "status_porcelain": " M value.txt",
+            "log": "",
+            "status_short": " M value.txt",
+            "diff": "",
+            "error": None,
+        }):
+            result = plugin.fetch_worker("TEST-001")
+        self.assertIn("uncommitted changes", result["dirty_warning"])
+        self.assertIn("uncommitted changes", plugin.format_fetch_result(result))
+
+    def test_counts_and_diffs_use_only_source_repo(self):
+        self.create_committed_worker()
+        observed = []
+        real_run = subprocess.run
+
+        def tracking_run(command, **kwargs):
+            command = list(command)
+            if command and command[0] == "git":
+                observed.append(command)
+            return real_run(command, **kwargs)
+
+        with patch.object(plugin.subprocess, "run", side_effect=tracking_run):
+            result = plugin.fetch_worker("TEST-001")
+
+        worker_repo = str((self.state / "workers" / "TEST-001" / "repo").resolve())
+        source = str(self.source.resolve())
+        for command in observed:
+            joined = " ".join(command)
+            if "-C" in command:
+                index = command.index("-C")
+                cwd_target = str(Path(command[index + 1]).resolve())
+                self.assertNotEqual(cwd_target, worker_repo, joined)
+                if any(token in command for token in ("rev-list", "diff", "log", "rev-parse")):
+                    # Diff/count/log against the fetched ref must be source-only.
+                    if "bundle" not in command and "index-pack" not in command:
+                        self.assertEqual(cwd_target, source, joined)
+            self.assertNotIn(worker_repo, command, joined)
+
+        self.assertEqual(result["commit_count"], 1)
+        # Explicit acceptance shape: rev-list count in the source against sandbox ref.
+        self.assertEqual(
+            git("-C", self.source, "rev-list", "--count", f"{self.source_head}..refs/heads/sandbox/TEST-001"),
+            "1",
+        )
+
+    def test_rejects_non_sandbox_destination(self):
+        with self.assertRaises(ValueError):
+            plugin.validate_sandbox_result_branch("main")
+        with self.assertRaises(ValueError):
+            plugin.validate_sandbox_result_branch("sandbox/*")
+        with self.assertRaises(ValueError):
+            plugin.validate_sandbox_result_branch("sandbox/../evil")
+        self.assertEqual(plugin.validate_sandbox_result_branch("sandbox/ok-1"), "sandbox/ok-1")
+
+    def test_fetch_action_accepts_positional_id_and_reports_review_details(self):
+        result = {
+            "commit": "a" * 40,
+            "branch": "sandbox/configured",
+            "commit_count": 2,
+            "log_oneline": "aaaa worker",
+            "changed_files": ["one.py"],
+            "diff_stat": " one.py | 1 +\n",
+            "base_commit": "b" * 40,
+        }
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "fetch", "configured"]), \
                 patch.object(plugin, "fetch_worker", return_value=result) as fetch, \
                 patch("sys.stdout", new_callable=io.StringIO) as output:
             self.assertEqual(plugin.main(), 0)
         fetch.assert_called_once_with("configured")
-        self.assertIn("Commit: " + "a" * 40, output.getvalue())
-        self.assertIn("Changed files:\none.py", output.getvalue())
+        text = output.getvalue()
+        self.assertIn("Branch: sandbox/configured", text)
+        self.assertIn("Commits: 2", text)
+        self.assertIn("Commit: " + "a" * 40, text)
+        self.assertIn("Changed files:\none.py", text)
+
+    def test_fetch_action_reads_configured_id(self):
+        (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + '\n[fetch]\nid = "configured"\n')
+        result = {
+            "commit": "a" * 40,
+            "branch": "sandbox/configured",
+            "commit_count": 1,
+            "log_oneline": "",
+            "changed_files": ["one.py"],
+            "diff_stat": " one.py | 1 +\n",
+            "base_commit": "b" * 40,
+        }
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "fetch"]), \
+                patch.object(plugin, "fetch_worker", return_value=result) as fetch, \
+                patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(plugin.main(), 0)
+        fetch.assert_called_once_with("configured")
+
+    def test_hs_codex_fetches_after_agent_exit(self):
+        worker = plugin.create_worker("AUTO-001", str(self.source))
+        repo = worker / "repo"
+        git("-C", repo, "config", "user.name", "Worker")
+        git("-C", repo, "config", "user.email", "worker@example.invalid")
+        (repo / "auto.txt").write_text("auto\n")
+        git("-C", repo, "add", "auto.txt")
+        git("-C", repo, "commit", "-qm", "auto")
+        worker_head = git("-C", repo, "rev-parse", "HEAD")
+
+        with patch.object(plugin, "check_root"), \
+                patch.object(plugin, "resolve_source_repo_from_cwd", return_value=self.source), \
+                patch.object(plugin, "check_dirty_tree", return_value=False), \
+                patch.object(plugin, "ensure_image_exists"), \
+                patch.object(plugin, "find_reusable_worker", return_value=("AUTO-001", None)), \
+                patch.object(plugin, "open_worker", return_value=0) as opened, \
+                patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            code = plugin.hs_codex([])
+        self.assertEqual(code, 0)
+        opened.assert_called_once()
+        self.assertEqual(
+            git("-C", self.source, "rev-parse", "refs/heads/sandbox/AUTO-001"),
+            worker_head,
+        )
+        self.assertIn("Branch: sandbox/AUTO-001", stdout.getvalue())
 
     def test_manifest_exposes_fetch_action(self):
         with (SCRIPT.parent.parent / "herdr-plugin.toml").open("rb") as stream:

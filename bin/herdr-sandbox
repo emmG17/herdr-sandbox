@@ -254,6 +254,55 @@ def _index_copied_packs(bare_repo, pack_files):
             )
 
 
+def validate_sandbox_result_branch(branch):
+    """Validate a forced-update destination under refs/heads/sandbox/ only.
+
+    Wildcards and prune-style patterns are rejected. The forced update may only
+    target a single concrete sandbox/<id> branch.
+    """
+    if not isinstance(branch, str) or not branch:
+        raise ValueError("Sandbox result branch is required.")
+    if not branch.startswith("sandbox/"):
+        raise ValueError(
+            f"Forced fetch destination must be under sandbox/: {branch!r}"
+        )
+    rest = branch[len("sandbox/"):]
+    if not rest or any(part in {"", ".", ".."} for part in rest.split("/")):
+        raise ValueError(f"Invalid sandbox result branch: {branch!r}")
+    if any(char in branch for char in "*?[]\\"):
+        raise ValueError(f"Sandbox result branch must not contain wildcards: {branch!r}")
+    if branch.startswith("-") or any(char.isspace() for char in branch):
+        raise ValueError(f"Invalid sandbox result branch: {branch!r}")
+    check = run("git", "check-ref-format", "--branch", branch)
+    if check.returncode:
+        raise ValueError(f"Invalid sandbox result branch: {branch!r}")
+    return branch
+
+
+def _sandbox_branch_checkout_path(source_repo, sandbox_branch):
+    """Return the worktree path if sandbox_branch is checked out, else None.
+
+    Git refuses to fetch into a checked-out branch. Callers must fail before
+    fetch; never pass --update-head-ok.
+    """
+    validate_sandbox_result_branch(sandbox_branch)
+    full_ref = f"refs/heads/{sandbox_branch}"
+    result = run("git", "-C", str(source_repo), "worktree", "list", "--porcelain")
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "git worktree list failed"
+        raise ValueError(f"Unable to list worktrees in {source_repo}: {detail}")
+    current_path = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            current_path = line[len("worktree "):]
+        elif line.startswith("branch ") and current_path is not None:
+            if line[len("branch "):] == full_ref:
+                return current_path
+        elif line == "":
+            current_path = None
+    return None
+
+
 def _safe_fetch_from_worker(source_repo, worker_repo, worker_branch, target_branch):
     """Import a worker branch into the source repo without trusting worker git config.
 
@@ -263,14 +312,25 @@ def _safe_fetch_from_worker(source_repo, worker_repo, worker_branch, target_bran
        `git index-pack` (skip commit-graph/MIDX/bitmaps/info).
     4. Write the branch tip in the temp repo and create a git bundle there.
     5. `git bundle verify`, then `git -C <source> fetch` with fsckObjects into
-       the source repo only.
+       the source repo only, forced to refs/heads/sandbox/<id>.
 
     The source repository is untouched until step 5. Failure or a crash before a
     successful fetch leaves no alternates, no dangling sandbox ref, and no
     dependency on the worker object store.
+
+    Destination validation: only a concrete refs/heads/sandbox/<id> may be
+    updated. Never uses wildcard refspecs, --prune, or --update-head-ok.
     """
     source_repo = Path(source_repo)
     worker_repo = Path(worker_repo)
+    target_branch = validate_sandbox_result_branch(target_branch)
+    if not isinstance(worker_branch, str) or not worker_branch or worker_branch.startswith("-"):
+        raise ValueError(f"Invalid worker branch: {worker_branch!r}")
+    if any(char in worker_branch for char in "*?[]\\") or any(
+        part in {"", ".", ".."} for part in worker_branch.split("/")
+    ):
+        raise ValueError(f"Invalid worker branch: {worker_branch!r}")
+
     worker_commit = _safe_read_worker_ref(worker_repo, worker_branch)
     if worker_commit is None:
         raise ValueError(f"Worker branch {worker_branch} does not exist")
@@ -318,16 +378,20 @@ def _safe_fetch_from_worker(source_repo, worker_repo, worker_branch, target_bran
         if verify.returncode:
             raise ValueError(verify.stderr.strip() or "Worker bundle failed verification")
 
-        # Only now touch the source repo. git fetch updates the ref atomically.
+        # Single forced refspec into sandbox/ only. No wildcards, no --prune,
+        # no --update-head-ok. Results live on the branch, not FETCH_HEAD.
+        refspec = f"+{worker_branch}:refs/heads/{target_branch}"
         fetch = subprocess.run(
             [
                 "git",
                 "-c", "fetch.fsckObjects=true",
                 "-c", "transfer.fsckObjects=true",
                 "-C", str(source_repo), "fetch",
-                "--no-tags", "--force", "--no-recurse-submodules",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
                 str(bundle_path),
-                f"{worker_branch}:refs/heads/{target_branch}",
+                refspec,
             ],
             capture_output=True,
             text=True,
@@ -899,12 +963,23 @@ def resolve_open_worker(worker_id, config_dir):
 def fetch_worker(worker_id, state_dir=None):
     """Fetch a worker branch into its source repository for later review.
 
-    Imports the worker tip into refs/heads/sandbox/<id> via a verified git
-    bundle built from copied objects in a temporary bare repo. Host git never
-    uses the worker clone as cwd or -C, so worker .git/config is never read.
-    The source repository is unchanged until the final bundle fetch succeeds.
+    Imports the worker tip (refs/heads/agent/<id>) into
+    refs/heads/sandbox/<id> via a verified git bundle built from copied objects
+    in a temporary bare repo. Host git never uses the worker clone as cwd or -C,
+    so worker .git/config is never read. The source repository is unchanged until
+    the final bundle fetch succeeds.
+
+    Worker ref choice: agent/<id>, not HEAD. create_worker always creates that
+    branch for the worker tip; reading the named ref via confined files matches
+    the safe import path and avoids ambiguous detached-HEAD tips.
+
+    Zero commits: the sandbox/<id> ref is still created (pointing at the same
+    tip as base) so review commands and GC status stay predictable.
+
     If the source HEAD has moved past the worker's base commit, a notice is
-    included but the fetch still proceeds as-is.
+    included but the fetch still proceeds as-is. If sandbox/<id> is checked out
+    in any worktree, fetch fails before touching the source and leaves the
+    worker un-fetched.
     """
     _, worker_dir = worker_storage(worker_id, state_dir)
     repo = worker_dir / "repo"
@@ -924,61 +999,99 @@ def fetch_worker(worker_id, state_dir=None):
         raise ValueError(source_error)
     source = Path(git("-C", source, "rev-parse", "--show-toplevel")).resolve()
     branch = f"agent/{validate_worker_id(worker_id)}"
-    sandbox_branch = f"sandbox/{worker_id}"
+    sandbox_branch = validate_sandbox_result_branch(f"sandbox/{worker_id}")
     base_commit = metadata.get("base_commit")
     if not isinstance(base_commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", base_commit):
         raise ValueError(f"Worker metadata has no valid base commit: {metadata_path}")
 
+    checkout_path = _sandbox_branch_checkout_path(source, sandbox_branch)
+    if checkout_path is not None:
+        raise ValueError(
+            f"sandbox/{worker_id} is checked out in {checkout_path}; "
+            f"switch away and run `hs fetch {worker_id}`"
+        )
+
     current_head = git("-C", source, "rev-parse", "HEAD")
     head_moved = current_head != base_commit
-    
-    # Use safe fetch that doesn't execute worker config
+
     try:
-        fetched_commit = _safe_fetch_from_worker(source, repo, branch, sandbox_branch)
+        _safe_fetch_from_worker(source, repo, branch, sandbox_branch)
     except ValueError as exc:
-        raise ValueError(f"Failed to fetch worker branch: {exc}")
-    
-    # Verify the fetched commit matches what we expect
+        raise ValueError(f"Failed to fetch worker branch: {exc}") from exc
+
+    # Counts and diffs are computed only in the source repo against the fetched ref.
     commit = git("-C", source, "rev-parse", "--verify", f"refs/heads/{sandbox_branch}^{{commit}}")
-    changed_files = [name for name in git("-C", source, "diff", "--no-ext-diff", "--name-only", f"{base_commit}...{sandbox_branch}").splitlines() if name]
+    commit_count = int(git("-C", source, "rev-list", "--count", f"{base_commit}..{sandbox_branch}"))
+    log_oneline = git(
+        "-C", source, "log", "--oneline", "--no-decorate", "-n", "10",
+        f"{base_commit}..{sandbox_branch}",
+    )
+    changed_files = [
+        name for name in git(
+            "-C", source, "diff", "--no-ext-diff", "--name-only",
+            f"{base_commit}...{sandbox_branch}",
+        ).splitlines() if name
+    ]
     diff_stat = git("-C", source, "diff", "--no-ext-diff", "--stat", f"{base_commit}...{sandbox_branch}")
-    
+
+    dirty_warning = None
+    snapshot = _query_worker_git_snapshot(worker_id, base_commit=base_commit)
+    if snapshot.get("error") is None and snapshot.get("status_porcelain"):
+        dirty_warning = (
+            "Warning: the worker has uncommitted changes that are not included "
+            "in this result."
+        )
+
     _update_worker_metadata(worker_dir, {
         "status": "fetched",
         "result_branch": sandbox_branch,
         "fetched_commit": commit,
     })
-    
+
     result = {
         "commit": commit,
         "branch": sandbox_branch,
+        "commit_count": commit_count,
+        "log_oneline": log_oneline,
         "changed_files": changed_files,
         "diff_stat": diff_stat,
         "base_commit": base_commit,
         "current_head": current_head,
         "head_moved": head_moved,
     }
-    
+    if dirty_warning:
+        result["dirty_warning"] = dirty_warning
     if head_moved:
         result["head_moved_notice"] = (
             f"Notice: source HEAD has moved from {base_commit[:12]} to {current_head[:12]}. "
             f"The worker result is based on the original base commit."
         )
-    
     return result
 
 
 def format_fetch_result(result):
-    """Format the fetched commit and review summary without implying integration."""
+    """Format the fetched branch, commit count, and review summary."""
+    branch = result.get("branch", "-")
     files = "\n".join(result["changed_files"]) or "(none)"
     stat = result["diff_stat"] or "(no changes)"
+    count = result.get("commit_count")
+    count_line = f"Commits: {count}" if count is not None else "Commits: -"
     lines = [
-        f"Branch: {result.get('branch', '-')}",
+        f"Branch: {branch}",
+        count_line,
         f"Commit: {result['commit']}",
     ]
+    if result.get("dirty_warning"):
+        lines.append(result["dirty_warning"])
     if result.get("head_moved_notice"):
         lines.append(result["head_moved_notice"])
+    log_oneline = (result.get("log_oneline") or "").strip()
+    if log_oneline:
+        lines.extend(["Log:", log_oneline])
+    elif count == 0:
+        lines.append("Log: (no commits beyond base; sandbox ref still created)")
     lines.extend([
+        f"Review: git log {result.get('base_commit', 'BASE')[:12]}..{branch}",
         "Changed files:",
         files,
         "Diff stat:",
@@ -2393,13 +2506,32 @@ def hs_codex(codex_args):
         if head_moved_notice:
             print(head_moved_notice, file=sys.stderr)
     
-    # Launch Codex with fresh session
+    # Launch Codex with fresh session, then fetch results into sandbox/<id>.
     try:
         command = ["codex"] + codex_args
-        return open_worker(worker_id, command, fresh=True)
+        exit_code = open_worker(worker_id, command, fresh=True)
     except Exception as exc:
         print(f"Worker launch failed: {exc}", file=sys.stderr)
         return 1
+
+    try:
+        print(format_fetch_result(fetch_worker(worker_id, state_dir)))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        print(
+            f"Worker {worker_id} was left un-fetched. "
+            f"Switch away from sandbox/{worker_id} if it is checked out, then run: hs fetch {worker_id}",
+            file=sys.stderr,
+        )
+        return exit_code if exit_code else 1
+    return exit_code
+
+
+def resolve_fetch_worker(worker_id, config_dir):
+    """Resolve a fetch target from a positional/option ID, config, or sole worker."""
+    if worker_id:
+        return worker_id
+    return configured_or_sole_worker(None, config_dir, fetch_options, "fetch")
 
 
 def main():
@@ -2415,8 +2547,9 @@ def main():
     create_parser.add_argument("--id", help="Worker ID (prompted for in an interactive terminal)")
     create_parser.add_argument("--repo", help="Source repository (defaults to the Herdr workspace)")
     create_parser.add_argument("--base", help="Base ref or commit (default: HEAD)")
-    fetch_parser = commands.add_parser("fetch", help="Fetch one worker commit for review")
-    fetch_parser.add_argument("--id", help="Worker ID (or configure [fetch].id)")
+    fetch_parser = commands.add_parser("fetch", help="Fetch worker HEAD into refs/heads/sandbox/<id>")
+    fetch_parser.add_argument("worker_id", nargs="?", help="Worker ID")
+    fetch_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (or configure [fetch].id)")
     cherry_pick_parser = commands.add_parser("cherry-pick", help="Cherry-pick one reviewed worker commit")
     cherry_pick_parser.add_argument("--id", help="Worker ID (or configure [cherry_pick].id)")
     cherry_pick_parser.add_argument("--commit", help="Full reviewed commit SHA (or configure [cherry_pick].commit)")
@@ -2479,7 +2612,10 @@ def main():
             print(f"Destroyed worker: {worker_id}" if removed else f"Worker already absent: {worker_id}")
         elif args.command == "fetch":
             config_dir, _ = paths()
-            worker_id = configured_or_sole_worker(args.id, config_dir, fetch_options, "fetch")
+            worker_id = resolve_fetch_worker(
+                args.worker_id or args.option_worker_id,
+                config_dir,
+            )
             print(format_fetch_result(fetch_worker(worker_id)))
         elif args.command == "cherry-pick":
             config_dir, _ = paths()
