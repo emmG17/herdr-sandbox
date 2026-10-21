@@ -84,15 +84,20 @@ class WorkerInspectionTests(unittest.TestCase):
         git("-C", clone, "commit", "-qam", "worker change")
         (clone / "untracked.txt").write_text("untracked\n")
 
-        record = plugin.inspect_worker("TEST-001")
+        with patch.object(plugin, "_query_worker_git_in_container") as query:
+            query.side_effect = [
+                (0, " M value.txt\n?? untracked.txt", ""),  # status --porcelain
+                (0, "abc123 worker change", ""),  # log
+                (0, "## agent/TEST-001\n M value.txt\n?? untracked.txt", ""),  # status --short
+                (0, "diff --git a/value.txt\nworker change", ""),  # diff
+            ]
+            record = plugin.inspect_worker("TEST-001")
 
         self.assertEqual(record["actual_branch"], "agent/TEST-001")
-        # dirty is now None for security (not checked on host)
-        self.assertIsNone(record["dirty"])
-        # git_log, git_status, git_diff are now omitted for security
-        self.assertIn("omitted", record["git_log"].lower())
-        self.assertIn("omitted", record["git_status"].lower())
-        self.assertIn("omitted", record["git_diff"].lower())
+        self.assertTrue(record["dirty"])
+        self.assertIn("worker change", record["git_log"])
+        self.assertIn("untracked.txt", record["git_status"])
+        self.assertIn("worker change", record["git_diff"])
         rendered = plugin.format_worker(record)
         self.assertIn("Git log:", rendered)
         self.assertIn("Git status:", rendered)

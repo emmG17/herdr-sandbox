@@ -61,11 +61,11 @@ class CompleteWorkflowTests(unittest.TestCase):
                     "-c",
                     f"from pathlib import Path; Path({str(worker_repo / 'worker.txt')!r}).write_text('worker-only change\\n'); print('completed', flush=True)",
                 ]), \
+                patch.object(plugin, "_query_worker_git_in_container", return_value=(0, "?? worker.txt", "")), \
                 patch.object(plugin.sys, "stdout", new_callable=io.StringIO) as worker_output:
             result = plugin.execute_worker("FLOW-001", "write worker.txt")
         self.assertEqual(result["exit_status"], 0)
-        # Dirty is now None for security (not checked on host)
-        self.assertIsNone(result["dirty"])
+        self.assertTrue(result["dirty"])
         self.assertIn("completed\n", worker_output.getvalue())
 
         git("-C", worker_repo, "config", "user.name", "Worker")
@@ -74,11 +74,17 @@ class CompleteWorkflowTests(unittest.TestCase):
         git("-C", worker_repo, "commit", "-qm", "worker change")
         worker_head = git("-C", worker_repo, "rev-parse", "HEAD")
 
-        with patch.object(plugin, "container_status", return_value="not-found"):
+        with patch.object(plugin, "container_status", return_value="not-found"), \
+                patch.object(plugin, "_query_worker_git_in_container") as query:
+            query.side_effect = [
+                (0, "", ""),  # status --porcelain
+                (0, "abc worker change", ""),  # log
+                (0, "## agent/FLOW-001", ""),  # status --short --branch
+                (0, "worker-only change", ""),  # diff
+            ]
             inspection = plugin.inspect_worker("FLOW-001")
         self.assertEqual(inspection["head"], worker_head)
-        # git_diff is now omitted for security (not queried on host)
-        self.assertIn("omitted", inspection["git_diff"].lower())
+        self.assertIn("worker-only change", inspection["git_diff"])
 
         fetched = plugin.fetch_worker("FLOW-001")
         self.assertEqual(fetched["commit"], worker_head)
