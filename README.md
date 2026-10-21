@@ -239,10 +239,17 @@ SANDBOX_LAUNCHER="$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox"
 The Podman command is independent of Herdr's pane cwd: it mounts only the
 selected worker clone at `/workspace`, sets the container workdir to
 `/workspace`, and starts Codex with `--cd /workspace`. Each interactive
-`start-codex` launch also gets a temporary plugin-owned `CODEX_HOME` containing
-only `auth.json`; the directory is removed when the session exits, so history
-from another worker or workspace cannot be resumed. The noninteractive
-`execute` action retains its existing shared dedicated Codex home.
+`start-codex` / `hs codex` launch also gets a temporary plugin-owned `CODEX_HOME`
+containing only `auth.json`; the directory is removed when the session exits,
+so history from another worker or workspace cannot be resumed.
+
+Noninteractive `hs codex --prompt "..."` (and the thin `execute --prompt`
+alias) keeps the shared dedicated Codex home mount. Long noninteractive runs
+can refresh tokens in place under that home; a per-launch temp home would
+discard those writes when the session ends. Issue #11 owns the token-refresh
+decision for every profile (write-back of `auth.json`, never write back, or
+mount auth alone). Until #11 lands, `--prompt` continues to use the shared
+home and does not write tokens back from a temp home.
 
 ## Customize the worker image
 
@@ -286,28 +293,38 @@ max_age = "7d"
 
 ## Advanced use and troubleshooting
 
-For noninteractive automation, configure `[execute].id` and `[execute].prompt`
-then invoke `execute`. Codex stdout and stderr are streamed to the action while
-it runs. Every invocation also writes a durable result and output log beneath
-the worker directory at `runs/<run-id>/result.json` and
-`runs/<run-id>/output.log`. The final action summary prints both paths, and
-`hs inspect` (and the inspect action) expose the latest run as a compact
-summary; `hs ls` stays limited to the RFC columns. You may configure
-action-specific IDs for `fetch` or the interactive `start-codex` pane via
-`[open].id` when multiple workers exist. Direct script use requires Herdr's
-own paths; do not invent storage locations:
+For noninteractive automation from a clean source tree:
+
+```sh
+hs codex --prompt "Implement the requested change and run the relevant tests."
+# Long prompts: hs codex --prompt - < prompt.txt
+```
+
+This reuses the interactive launcher path (generated worker ID, dirty-tree
+refusal, state store/lock, auto-fetch into `sandbox/<id>`). Codex stdout and
+stderr stream live; stdin to the agent is closed. The process exits with the
+agent's exit status. Every run also writes `runs/<run-id>/result.json` and
+`runs/<run-id>/output.log` under the worker directory. `result.json` keeps its
+existing keys and adds `result_branch` and `commit_count` (computed in the
+**source** repo against the fetched `sandbox/<id>` ref). `hs inspect` exposes
+the latest run; `hs ls` stays limited to the RFC columns. `[execute]` in
+`config.toml` is ignored with a one-line deprecation notice. `execute --prompt`
+remains a thin alias until thin action wrappers land.
+
+You may configure action-specific IDs for `fetch` or the interactive
+`start-codex` pane via `[open].id` when multiple workers exist. Direct script
+use requires Herdr's own paths; do not invent storage locations:
 
 ```sh
 HERDR_PLUGIN_CONFIG_DIR=/path/to/config HERDR_PLUGIN_STATE_DIR=/path/to/state \
 python3 bin/herdr-sandbox create --id WORKER-001 --repo /path/to/source-repo --base main
 ```
 
-### One-off execute and remove inputs
+### One-off prompt and remove inputs
 
 Herdr 0.9.0 plugin actions have fixed command arguments. `herdr plugin action
-invoke` does not forward arguments after the action ID, so a command such as
-`herdr plugin action invoke execute -- --id WORKER-001` cannot provide
-per-invocation values. Avoid editing `config.toml` just for a one-off run.
+invoke` does not forward arguments after the action ID, so prefer `hs` on
+`PATH` or the bound launcher for per-run prompts.
 
 Setup/bootstrap creates an executable launcher at the plugin config directory,
 which can be found without discovering Herdr's state directory:
@@ -315,8 +332,9 @@ which can be found without discovering Herdr's state directory:
 ```sh
 SANDBOX_LAUNCHER="$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox"
 
-"$SANDBOX_LAUNCHER" execute --id WORKER-001 \
-  --prompt "Implement the requested change and run the relevant tests."
+hs codex --prompt "Implement the requested change and run the relevant tests."
+# Thin alias (same launcher path):
+"$SANDBOX_LAUNCHER" execute --prompt "Implement the requested change and run the relevant tests."
 
 "$SANDBOX_LAUNCHER" fetch WORKER-001
 
@@ -325,14 +343,12 @@ SANDBOX_LAUNCHER="$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox"
 "$SANDBOX_LAUNCHER" destroy --id WORKER-001
 ```
 
-These direct invocations are one-shot overrides: each command requires all of
-its inputs and does not read that action's config table. The launcher safely
-binds the Herdr-provided config and state directories to the plugin script and
-forwards arguments directly, without shell evaluation. It still uses the same
-hardened runtime, worker-path validation, and remove ordering as the
-corresponding Herdr action. After `fetch`, integrate with plain git on
-`sandbox/<id>`. Rerun setup/bootstrap after changing the plugin installation so
-the launcher refreshes its bound script path.
+The launcher safely binds the Herdr-provided config and state directories to the
+plugin script and forwards arguments directly, without shell evaluation. It
+still uses the same hardened runtime, worker-path validation, and remove
+ordering as the corresponding Herdr action. After auto-fetch (or `hs fetch`),
+integrate with plain git on `sandbox/<id>`. Rerun setup/bootstrap after changing
+the plugin installation so the launcher refreshes its bound script path.
 
 The plugin waits for the Codex process it starts, but it cannot add a separate
 `--wait` or status protocol to Herdr's plugin-action API. Herdr 0.9.0 controls

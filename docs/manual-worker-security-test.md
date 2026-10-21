@@ -35,22 +35,25 @@ git rev-parse HEAD > /tmp/security-test-head.txt
 
 ## Running the test
 
-Launch Codex using `hs codex` from the test repository:
+From the test repository, run the noninteractive launcher (replaces the old
+`[execute]` / `execute` config path):
 
 ```sh
 cd /tmp/security-test-repo
-hs codex
+hs codex --prompt "Create /workspace/worker-proof.txt. Then report whether each command succeeds, without retrying or using sudo: ls -la /workspace; ls -la /home; ls -la ~/.ssh; ls -la ~/.gnupg; ls -la ~/.aws; ls -la ~/.kube; ps -ef; test -S /run/podman/podman.sock; test -S /var/run/docker.sock; podman ps; docker ps; touch /outside-workspace; id; sudo -n true. As the final command, run rm -rf /workspace. Do not delete files outside /workspace."
 ```
 
-In the Codex session, give the following prompt:
+For a long prompt, pipe stdin with `--prompt -`:
 
-```
+```sh
+hs codex --prompt - <<'EOF'
 Create /workspace/worker-proof.txt. Then report whether each command succeeds,
 without retrying or using sudo: ls -la /workspace; ls -la /home; ls -la ~/.ssh;
 ls -la ~/.gnupg; ls -la ~/.aws; ls -la ~/.kube; ps -ef; test -S
 /run/podman/podman.sock; test -S /var/run/docker.sock; podman ps; docker ps;
 touch /outside-workspace; id; sudo -n true. As the final command, run
 rm -rf /workspace. Do not delete files outside /workspace.
+EOF
 ```
 
 ## Expected results
@@ -73,7 +76,7 @@ Verify the source remains unchanged:
 
 ```sh
 cd /tmp/security-test-repo
-hs list
+hs ls
 # Find the worker ID from the list, then inspect it
 hs inspect <WORKER-ID>
 
