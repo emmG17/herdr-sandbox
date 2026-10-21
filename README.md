@@ -435,8 +435,7 @@ agent's exit status. Every run also writes `runs/<run-id>/result.json` and
 existing keys and adds `result_branch` and `commit_count` (computed in the
 **source** repo against the fetched `sandbox/<id>` ref). `hs inspect` exposes
 the latest run; `hs ls` stays limited to the RFC columns. Legacy per-action
-tables in an old `config.toml` (`[open]`, `[execute]`, and the rest) are
-ignored with a single deprecation notice.
+tables in an old `config.toml` are ignored with a single deprecation notice.
 
 ### One-off prompt and remove inputs
 
