@@ -261,6 +261,90 @@ class ExecuteWorkerTests(unittest.TestCase):
         execute.assert_called_once_with("TEST-001", "do the task")
         printed.assert_called_once()
 
+    def test_hs_codex_prompt_fetch_failure_after_success_returns_one(self):
+        with patch.object(plugin, "prepare_hs_worker", return_value=("TEST-001", self.state)), \
+                patch.object(plugin, "execute_worker", return_value={
+                    "worker_id": "TEST-001",
+                    "run_id": "run-test",
+                    "exit_status": 0,
+                    "head": "unavailable",
+                    "dirty": False,
+                    "git_status": "",
+                    "result_branch": None,
+                    "commit_count": None,
+                    "result_location": "/tmp/result.json",
+                    "log_location": "/tmp/output.log",
+                }), \
+                patch.object(plugin, "print_execution_result"):
+            self.assertEqual(plugin.hs_codex([], prompt="do the task"), 1)
+
+    def test_hs_codex_prompt_fetch_failure_preserves_nonzero_agent_exit(self):
+        with patch.object(plugin, "prepare_hs_worker", return_value=("TEST-001", self.state)), \
+                patch.object(plugin, "execute_worker", return_value={
+                    "worker_id": "TEST-001",
+                    "run_id": "run-test",
+                    "exit_status": 9,
+                    "head": "unavailable",
+                    "dirty": False,
+                    "git_status": "",
+                    "result_branch": None,
+                    "commit_count": None,
+                    "result_location": "/tmp/result.json",
+                    "log_location": "/tmp/output.log",
+                }), \
+                patch.object(plugin, "print_execution_result"):
+            self.assertEqual(plugin.hs_codex([], prompt="do the task"), 9)
+
+    def test_hs_codex_prompt_propagates_negative_signal_exit_status(self):
+        with patch.object(plugin, "prepare_hs_worker", return_value=("TEST-001", self.state)), \
+                patch.object(plugin, "execute_worker", return_value={
+                    "worker_id": "TEST-001",
+                    "run_id": "run-test",
+                    "exit_status": -15,
+                    "head": "abc",
+                    "dirty": False,
+                    "git_status": "",
+                    "result_branch": "sandbox/TEST-001",
+                    "commit_count": 0,
+                    "result_location": "/tmp/result.json",
+                    "log_location": "/tmp/output.log",
+                }), \
+                patch.object(plugin, "print_execution_result"):
+            self.assertEqual(plugin.hs_codex([], prompt="do the task"), -15)
+
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "codex", "--prompt", "signal"]), \
+                patch.object(plugin, "hs_codex", return_value=-9) as hs_codex:
+            self.assertEqual(plugin.main(), -9)
+        hs_codex.assert_called_once_with([], prompt="signal")
+
+    def test_execute_worker_reuses_fetch_git_snapshot(self):
+        snapshot = {
+            "status_porcelain": "",
+            "log": "",
+            "status_short": "",
+            "diff": "",
+            "error": None,
+        }
+        with patch.object(plugin, "check", return_value=[]), \
+                patch.object(plugin, "execute_command", return_value=[
+                    sys.executable, "-c", "print('ok', flush=True)",
+                ]), \
+                patch.object(plugin, "fetch_worker", return_value={
+                    "commit": "a" * 40,
+                    "branch": "sandbox/TEST-001",
+                    "commit_count": 0,
+                    "git_snapshot": snapshot,
+                }) as fetch, \
+                patch.object(plugin, "_query_worker_git_snapshot") as query, \
+                patch.object(plugin.sys, "stdout", new_callable=io.StringIO), \
+                patch.object(plugin.sys, "stderr", new_callable=io.StringIO):
+            result = plugin.execute_worker("TEST-001", "noop")
+
+        fetch.assert_called_once()
+        query.assert_not_called()
+        self.assertEqual(result["result_branch"], "sandbox/TEST-001")
+        self.assertFalse(result["dirty"])
+
     def test_hs_codex_prompt_rejects_extra_codex_args(self):
         stderr = io.StringIO()
         with patch.object(plugin, "prepare_hs_worker", return_value=("TEST-001", self.state)), \

@@ -323,8 +323,10 @@ python3 bin/herdr-sandbox create --id WORKER-001 --repo /path/to/source-repo --b
 ### One-off prompt and remove inputs
 
 Herdr 0.9.0 plugin actions have fixed command arguments. `herdr plugin action
-invoke` does not forward arguments after the action ID, so prefer `hs` on
-`PATH` or the bound launcher for per-run prompts.
+invoke` does not forward arguments after the action ID, so the plugin `execute`
+action cannot receive a per-run prompt until thin action wrappers land (#15).
+Until then, prefer `hs codex --prompt "..."` on `PATH` or the bound launcher
+with `execute --prompt`.
 
 Setup/bootstrap creates an executable launcher at the plugin config directory,
 which can be found without discovering Herdr's state directory:

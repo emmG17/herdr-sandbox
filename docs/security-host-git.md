@@ -99,6 +99,9 @@ host git against attacker-controlled config. Printed review commands always use
 
 - Malicious `core.fsmonitor` / hooks / textconv / sshCommand markers for list,
   inspect, fetch, and post-run HEAD reads
+- Noninteractive `hs codex --prompt` / `execute_worker` post-run accounting
+  (`result_branch`, `commit_count`, source-repo HEAD) with a malicious worker
+  `.git/config`
 - Packed-refs resolution and fetch
 - Symlinked refs and objects rejected; source left without sandbox ref or
   alternates
