@@ -207,6 +207,8 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("Tracked files always come from git objects", readme)
         self.assertIn("O_NOFOLLOW", readme)
         self.assertIn("hardlinked into `node_modules`", readme)
+        self.assertIn("source/.git", readme)
+        self.assertIn("O_DIRECTORY", readme)
         example = (ROOT / "config.example.toml").read_text()
         self.assertIn("[workspace]", example)
         self.assertIn("copy_untracked", example)
