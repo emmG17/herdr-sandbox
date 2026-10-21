@@ -1451,24 +1451,36 @@ def gc_settings(config_dir):
 
 
 def validate_copy_untracked_entry(entry):
-    """Reject absolute paths, ``..`` segments, and any ``.git`` allowlist entry."""
-    if not isinstance(entry, str) or not entry or entry != entry.strip():
+    """Reject unsafe ``copy_untracked`` entries.
+
+    Requires a nonempty relative path that sits strictly under the source repo
+    root: no absolute paths, no empty/``.``/``./`` roots, and no ``.`` or ``..``
+    path parts. Any ``.git`` segment at any depth is rejected (walk-time skips of
+    nested ``.git`` directories are a second defense only).
+    """
+    if not isinstance(entry, str) or entry != entry.strip() or not entry:
         raise ValueError(
             "Set [workspace].copy_untracked entries to nonempty relative path strings "
             f"(got {entry!r})."
         )
     path = Path(entry)
-    if path.is_absolute() or ".." in path.parts:
+    if path.is_absolute():
         raise ValueError(
-            "[workspace].copy_untracked entries must be relative paths without '..' "
+            "[workspace].copy_untracked entries must be relative paths "
             f"(got {entry!r})."
         )
-    if path.parts and path.parts[0] == ".git":
+    if not path.parts or any(part in {".", ".."} for part in path.parts):
         raise ValueError(
-            "[workspace].copy_untracked must not include .git "
+            "[workspace].copy_untracked entries must be nonempty relative paths "
+            "strictly under the source without '.' or '..' parts "
             f"(got {entry!r})."
         )
-    return entry
+    if ".git" in path.parts:
+        raise ValueError(
+            "[workspace].copy_untracked must not include a .git path segment "
+            f"(got {entry!r})."
+        )
+    return path.as_posix()
 
 
 def workspace_settings(config_dir):
@@ -1507,65 +1519,91 @@ def _path_is_within(path, root):
         return False
 
 
-def _symlink_points_outside(link_path, source_root):
-    """Return True when a symlink's resolved target escapes source_root."""
+def _rel_under_allowlist_entry(rel, entry):
+    """Return True when relative path ``rel`` is the entry or a descendant."""
+    rel_parts = Path(rel).parts
+    entry_parts = Path(entry).parts
+    if not entry_parts or len(rel_parts) < len(entry_parts):
+        return False
+    return rel_parts[: len(entry_parts)] == entry_parts
+
+
+def _symlink_target_within_allowlist(link_path, allowlist_root):
+    """Return True when a relative symlink resolves inside ``allowlist_root``.
+
+    Absolute symlink targets are never allowed. Resolution follows the final
+    target; the target must stay inside the same allowlisted top-level entry
+    (so pnpm links within ``node_modules`` keep working).
+    """
     link_path = Path(link_path)
-    source_root = Path(source_root).resolve()
+    allowlist_root = Path(allowlist_root).resolve()
     try:
         raw = os.readlink(link_path)
     except OSError:
-        return True
-    candidate = Path(raw) if os.path.isabs(raw) else (link_path.parent / raw)
+        return False
+    if os.path.isabs(raw):
+        return False
+    candidate = link_path.parent / raw
     try:
         resolved = candidate.resolve()
     except (OSError, RuntimeError):
-        return True
-    try:
-        resolved.relative_to(source_root)
         return False
-    except ValueError:
+    try:
+        resolved.relative_to(allowlist_root)
         return True
+    except ValueError:
+        return False
 
 
 def reflink_file(src, dst):
     """Create ``dst`` as a CoW reflink of ``src`` (new inode; writes do not affect src).
 
-    Tries Linux FICLONE, then ``cp --reflink=always``. Raises OSError on failure
-    (including cross-filesystem EXDEV).
+    Opens the source with ``O_RDONLY|O_NOFOLLOW`` and requires a regular file via
+    ``fstat``/``S_ISREG``. Creates the destination with
+    ``O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW``, then ``FICLONE`` fd-to-fd. There is
+    no ``cp`` fallback (it cannot give the same TOCTOU guarantees). Raises
+    OSError on failure, including cross-filesystem EXDEV.
     """
     src = Path(src)
     dst = Path(dst)
-    if not src.is_file() or src.is_symlink():
-        raise OSError(f"Reflink source must be a regular file: {src}")
-    if dst.exists() or dst.is_symlink():
-        raise OSError(f"Reflink destination already exists: {dst}")
     dst.parent.mkdir(parents=True, exist_ok=True)
+    src_fd = os.open(str(src), os.O_RDONLY | os.O_NOFOLLOW)
     try:
-        with open(src, "rb") as src_f, open(dst, "wb") as dst_f:
-            fcntl.ioctl(dst_f.fileno(), _FICLONE, src_f.fileno())
-        shutil.copystat(src, dst, follow_symlinks=True)
-        return
-    except OSError:
-        if dst.exists():
+        src_stat = os.fstat(src_fd)
+        if not stat.S_ISREG(src_stat.st_mode):
+            raise OSError(f"Reflink source must be a regular file: {src}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        try:
+            dst_fd = os.open(str(dst), flags, stat.S_IMODE(src_stat.st_mode))
+        except FileExistsError as exc:
+            raise OSError(f"Reflink destination already exists: {dst}") from exc
+        try:
             try:
-                dst.unlink()
+                fcntl.ioctl(dst_fd, _FICLONE, src_fd)
+            except OSError:
+                os.close(dst_fd)
+                dst_fd = -1
+                try:
+                    os.unlink(dst)
+                except OSError:
+                    pass
+                raise
+            try:
+                os.fsync(dst_fd)
             except OSError:
                 pass
-    result = run("cp", "--reflink=always", "--preserve=mode,timestamps", "--", str(src), str(dst))
-    if result.returncode != 0:
-        if dst.exists():
-            try:
-                dst.unlink()
-            except OSError:
-                pass
-        detail = (result.stderr or result.stdout or "cp --reflink=always failed").strip()
-        raise OSError(detail)
+        finally:
+            if dst_fd >= 0:
+                os.close(dst_fd)
+    finally:
+        os.close(src_fd)
 
 
 def probe_reflink(source_root, state_dir):
     """Return True when a file on the source filesystem can be reflinked into state_dir.
 
-    Creates a temp probe under ``source_root`` and reflinks it into ``state_dir``.
+    Creates a temp probe under ``source_root`` and reflinks it into ``state_dir``
+    with the same ``O_NOFOLLOW``/FICLONE primitive used for allowlisted copies.
     Fails (and callers fall back to clone) when the paths are on different
     filesystems or the filesystem lacks reflink/CoW support.
     """
@@ -1617,11 +1655,12 @@ def _strip_git_alternates(clone):
 
 
 def _materialize_worker_git(source, clone, commit, branch, user_name, user_email):
-    """Build worker ``.git`` exactly like the clone strategy (no hardlinks/alternates).
+    """Build worker ``.git`` like the clone strategy (no hardlinks/alternates).
 
-    Does not populate the work tree; callers either checkout-index or reflink tracked files.
-    Source hooks, config, and info/ are not carried over: ``git clone`` creates a fresh
-    repository metadata tree from the template.
+    Does not populate the work tree; callers use ``checkout-index`` so tracked
+    bytes always come from git objects, never from the source worktree.
+    Source hooks, config, and info/ are not carried over: ``git clone`` creates a
+    fresh repository metadata tree from the template.
     """
     git("clone", "--no-hardlinks", "--no-checkout", source, clone)
     _strip_git_alternates(clone)
@@ -1632,41 +1671,110 @@ def _materialize_worker_git(source, clone, commit, branch, user_name, user_email
     git("-C", clone, "read-tree", commit)
 
 
-def _reflink_tracked_worktree(source, clone):
-    """Reflink tracked paths from the clean source work tree into the worker clone."""
-    source = Path(source)
-    clone = Path(clone)
-    listed = git("-C", source, "ls-files", "-z")
-    for rel in listed.split("\0"):
+def _list_gitlink_paths(source, commit):
+    """Return relative paths of gitlinks (mode 160000) at ``commit``."""
+    raw = git("-C", source, "ls-tree", "-r", "-z", commit)
+    gitlinks = []
+    for entry in raw.split("\0"):
+        if not entry:
+            continue
+        # ls-tree -z lines: <mode> <type> <object>\t<name>
+        meta, _, name = entry.partition("\t")
+        parts = meta.split()
+        if len(parts) >= 2 and parts[0] == "160000":
+            gitlinks.append(name)
+    return gitlinks
+
+
+def _checkout_tracked_from_objects(clone, source, commit):
+    """Materialize tracked files from git objects only; skip gitlinks with notice."""
+    gitlinks = _list_gitlink_paths(source, commit)
+    if gitlinks:
+        shown = ", ".join(gitlinks[:5])
+        more = "" if len(gitlinks) <= 5 else f" (+{len(gitlinks) - 5} more)"
+        print(
+            f"reflink: skipping {len(gitlinks)} gitlink/submodule path(s): {shown}{more}",
+            file=sys.stderr,
+        )
+    git("-C", clone, "checkout-index", "-a", "-f")
+
+
+def _iter_untracked_and_ignored_rels(source):
+    """Yield relative paths of untracked and ignored files (deduplicated)."""
+    seen = set()
+    queries = (
+        ("--others",),
+        ("--others", "--exclude-standard"),
+        ("--others", "--ignored", "--exclude-standard"),
+    )
+    for extra in queries:
+        result = run("git", "-C", str(source), "ls-files", "-z", *extra)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "git ls-files failed").strip()
+            raise ValueError(detail)
+        for rel in result.stdout.split("\0"):
+            if not rel or rel in seen:
+                continue
+            seen.add(rel)
+            yield rel
+
+
+def _forbidden_hardlink_inodes(source, copy_untracked):
+    """Return ``{(st_dev, st_ino)}`` for files that must not be reflinked via allowlist.
+
+    Includes every untracked/ignored regular file outside the allowlist (so a
+    ``.env`` hardlinked into ``node_modules`` is refused) and tracked regular
+    files outside allowlisted subtrees when cheap to collect. Directories are
+    skipped. pnpm/npm hardlinks that stay entirely inside the allowlist are kept.
+    """
+    source = Path(source).resolve()
+    forbidden = set()
+
+    def add_if_regular(rel):
+        path = source / rel
+        try:
+            st = path.lstat()
+        except OSError:
+            return
+        if stat.S_ISREG(st.st_mode):
+            forbidden.add((st.st_dev, st.st_ino))
+
+    for rel in _iter_untracked_and_ignored_rels(source):
+        if any(_rel_under_allowlist_entry(rel, entry) for entry in copy_untracked):
+            continue
+        add_if_regular(rel)
+
+    tracked = git("-C", source, "ls-files", "-z")
+    for rel in tracked.split("\0"):
         if not rel:
             continue
-        src = source / rel
-        dst = clone / rel
-        if src.is_symlink():
-            if _symlink_points_outside(src, source):
-                raise ValueError(f"Tracked symlink escapes source repository: {rel}")
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if dst.exists() or dst.is_symlink():
-                dst.unlink()
-            os.symlink(os.readlink(src), dst, target_is_directory=False)
+        if any(_rel_under_allowlist_entry(rel, entry) for entry in copy_untracked):
             continue
-        if not src.is_file():
-            raise ValueError(f"Tracked path is missing or not a regular file: {rel}")
-        reflink_file(src, dst)
+        add_if_regular(rel)
+
+    return forbidden
 
 
-def _copy_allowlisted_entry(src, dst, source_root):
-    """Copy one allowlisted path into the worker without following escaping symlinks.
+def _copy_allowlisted_entry(src, dst, allowlist_root, forbidden_inodes):
+    """Copy one path under an allowlisted tree without following unsafe symlinks.
 
-    Symlinks whose resolved target leaves ``source_root`` are skipped. Symlinked
-    directories are recreated as symlinks (or skipped), never walked through.
-    Nested ``.git`` directories are never copied.
+    Absolute symlinks are never recreated. Relative symlinks are recreated only
+    when their fully resolved target stays inside the same allowlisted top-level
+    entry. Nested ``.git`` directories are skipped at walk time as a second layer
+    after config validation. Files whose ``(dev, ino)`` appear in
+    ``forbidden_inodes`` (hardlinks to non-allowlisted paths such as ``.env``)
+    are skipped with one stderr line each.
     """
     src = Path(src)
     dst = Path(dst)
-    source_root = Path(source_root).resolve()
+    allowlist_root = Path(allowlist_root).resolve()
     if src.is_symlink():
-        if _symlink_points_outside(src, source_root):
+        raw = os.readlink(src)
+        if os.path.isabs(raw) or not _symlink_target_within_allowlist(src, allowlist_root):
+            print(
+                f"reflink: skipping symlink outside allowlist entry {allowlist_root.name}: {src}",
+                file=sys.stderr,
+            )
             return
         dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.exists() or dst.is_symlink():
@@ -1674,17 +1782,34 @@ def _copy_allowlisted_entry(src, dst, source_root):
                 shutil.rmtree(dst)
             else:
                 dst.unlink()
-        os.symlink(os.readlink(src), dst)
+        os.symlink(raw, dst)
+        return
+    if src.name == ".git":
+        # Second layer: never copy a nested .git even if validation was bypassed.
         return
     if src.is_dir():
         dst.mkdir(parents=True, exist_ok=True)
         with os.scandir(src) as entries:
             for entry in entries:
-                if entry.name == ".git":
-                    continue
-                _copy_allowlisted_entry(Path(entry.path), dst / entry.name, source_root)
+                _copy_allowlisted_entry(
+                    Path(entry.path),
+                    dst / entry.name,
+                    allowlist_root,
+                    forbidden_inodes,
+                )
         return
     if src.is_file():
+        try:
+            st = src.lstat()
+        except OSError as exc:
+            print(f"reflink: skipping unreadable allowlisted file {src}: {exc}", file=sys.stderr)
+            return
+        if (st.st_dev, st.st_ino) in forbidden_inodes:
+            print(
+                f"reflink: skipping hardlink to non-allowlisted path: {src}",
+                file=sys.stderr,
+            )
+            return
         if dst.exists() or dst.is_symlink():
             if dst.is_dir() and not dst.is_symlink():
                 shutil.rmtree(dst)
@@ -1699,17 +1824,29 @@ def copy_allowlisted_untracked(source, clone, copy_untracked):
     """Reflink allowlisted untracked/ignored paths into the worker work tree."""
     source = Path(source).resolve()
     clone = Path(clone).resolve()
+    forbidden = _forbidden_hardlink_inodes(source, copy_untracked)
     for entry in copy_untracked:
-        validate_copy_untracked_entry(entry)
+        entry = validate_copy_untracked_entry(entry)
         src = source / entry
-        if not (src.exists() or src.is_symlink()):
-            continue
         if src.is_symlink():
-            if _symlink_points_outside(src, source):
-                continue
-        elif not _path_is_within(src, source):
+            raise ValueError(
+                f"[workspace].copy_untracked entry must not be a symlink: {entry}"
+            )
+        if not src.exists():
+            continue
+        if not _path_is_within(src, source):
             raise ValueError(f"copy_untracked path escapes source repository: {entry}")
-        _copy_allowlisted_entry(src, clone / entry, source)
+        allowlist_root = src.resolve()
+        try:
+            allowlist_root.relative_to(source)
+        except ValueError as exc:
+            raise ValueError(f"copy_untracked path escapes source repository: {entry}") from exc
+        if allowlist_root == source:
+            raise ValueError(
+                f"[workspace].copy_untracked entry must sit strictly under the source "
+                f"(got {entry!r})."
+            )
+        _copy_allowlisted_entry(src, clone / entry, allowlist_root, forbidden)
 
 
 def _herdr_bin():
@@ -4043,6 +4180,11 @@ def create_worker(worker_id, repo=None, base_ref="HEAD", agent=None):
         settings = workspace_settings(config_dir)
         use_reflink = False
         if settings["strategy"] == "reflink":
+            # Dirty refusal applies inside create_worker for reflink (not only the launcher).
+            if check_dirty_tree(source):
+                raise ValueError(
+                    f"Refusing: source repository has uncommitted or untracked changes: {source}"
+                )
             if probe_reflink(source, state_dir):
                 use_reflink = True
             else:
@@ -4063,12 +4205,8 @@ def create_worker(worker_id, repo=None, base_ref="HEAD", agent=None):
             clone = destination / "repo"
             if use_reflink:
                 _materialize_worker_git(source, clone, commit, branch, user_name, user_email)
-                source_head = git("-C", source, "rev-parse", "HEAD")
-                if source_head == commit:
-                    _reflink_tracked_worktree(source, clone)
-                else:
-                    # Work tree does not match base_ref; extract tracked files from objects.
-                    git("-C", clone, "checkout-index", "-a", "-f")
+                # Tracked bytes always come from git objects, never the worktree.
+                _checkout_tracked_from_objects(clone, source, commit)
                 if settings["copy_untracked"]:
                     copy_allowlisted_untracked(source, clone, settings["copy_untracked"])
             else:
