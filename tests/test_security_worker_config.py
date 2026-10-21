@@ -172,10 +172,9 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
         """Test that 'list' command never executes worker config."""
         worker_id, _ = self.create_malicious_worker()
 
-        with patch.object(plugin, "_query_worker_git_snapshot", return_value={
-            "status_porcelain": "", "log": "", "status_short": "", "diff": "", "error": None,
-        }):
+        with patch.object(plugin, "_query_worker_git_snapshot") as query:
             workers = plugin.list_workers(self.state)
+            query.assert_not_called()
 
         self.assertTrue(any(w["id"] == worker_id for w in workers))
         self.assert_no_markers()

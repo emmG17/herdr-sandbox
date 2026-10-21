@@ -143,12 +143,14 @@ class ExecuteWorkerTests(unittest.TestCase):
 
         with patch.object(plugin, "container_status", return_value="not-found"):
             record = plugin.inspect_worker("TEST-001")
-            rendered = plugin.format_workers(plugin.list_workers())
+            listed = plugin.format_workers(plugin.list_workers())
             inspected = plugin.format_worker(record)
 
         self.assertEqual(record["latest_result"]["run_id"], "run-test")
-        self.assertIn("run-test exit=0 HEAD=abc123 dirty=no", rendered)
+        self.assertIn("TEST-001", listed)
+        self.assertNotIn("run-test", listed)
         self.assertIn("Latest result:", inspected)
+        self.assertIn("run-test", inspected)
         self.assertIn(str(run_dir / "output.log"), inspected)
 
     def test_execute_action_reads_fixed_worker_and_prompt_from_config(self):

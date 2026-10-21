@@ -79,7 +79,9 @@ Status, log, and diff are collected in a single `sh -c` with the base commit
 passed as a positional argument (not interpolated). When Podman or the worker
 runtime is unavailable, fields report `(unavailable: ...)` with an issue entry.
 
-HEAD and branch for list/inspect still come from the file-based helpers so a
+`hs ls` / `list` never starts a git-query container: it reads the state store
+and `container_status()` only. HEAD, branch, dirty status, log, and diff for
+`hs inspect` come from the file-based helpers plus one sandboxed snapshot so a
 missing container does not block identity reporting.
 
 ## Tests
@@ -103,8 +105,8 @@ missing container does not block identity reporting.
 ## Usage
 
 ```sh
-hs list
-hs inspect <id>
+hs ls
+hs inspect [id]
 hs fetch <id>
 git log main..sandbox/<id>
 git diff main...sandbox/<id>

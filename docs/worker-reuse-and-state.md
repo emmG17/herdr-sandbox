@@ -299,6 +299,18 @@ git rebase main sandbox/herdr-sandbox-a1b2c3  # if desired
 git merge sandbox/herdr-sandbox-a1b2c3        # or merge
 ```
 
+## Listing and inspect
+
+- `hs ls` (alias of `list`) reads worker.json plus `container_status()` only.
+  Columns: id, agent, source repo, pane, status (including `fetched`), result
+  branch (`sandbox/<id>` or `-`), created time. It does **not** start a
+  sandboxed git-query container per worker.
+- `hs inspect [id]` defaults to the worker for (`HERDR_PANE_ID`, cwd repo, any
+  agent). Missing or ambiguous pane context errors with candidate IDs.
+  `[inspect]` config and sole-worker fallback are ignored. Inspect may run one
+  sandboxed git snapshot for dirty/log/diff and prints source-repo review
+  commands against `sandbox/<id>`.
+
 ## Security Invariants
 
 The new state store maintains all existing security invariants:
