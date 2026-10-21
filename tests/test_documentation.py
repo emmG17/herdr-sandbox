@@ -1,9 +1,22 @@
 from pathlib import Path
+import re
 import tomllib
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _orchestrator_loop_section(skill: str) -> str:
+    """Return the skill text from '## Orchestrator loop' through the next H2."""
+    match = re.search(
+        r"^## Orchestrator loop\n(.*?)(?=^## |\Z)",
+        skill,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        raise AssertionError("skills/herdr-sandbox-worker/SKILL.md missing '## Orchestrator loop'")
+    return match.group(0)
 
 
 class DocumentationTests(unittest.TestCase):
@@ -75,10 +88,18 @@ class DocumentationTests(unittest.TestCase):
             "herdr pane run <pane>",
             "herdr agent wait <pane> --until done",
             "skills/herdr-sandbox-worker/SKILL.md",
+            "STATUS=fetched",
+            "hs inspect <id>",
         )
         for item in required:
             with self.subTest(item=item):
                 self.assertIn(item, readme)
+
+        orch = readme.split("### Orchestrator agents on the host", 1)[1].split("Alternatively, use the plugin actions:", 1)[0]
+        self.assertLess(orch.index("hs ls"), orch.index("git log"))
+        self.assertLess(orch.index("hs ls"), orch.index("hs inspect <id>"))
+        self.assertNotRegex(orch, r"(?m)^hs inspect\s*$")
+        self.assertNotRegex(orch, r"hs inspect\s+#")
 
     def test_skill_documents_hs_orchestrator_loop_without_legacy_actions(self):
         skill_path = ROOT / "skills" / "herdr-sandbox-worker" / "SKILL.md"
@@ -93,18 +114,22 @@ class DocumentationTests(unittest.TestCase):
             "[fetch]",
             "[inspect]",
             "FETCH_HEAD",
-            "cherry-pick",
-            "cherry_pick",
         )
         for item in forbidden:
             with self.subTest(forbidden=item):
                 self.assertNotIn(item, skill)
+
+        # Ban the removed plugin action/table name, not plain `git cherry-pick`.
+        self.assertNotRegex(skill, r"invoke\s+cherry[_-]pick")
+        self.assertIn("git cherry-pick", skill)
 
         required = (
             "hs login",
             "hs login codex",
             "hs login claude",
             "login-homes/claude",
+            "[claude].forward_api_key",
+            "ANTHROPIC_API_KEY",
             "herdr pane run <pane>",
             "hs claude",
             "hs codex",
@@ -112,11 +137,17 @@ class DocumentationTests(unittest.TestCase):
             "hs codex --prompt",
             "herdr agent wait <pane> --until done",
             "hs ls",
-            "hs inspect",
+            "hs inspect <id>",
+            "STATUS=fetched",
+            "RESULT=sandbox/<id>",
             "sandbox/<id>",
             "git log <base>..sandbox/<id>",
             "git diff <base>...sandbox/<id>",
             "git merge sandbox/<id>",
+            "git cherry-pick",
+            "Review",
+            "print_execution_result",
+            "result.json",
             "hs rm <id>",
             "hs gc",
             "HERDR_PANE_ID",
@@ -134,6 +165,16 @@ class DocumentationTests(unittest.TestCase):
         for item in required:
             with self.subTest(item=item):
                 self.assertIn(item, skill)
+
+        loop = _orchestrator_loop_section(skill)
+        self.assertLess(loop.index("hs ls"), loop.index("git log <base>..sandbox/<id>"))
+        self.assertLess(loop.index("STATUS=fetched"), loop.index("git log <base>..sandbox/<id>"))
+        self.assertLess(loop.index("hs inspect <id>"), loop.index("git log <base>..sandbox/<id>"))
+        # Bare `hs inspect` (no id) must not appear in the orchestrator happy path.
+        self.assertNotRegex(loop, r"(?m)^hs inspect\s*$")
+        self.assertNotRegex(loop, r"hs inspect\s+#")
+        self.assertIn("PANE", loop)
+        self.assertIn("do not use bare `hs inspect`", loop.lower())
 
         agents_copy = ROOT / ".agents" / "skills" / "herdr-sandbox-worker" / "SKILL.md"
         self.assertFalse(

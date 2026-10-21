@@ -328,6 +328,57 @@ class FetchTests(unittest.TestCase):
         )
         self.assertIn("Branch: sandbox/AUTO-001", stdout.getvalue())
 
+    def test_hs_agent_keeps_herdr_agent_until_after_fetch(self):
+        """Interactive path must not clear HERDR_AGENT before auto-fetch.
+
+        open_worker restores the HERDR_AGENT value it saw on entry. If hs_agent
+        clears identity before fetch, herdr agent wait --until done can return
+        before refs/heads/sandbox/<id> exists.
+        """
+        plugin.create_worker("AUTO-002", str(self.source))
+        seen = {"during_open": None, "during_fetch": None}
+        os.environ.pop("HERDR_AGENT", None)
+
+        def fake_open(worker_id, command=None, fresh=False, profile=None):
+            seen["during_open"] = os.environ.get("HERDR_AGENT")
+            # Match open_worker's finally: restore whatever was set on entry.
+            previous = os.environ.get("HERDR_AGENT")
+            os.environ["HERDR_AGENT"] = plugin.DEFAULT_PROFILE.herdr_agent
+            if previous is None:
+                os.environ.pop("HERDR_AGENT", None)
+            else:
+                os.environ["HERDR_AGENT"] = previous
+            return 0
+
+        def fake_fetch(worker_id, state_dir=None):
+            seen["during_fetch"] = os.environ.get("HERDR_AGENT")
+            return {
+                "commit": "a" * 40,
+                "branch": f"sandbox/{worker_id}",
+                "commit_count": 1,
+                "log_oneline": "aaaa worker",
+                "changed_files": ["one.py"],
+                "diff_stat": " one.py | 1 +\n",
+                "base_commit": "b" * 40,
+                "source_repo": str(self.source),
+                "worker_id": worker_id,
+            }
+
+        with patch.object(plugin, "check_root"), \
+                patch.object(plugin, "resolve_source_repo_from_cwd", return_value=self.source), \
+                patch.object(plugin, "check_dirty_tree", return_value=False), \
+                patch.object(plugin, "ensure_image_exists"), \
+                patch.object(plugin, "find_reusable_worker", return_value=("AUTO-002", None)), \
+                patch.object(plugin, "open_worker", side_effect=fake_open), \
+                patch.object(plugin, "fetch_worker", side_effect=fake_fetch), \
+                patch("sys.stdout", new_callable=io.StringIO):
+            code = plugin.hs_agent(plugin.DEFAULT_PROFILE, [])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["during_open"], plugin.DEFAULT_PROFILE.herdr_agent)
+        self.assertEqual(seen["during_fetch"], plugin.DEFAULT_PROFILE.herdr_agent)
+        self.assertNotIn("HERDR_AGENT", os.environ)
+
     def test_manifest_exposes_fetch_action(self):
         with (SCRIPT.parent.parent / "herdr-plugin.toml").open("rb") as stream:
             manifest = tomllib.load(stream)

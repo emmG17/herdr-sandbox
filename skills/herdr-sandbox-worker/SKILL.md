@@ -34,9 +34,11 @@ herdr plugin action invoke check --plugin dev.herdr.sandbox
 
 `hs login codex` runs device auth with `CODEX_HOME` pointed at the plugin-owned Codex home. `hs login claude` runs `claude auth login` with `CLAUDE_CONFIG_DIR` on the plugin-owned Claude home and sets `HOME` to an isolated directory under plugin state (`login-homes/claude`) so the host CLI cannot touch the real `~/.claude.json`. Never copy credentials from `~/.codex` or `~/.claude`.
 
+Optional Claude API-key auth (instead of or alongside login): set `[claude].forward_api_key = true` in the plugin `config.toml` and export `ANTHROPIC_API_KEY` on the host. Prefer `hs login claude` so credentials live under the plugin-owned home.
+
 ## Orchestrator loop
 
-Prefer a normal tiled pane (so `HERDR_PANE_ID` is set and the same pane can reuse one worker). Split a sibling if needed, keep focus, then spawn:
+Prefer a normal tiled pane (so `HERDR_PANE_ID` is set and the same pane can reuse one worker). Split a sibling if needed, keep focus, then spawn and wait:
 
 ```sh
 herdr pane split --current --direction right --cwd "$PWD" --no-focus
@@ -46,44 +48,64 @@ herdr pane run <pane> "hs claude"
 herdr agent wait <pane> --until done
 ```
 
-For non-interactive work (no TTY agent session), run the prompt form in the pane or from a shell that has the source repo as cwd:
+### Discover the worker (do not use bare `hs inspect`)
+
+`hs inspect` without an ID resolves against **your** `HERDR_PANE_ID` and cwd, not the worker pane. After wait, from the **source** repository:
+
+1. Run `hs ls`.
+2. Find the row whose `PANE` equals `<pane>`.
+3. Take that row's `ID` and `RESULT`.
+4. Require `STATUS=fetched` and `RESULT=sandbox/<id>` before reading git. If status is not yet `fetched`, wait briefly and re-run `hs ls` (interactive auto-fetch keeps `HERDR_AGENT` set until the sandbox ref exists; still verify before integrating).
+5. Run `hs inspect <id>` (always with the explicit ID). Use its `Base:` line and the printed `Review (run in source repo ...):` git commands. Auto-fetch / `hs fetch` also print ready-made `Review:` lines—you may use those directly.
 
 ```sh
-herdr pane run <pane> "hs claude --prompt \"Implement the change and commit in the worker clone.\""
-# or: hs claude --prompt "..."
-# or: hs codex --prompt "..."
-herdr agent wait <pane> --until done
+hs ls
+# PANE matches <pane> → note ID and RESULT=sandbox/<id>; STATUS must be fetched
+hs inspect <id>
+# Base: <base>   and Review lines, e.g.:
+#   git -C <source> log <base>..sandbox/<id>
+#   git -C <source> diff <base>...sandbox/<id>
 ```
 
-`hs <agent>` creates or reuses a worker for the current pane, launches the agent in the sandbox, and on agent exit auto-fetches the worker tip into `refs/heads/sandbox/<id>` in the source repo. `--prompt` closes agent stdin, streams output, persists `runs/<run-id>/result.json` and `output.log` under the worker directory, then auto-fetches the same way. The source tree must be clean (no uncommitted changes).
+Only then run git (or paste the Review lines from fetch / `hs inspect <id>`):
+
+```sh
+git log <base>..sandbox/<id>
+git diff <base>...sandbox/<id>
+```
+
+### Non-interactive `--prompt`
+
+Prefer running `hs <agent> --prompt` **directly** (same source-repo cwd) when the orchestrator needs the process exit code. `herdr pane run` only acknowledges that the command was queued; it does not return the agent/fetch exit status—use `herdr pane read` or the worker's `runs/<run-id>/result.json` if you must go through a pane.
+
+```sh
+hs claude --prompt "Implement the change and commit in the worker clone."
+# or: hs codex --prompt "..."
+```
+
+On success the launcher prints a summary (`print_execution_result`): Worker, Run, Exit status, HEAD, Result branch, Commit count, Dirty, Git status, Result path, Log path. Base for review still comes from `hs inspect <id>` (or the Review lines printed at fetch).
+
+Exit rules (`hs_agent` with `--prompt`):
+
+- Setup / argument errors (no worker, extra args with `--prompt`, bad prompt, readiness failure) → exit `1`.
+- Otherwise → the agent's exit status.
+- If auto-fetch failed (`result_branch` missing) → that exit status, or `1` when the agent exited `0`.
+
+After `--prompt`, still run `hs ls`, confirm `STATUS=fetched` and `RESULT=sandbox/<id>`, then `hs inspect <id>` before integrating.
+
+`hs <agent>` creates or reuses a worker for the current pane, launches the agent in the sandbox, and on agent exit auto-fetches into `refs/heads/sandbox/<id>`. The source tree must be clean (no uncommitted changes).
 
 ### Popup-pane caveat
 
 Plugin popup panes do not receive `HERDR_PANE_ID`. Without it, every `hs` launch creates a **new** worker; there is no per-pane reuse. Prefer `herdr pane split` / `herdr pane run` on ordinary tiled panes for orchestrated work.
 
-## Read results
-
-In the **source** repository:
-
-```sh
-hs ls
-hs inspect          # this pane's worker when HERDR_PANE_ID is set
-hs inspect <id>     # when the pane is ambiguous or unset
-
-git log <base>..sandbox/<id>
-git diff <base>...sandbox/<id>
-```
-
-`hs ls` lists id, agent, source repo, pane, status, result branch (`sandbox/<id>` or `-`), and created time. `hs inspect` adds the latest run summary, container-side dirty status, and review commands that run in the source repo against `sandbox/<id>`.
-
 ## Integrate with plain git
 
-Review first. Then integrate only what you or the user approve—merge, rebase, or apply selected commits. The plugin never merges into the current branch.
+Review first. Then integrate only what you or the user approve—`git merge`, `git rebase`, or `git cherry-pick` selected commits. The plugin never merges into the current branch and has no action that applies worker commits for you.
 
 ```sh
-git log main..sandbox/<id>
-git diff main...sandbox/<id>
 git merge sandbox/<id>
+# or: git cherry-pick <sha> … / git rebase …
 ```
 
 ## Cleanup
@@ -104,7 +126,7 @@ Rootless Podman is the isolation boundary (not a VM). Agent launches (`hs <agent
 - the worker clone at `/workspace` (read-write), and
 - a **per-launch session home** at `/codex` or `/claude` that contains only authentication artifacts copied from the dedicated plugin agent home.
 
-They do not mount the host home, normal `~/.codex` / `~/.claude` / `~/.claude.json`, SSH/GPG/cloud credentials, the source repository as writable, or Podman/Docker sockets. Capabilities are dropped, `no-new-privileges` is set, the container root is read-only, and `--userns=keep-id` is used. Host environment variables are never forwarded into the container implicitly.
+They do not mount the host home, normal `~/.codex` / `~/.claude` / `~/.claude.json`, SSH/GPG/cloud credentials, the source repository as writable, or Podman/Docker sockets. Capabilities are dropped, `no-new-privileges` is set, the container root is read-only, and `--userns=keep-id` is used. Host environment variables are never forwarded into the container implicitly (except the optional explicit `ANTHROPIC_API_KEY` inherit when `[claude].forward_api_key` is enabled).
 
 Caveat (tracked in issue #29): a non-fresh bash `open` (interactive shell into an existing worker) still bind-mounts the **whole** configured plugin agent home at `/codex` or `/claude`, not a session home. Prefer `hs <agent>` / `--prompt` for delegated work; do not treat a bash `open` session as auth-only.
 

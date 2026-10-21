@@ -3948,24 +3948,36 @@ def hs_agent(profile, agent_args, prompt=None):
             return exit_status if exit_status else 1
         return exit_status
 
+    # Keep HERDR_AGENT set across open_worker and auto-fetch, matching
+    # execute_worker (--prompt). open_worker's finally restores the value it
+    # saw on entry; if we clear it first, herdr agent wait --until done can
+    # return before refs/heads/sandbox/<id> exists.
+    previous_herdr_agent = os.environ.get("HERDR_AGENT")
+    os.environ["HERDR_AGENT"] = profile.herdr_agent
     try:
-        command = [profile.interactive_bin] + list(agent_args or [])
-        exit_code = open_worker(worker_id, command, fresh=True, profile=profile)
-    except Exception as exc:
-        print(f"Worker launch failed: {exc}", file=sys.stderr)
-        return 1
+        try:
+            command = [profile.interactive_bin] + list(agent_args or [])
+            exit_code = open_worker(worker_id, command, fresh=True, profile=profile)
+        except Exception as exc:
+            print(f"Worker launch failed: {exc}", file=sys.stderr)
+            return 1
 
-    try:
-        print(format_fetch_result(fetch_worker(worker_id, state_dir)))
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        print(
-            f"Worker {worker_id} was left un-fetched. "
-            f"Switch away from sandbox/{worker_id} if it is checked out, then run: hs fetch {worker_id}",
-            file=sys.stderr,
-        )
-        return exit_code if exit_code else 1
-    return exit_code
+        try:
+            print(format_fetch_result(fetch_worker(worker_id, state_dir)))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            print(
+                f"Worker {worker_id} was left un-fetched. "
+                f"Switch away from sandbox/{worker_id} if it is checked out, then run: hs fetch {worker_id}",
+                file=sys.stderr,
+            )
+            return exit_code if exit_code else 1
+        return exit_code
+    finally:
+        if previous_herdr_agent is None:
+            os.environ.pop("HERDR_AGENT", None)
+        else:
+            os.environ["HERDR_AGENT"] = previous_herdr_agent
 
 
 def ensure_login_home(state_dir, profile):
