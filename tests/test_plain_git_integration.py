@@ -3,6 +3,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import shlex
 import tempfile
 import tomllib
 import unittest
@@ -80,11 +81,12 @@ class PlainGitIntegrationTests(unittest.TestCase):
         self.assertEqual(git("-C", self.source, "rev-parse", "HEAD"), self.source_head)
 
         review = plugin.format_fetch_result(fetched)
-        self.assertIn("git log ", review)
+        quoted_source = shlex.quote(str(self.source))
+        self.assertIn(f"git -C {quoted_source} log ", review)
         self.assertIn("..sandbox/TEST-001", review)
-        self.assertIn("git diff ", review)
+        self.assertIn(f"git -C {quoted_source} diff ", review)
         self.assertIn("...sandbox/TEST-001", review)
-        self.assertIn("git merge sandbox/TEST-001", review)
+        self.assertIn(f"git -C {quoted_source} merge sandbox/TEST-001", review)
 
         git("-C", self.source, "merge", "--no-edit", "sandbox/TEST-001")
         self.assertEqual((self.source / "value.txt").read_text(), "worker change\n")

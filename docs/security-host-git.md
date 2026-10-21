@@ -84,6 +84,12 @@ and `container_status()` only. HEAD, branch, dirty status, log, and diff for
 `hs inspect` come from the file-based helpers plus one sandboxed snapshot so a
 missing container does not block identity reporting.
 
+Pane-default `hs inspect` resolves the cwd source repo by walking parents for a
+`.git` entry — never `git rev-parse` with the process cwd — and rejects roots
+under `state_workers_dir()` so a shell sitting in a worker clone cannot trigger
+host git against attacker-controlled config. Printed review commands always use
+`git -C <quoted-source>` against a validated `sandbox/<id>` branch.
+
 ## Tests
 
 `tests/test_security_worker_config.py` covers:
