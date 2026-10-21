@@ -234,13 +234,25 @@ hs codex  # Creates new worker at current HEAD
 
 - `hs gc` removes workers whose status is `fetched` and whose pane no longer
   exists (`herdr pane get`), or that are older than `[gc].max_age` (default `7d`).
-- **max_age + unfetched:** attempt `fetch_worker` first; delete only on success;
-  otherwise skip with a one-line warning naming the worker.
-- Running containers are never collected. `pane.exited` is not a GC trigger.
+- **Fetched means tip-current:** before deleting, GC requires
+  `agent/<id>` (via `_safe_read_worker_ref`) and source `refs/heads/sandbox/<id>`
+  both equal `fetched_commit`. A stale `fetched` status after more worker
+  commits is not enough. Explicit `hs gc` may re-fetch first; pane-event and
+  opportunistic paths skip with a warning.
+- **max_age + unfetched (explicit `hs gc` only):** attempt `fetch_worker` first;
+  delete only on success; otherwise skip with a one-line warning naming the
+  worker. Opportunistic GC never fetches.
+- Containers are collectible only when status is `not-found`, `exited`, or
+  `stopped`. `unavailable`, errors, `running`, `paused`, etc. skip with a
+  warning. `pane.exited` is not a GC trigger.
+- Pane gone requires a structured `pane_not_found` error code from
+  `herdr pane get`. Soft failures ("command not found", server down) keep the
+  worker.
 - A `pane.closed` `[[events]]` hook runs `gc --from-event` (strict
   `HERDR_PLUGIN_EVENT_JSON` parse) for that pane's fetched workers.
-- Each `hs <agent>` launch runs opportunistic GC under the state lock with a
-  2s budget; GC failures never fail the launch.
+- Each `hs <agent>` launch runs opportunistic GC with a non-blocking state
+  lock and a 2s budget (no fetch-before-GC). Busy lock or GC failures never
+  fail the launch.
 - GC never deletes or rewrites any ref in the source repository.
 
 ### Example Scenarios
