@@ -18,6 +18,19 @@ pids = 1024
 # first and deleted only on success; otherwise they are skipped with a warning.
 max_age = "7d"
 
+# Experimental: optional CoW workspace materialization (RFC phase 5 / #14).
+# Default remains "clone". "reflink" probes cp/--reflink (FICLONE) from the
+# source filesystem into the plugin state directory; if that fails (for example
+# state and source on different filesystems, or ext4 without reflink), create
+# falls back to clone with one notice line and does not copy allowlisted paths.
+# copy_untracked is a relative-path allowlist only (no absolute paths, no "..").
+# Untracked files outside the allowlist (e.g. .env) never reach the worker.
+# Symlinks that resolve outside the source are skipped; source .git is never
+# reflinked — worker .git is built like the clone strategy (no alternates).
+[workspace]
+strategy = "clone"          # "clone" | "reflink" (experimental)
+copy_untracked = []         # reflink only, e.g. ["node_modules", "target", ".venv"]
+
 # Per-agent home under the plugin config directory. Default dirname matches the
 # agent name when omitted. Never point this at a normal user agent home
 # (~/.codex, ~/.claude) or other banned host paths (~/.claude.json).

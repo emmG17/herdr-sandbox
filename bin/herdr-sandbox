@@ -36,6 +36,16 @@ DEFAULT_GC_MAX_AGE = "7d"
 GC_OPPORTUNISTIC_BUDGET_SECONDS = 2.0
 DURATION_RE = re.compile(r"\A([1-9][0-9]*)([smhd])\Z")
 DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+DEFAULT_WORKSPACE_STRATEGY = "clone"
+WORKSPACE_STRATEGIES = frozenset({"clone", "reflink"})
+WORKSPACE_CONFIG_KEYS = frozenset({"strategy", "copy_untracked"})
+# Linux FICLONE: _IOW(0x94, 9, int) — CoW clone one file to another.
+_FICLONE = 0x40049409
+REFLINK_FALLBACK_NOTICE = (
+    "workspace.strategy=reflink is unavailable here "
+    "(reflink cannot cross filesystems and needs btrfs/XFS CoW support); "
+    "falling back to clone"
+)
 
 # ---------------------------------------------------------------------------
 # Agent profiles. Isolation flags stay on PodmanSandboxRuntime; a profile may
@@ -1438,6 +1448,268 @@ def gc_settings(config_dir):
     _permitted_settings(options, "[gc]", {"max_age"})
     max_age = options.get("max_age", DEFAULT_GC_MAX_AGE)
     return {"max_age": max_age, "max_age_seconds": parse_duration(max_age)}
+
+
+def validate_copy_untracked_entry(entry):
+    """Reject absolute paths, ``..`` segments, and any ``.git`` allowlist entry."""
+    if not isinstance(entry, str) or not entry or entry != entry.strip():
+        raise ValueError(
+            "Set [workspace].copy_untracked entries to nonempty relative path strings "
+            f"(got {entry!r})."
+        )
+    path = Path(entry)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(
+            "[workspace].copy_untracked entries must be relative paths without '..' "
+            f"(got {entry!r})."
+        )
+    if path.parts and path.parts[0] == ".git":
+        raise ValueError(
+            "[workspace].copy_untracked must not include .git "
+            f"(got {entry!r})."
+        )
+    return entry
+
+
+def workspace_settings(config_dir):
+    """Load optional [workspace] strategy settings; default strategy is clone."""
+    config_file = Path(config_dir) / "config.toml"
+    if not config_file.is_file():
+        return {"strategy": DEFAULT_WORKSPACE_STRATEGY, "copy_untracked": []}
+    with config_file.open("rb") as stream:
+        config = tomllib.load(stream)
+    options = config.get("workspace", {})
+    if options is None:
+        options = {}
+    if not isinstance(options, dict):
+        raise ValueError(f"Expected a [workspace] table in {config_file}.")
+    _permitted_settings(options, "[workspace]", WORKSPACE_CONFIG_KEYS)
+    strategy = options.get("strategy", DEFAULT_WORKSPACE_STRATEGY)
+    if strategy not in WORKSPACE_STRATEGIES:
+        raise ValueError(
+            f"Set [workspace].strategy to 'clone' or 'reflink' in {config_file} "
+            f"(got {strategy!r})."
+        )
+    copy_untracked = options.get("copy_untracked", [])
+    if not isinstance(copy_untracked, list):
+        raise ValueError(f"Set [workspace].copy_untracked to an array of paths in {config_file}.")
+    validated = [validate_copy_untracked_entry(entry) for entry in copy_untracked]
+    return {"strategy": strategy, "copy_untracked": validated}
+
+
+def _path_is_within(path, root):
+    """Return True when resolved path stays under resolved root."""
+    root = Path(root).resolve()
+    try:
+        Path(path).resolve().relative_to(root)
+        return True
+    except (ValueError, OSError, RuntimeError):
+        return False
+
+
+def _symlink_points_outside(link_path, source_root):
+    """Return True when a symlink's resolved target escapes source_root."""
+    link_path = Path(link_path)
+    source_root = Path(source_root).resolve()
+    try:
+        raw = os.readlink(link_path)
+    except OSError:
+        return True
+    candidate = Path(raw) if os.path.isabs(raw) else (link_path.parent / raw)
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError):
+        return True
+    try:
+        resolved.relative_to(source_root)
+        return False
+    except ValueError:
+        return True
+
+
+def reflink_file(src, dst):
+    """Create ``dst`` as a CoW reflink of ``src`` (new inode; writes do not affect src).
+
+    Tries Linux FICLONE, then ``cp --reflink=always``. Raises OSError on failure
+    (including cross-filesystem EXDEV).
+    """
+    src = Path(src)
+    dst = Path(dst)
+    if not src.is_file() or src.is_symlink():
+        raise OSError(f"Reflink source must be a regular file: {src}")
+    if dst.exists() or dst.is_symlink():
+        raise OSError(f"Reflink destination already exists: {dst}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(src, "rb") as src_f, open(dst, "wb") as dst_f:
+            fcntl.ioctl(dst_f.fileno(), _FICLONE, src_f.fileno())
+        shutil.copystat(src, dst, follow_symlinks=True)
+        return
+    except OSError:
+        if dst.exists():
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+    result = run("cp", "--reflink=always", "--preserve=mode,timestamps", "--", str(src), str(dst))
+    if result.returncode != 0:
+        if dst.exists():
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+        detail = (result.stderr or result.stdout or "cp --reflink=always failed").strip()
+        raise OSError(detail)
+
+
+def probe_reflink(source_root, state_dir):
+    """Return True when a file on the source filesystem can be reflinked into state_dir.
+
+    Creates a temp probe under ``source_root`` and reflinks it into ``state_dir``.
+    Fails (and callers fall back to clone) when the paths are on different
+    filesystems or the filesystem lacks reflink/CoW support.
+    """
+    source_root = Path(source_root).resolve()
+    state_dir = Path(state_dir).resolve()
+    if not source_root.is_dir() or not state_dir.is_dir():
+        return False
+    src_probe = None
+    dst_probe = None
+    try:
+        fd, src_name = tempfile.mkstemp(
+            prefix=".hs-reflink-src-",
+            suffix=".probe",
+            dir=str(source_root),
+        )
+        try:
+            os.write(fd, b"herdr-sandbox-reflink-probe\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        src_probe = Path(src_name)
+        dst_probe = state_dir / f".hs-reflink-dst-{os.getpid()}-{secrets.token_hex(4)}.probe"
+        reflink_file(src_probe, dst_probe)
+        src_stat = src_probe.stat()
+        dst_stat = dst_probe.stat()
+        if src_stat.st_ino == dst_stat.st_ino:
+            return False
+        # CoW check: a write to the destination must not change the source.
+        dst_probe.write_bytes(b"herdr-sandbox-reflink-probe-mutated\n")
+        if src_probe.read_bytes() != b"herdr-sandbox-reflink-probe\n":
+            return False
+        return True
+    except (OSError, ValueError):
+        return False
+    finally:
+        for path in (dst_probe, src_probe):
+            if path is None:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _strip_git_alternates(clone):
+    alternates_file = Path(clone) / ".git" / "objects" / "info" / "alternates"
+    if alternates_file.exists():
+        alternates_file.unlink()
+
+
+def _materialize_worker_git(source, clone, commit, branch, user_name, user_email):
+    """Build worker ``.git`` exactly like the clone strategy (no hardlinks/alternates).
+
+    Does not populate the work tree; callers either checkout-index or reflink tracked files.
+    Source hooks, config, and info/ are not carried over: ``git clone`` creates a fresh
+    repository metadata tree from the template.
+    """
+    git("clone", "--no-hardlinks", "--no-checkout", source, clone)
+    _strip_git_alternates(clone)
+    git("-C", clone, "config", "--local", "user.name", user_name)
+    git("-C", clone, "config", "--local", "user.email", user_email)
+    git("-C", clone, "update-ref", f"refs/heads/{branch}", commit)
+    git("-C", clone, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
+    git("-C", clone, "read-tree", commit)
+
+
+def _reflink_tracked_worktree(source, clone):
+    """Reflink tracked paths from the clean source work tree into the worker clone."""
+    source = Path(source)
+    clone = Path(clone)
+    listed = git("-C", source, "ls-files", "-z")
+    for rel in listed.split("\0"):
+        if not rel:
+            continue
+        src = source / rel
+        dst = clone / rel
+        if src.is_symlink():
+            if _symlink_points_outside(src, source):
+                raise ValueError(f"Tracked symlink escapes source repository: {rel}")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            os.symlink(os.readlink(src), dst, target_is_directory=False)
+            continue
+        if not src.is_file():
+            raise ValueError(f"Tracked path is missing or not a regular file: {rel}")
+        reflink_file(src, dst)
+
+
+def _copy_allowlisted_entry(src, dst, source_root):
+    """Copy one allowlisted path into the worker without following escaping symlinks.
+
+    Symlinks whose resolved target leaves ``source_root`` are skipped. Symlinked
+    directories are recreated as symlinks (or skipped), never walked through.
+    Nested ``.git`` directories are never copied.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    source_root = Path(source_root).resolve()
+    if src.is_symlink():
+        if _symlink_points_outside(src, source_root):
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() or dst.is_symlink():
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+        os.symlink(os.readlink(src), dst)
+        return
+    if src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        with os.scandir(src) as entries:
+            for entry in entries:
+                if entry.name == ".git":
+                    continue
+                _copy_allowlisted_entry(Path(entry.path), dst / entry.name, source_root)
+        return
+    if src.is_file():
+        if dst.exists() or dst.is_symlink():
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+        reflink_file(src, dst)
+        return
+    # Skip sockets, devices, and other non-file types.
+
+
+def copy_allowlisted_untracked(source, clone, copy_untracked):
+    """Reflink allowlisted untracked/ignored paths into the worker work tree."""
+    source = Path(source).resolve()
+    clone = Path(clone).resolve()
+    for entry in copy_untracked:
+        validate_copy_untracked_entry(entry)
+        src = source / entry
+        if not (src.exists() or src.is_symlink()):
+            continue
+        if src.is_symlink():
+            if _symlink_points_outside(src, source):
+                continue
+        elif not _path_is_within(src, source):
+            raise ValueError(f"copy_untracked path escapes source repository: {entry}")
+        _copy_allowlisted_entry(src, clone / entry, source)
 
 
 def _herdr_bin():
@@ -3766,7 +4038,16 @@ def create_worker(worker_id, repo=None, base_ref="HEAD", agent=None):
         
         user_name, user_email = source_git_identity(str(source))
         commit = git("-C", source, "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}")
-        
+
+        config_dir, _ = paths()
+        settings = workspace_settings(config_dir)
+        use_reflink = False
+        if settings["strategy"] == "reflink":
+            if probe_reflink(source, state_dir):
+                use_reflink = True
+            else:
+                print(REFLINK_FALLBACK_NOTICE, file=sys.stderr)
+
         workers_dir = state_dir / "workers"
         workers_dir.mkdir(exist_ok=True)
         if workers_dir.resolve() != workers_dir or not workers_dir.is_dir():
@@ -3780,20 +4061,29 @@ def create_worker(worker_id, repo=None, base_ref="HEAD", agent=None):
         
         try:
             clone = destination / "repo"
-            git("clone", "--no-hardlinks", "--no-checkout", source, clone)
-            
+            if use_reflink:
+                _materialize_worker_git(source, clone, commit, branch, user_name, user_email)
+                source_head = git("-C", source, "rev-parse", "HEAD")
+                if source_head == commit:
+                    _reflink_tracked_worktree(source, clone)
+                else:
+                    # Work tree does not match base_ref; extract tracked files from objects.
+                    git("-C", clone, "checkout-index", "-a", "-f")
+                if settings["copy_untracked"]:
+                    copy_allowlisted_untracked(source, clone, settings["copy_untracked"])
+            else:
+                git("clone", "--no-hardlinks", "--no-checkout", source, clone)
+                _strip_git_alternates(clone)
+                git("-C", clone, "config", "--local", "user.name", user_name)
+                git("-C", clone, "config", "--local", "user.email", user_email)
+                git("-C", clone, "switch", "--detach", commit)
+                git("-C", clone, "switch", "-c", branch)
+
             # Ensure no alternates file exists (worker must never access source objects)
-            alternates_file = clone / ".git" / "objects" / "info" / "alternates"
-            if alternates_file.exists():
-                alternates_file.unlink()
-            
-            git("-C", clone, "config", "--local", "user.name", user_name)
-            git("-C", clone, "config", "--local", "user.email", user_email)
-            git("-C", clone, "switch", "--detach", commit)
-            git("-C", clone, "switch", "-c", branch)
-            
+            _strip_git_alternates(clone)
+
             pane_id, workspace_id, socket_path = _get_pane_context()
-            
+
             metadata = {
                 "id": worker_id,
                 "source_repo": str(source),
@@ -3810,6 +4100,7 @@ def create_worker(worker_id, repo=None, base_ref="HEAD", agent=None):
                 "status": "created",
                 "result_branch": None,
                 "fetched_commit": None,
+                "workspace_strategy": "reflink" if use_reflink else "clone",
             }
             _atomic_write_json(destination / "worker.json", metadata)
         except (ValueError, OSError):

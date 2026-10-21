@@ -195,6 +195,18 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("Primary control", procedure)
         self.assertIn("Regression check", procedure)
         self.assertIn("cmp /tmp/claude-json-before-login ~/.claude.json", procedure)
+        self.assertIn("Reflink strategy run", procedure)
+        self.assertIn('strategy = "reflink"', procedure)
+        self.assertIn("copy_untracked", procedure)
+
+    def test_readme_marks_reflink_experimental(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("Experimental reflink workspace strategy", readme)
+        self.assertIn("**Experimental.**", readme)
+        self.assertIn('strategy = "reflink"', readme)
+        example = (ROOT / "config.example.toml").read_text()
+        self.assertIn("[workspace]", example)
+        self.assertIn("copy_untracked", example)
 
 
 if __name__ == "__main__":

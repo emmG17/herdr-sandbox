@@ -376,6 +376,35 @@ Worker retention:
 max_age = "7d"
 ```
 
+### Experimental reflink workspace strategy
+
+**Experimental.** By default workers are created with `git clone --no-hardlinks`
+(`[workspace].strategy = "clone"`). On Linux filesystems with reflink/CoW
+support (btrfs, XFS with `reflink=1`), you can set:
+
+```toml
+[workspace]
+strategy = "reflink"
+copy_untracked = ["node_modules", "target", ".venv"]
+```
+
+Before creating a worker, the plugin probes reflink by cloning a temp file from
+the **source** filesystem into the **plugin state** directory. Reflink cannot
+cross filesystems: if state and source are on different devices, or the FS lacks
+CoW clones, create prints one notice line and falls back to `clone` (no
+allowlist copy).
+
+With a successful probe, the worker `.git` is still built like the clone
+strategy (no hardlinked objects, no `alternates`, fresh hooks/config/info — the
+source `.git` is never reflinked). Tracked files come from the source work tree
+via reflink when `base_ref` is `HEAD`; allowlisted untracked/ignored paths are
+reflinked on top. Everything else (including `.env`) stays out. Absolute
+`copy_untracked` entries and paths containing `..` are rejected. Symlinks that
+resolve outside the source are skipped and never followed (including under
+allowlisted trees such as `node_modules`). Reflinked files get new inodes; a
+write in the worker must not change the source. The dirty-tree refusal from the
+launcher still applies.
+
 ## Advanced use and troubleshooting
 
 For noninteractive automation from a clean source tree:
