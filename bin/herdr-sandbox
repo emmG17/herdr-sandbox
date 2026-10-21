@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 import time
@@ -34,6 +35,121 @@ DEFAULT_GC_MAX_AGE = "7d"
 GC_OPPORTUNISTIC_BUDGET_SECONDS = 2.0
 DURATION_RE = re.compile(r"\A([1-9][0-9]*)([smhd])\Z")
 DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+# ---------------------------------------------------------------------------
+# Agent profiles. Isolation flags stay on PodmanSandboxRuntime; a profile may
+# only supply agent-specific home/env/argv/auth/forbidden-args/HERDR_AGENT.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AgentProfile:
+    """Agent-specific launch and auth values. Cannot widen runtime isolation."""
+
+    name: str
+    home_dirname: str
+    mount_point: str
+    home_env_var: str
+    auth_files: tuple
+    login_argv: tuple
+    interactive_bin: str
+    workspace_flag: str
+    forbidden_user_args: tuple
+    herdr_agent: str
+    normal_user_home: str
+    noninteractive_prefix: tuple
+
+    def normal_user_home_path(self):
+        return (Path.home() / self.normal_user_home).expanduser().resolve()
+
+    def validate_auth_data(self, data):
+        """Return True when auth JSON has the expected object shape for this agent."""
+        raise NotImplementedError
+
+    def build_interactive_argv(self, command):
+        args = list(command or [self.interactive_bin])
+        if not args or any(not isinstance(arg, str) or not arg for arg in args):
+            raise ValueError("Interactive command must contain nonempty arguments.")
+        if args[0] != self.interactive_bin:
+            raise ValueError(
+                f"Fresh {self.name} sessions must start with the {self.interactive_bin} command."
+            )
+        for arg in args[1:]:
+            if arg in self.forbidden_user_args or any(
+                arg.startswith(f"{flag}=")
+                for flag in self.forbidden_user_args
+                if flag.startswith("--")
+            ):
+                raise ValueError(
+                    f"Fresh {self.name} sessions must use the worker workspace at /workspace."
+                )
+        return [self.interactive_bin, self.workspace_flag, "/workspace", *args[1:]]
+
+    def build_noninteractive_argv(self, prompt):
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Execution prompt must be a nonempty string.")
+        return [self.interactive_bin, *self.noninteractive_prefix, prompt]
+
+    def host_env(self, base_env=None):
+        """Environment for the host wrapper process (Herdr reads HERDR_AGENT here)."""
+        env = dict(os.environ if base_env is None else base_env)
+        env["HERDR_AGENT"] = self.herdr_agent
+        return env
+
+
+# BEGIN AGENT PROFILE: codex
+def _codex_validate_auth_data(data):
+    if not isinstance(data, dict) or not data:
+        return False
+    if "tokens" in data:
+        tokens = data["tokens"]
+        if not isinstance(tokens, dict):
+            return False
+        if not any(
+            isinstance(tokens.get(key), str) and tokens.get(key)
+            for key in ("access_token", "refresh_token", "id_token")
+        ):
+            return False
+        return True
+    api_key = data.get("OPENAI_API_KEY")
+    return isinstance(api_key, str) and bool(api_key.strip())
+
+
+@dataclass(frozen=True)
+class _CodexAgentProfile(AgentProfile):
+    def validate_auth_data(self, data):
+        return _codex_validate_auth_data(data)
+
+
+CODEX_PROFILE = _CodexAgentProfile(
+    name="codex",
+    home_dirname="codex",
+    mount_point="/codex",
+    home_env_var="CODEX_HOME",
+    auth_files=("auth.json",),
+    login_argv=("codex", "login", "--device-auth"),
+    interactive_bin="codex",
+    workspace_flag="--cd",
+    forbidden_user_args=("-C", "--cd"),
+    herdr_agent="codex",
+    normal_user_home=".codex",
+    noninteractive_prefix=("exec", "--sandbox", "danger-full-access"),
+)
+# END AGENT PROFILE: codex
+
+AGENT_PROFILES = {CODEX_PROFILE.name: CODEX_PROFILE}
+DEFAULT_PROFILE = CODEX_PROFILE
+
+
+def get_profile(name):
+    """Resolve a registered agent profile by name."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Agent name is required.")
+    profile = AGENT_PROFILES.get(name)
+    if profile is None:
+        known = ", ".join(sorted(AGENT_PROFILES))
+        raise ValueError(f"Unknown agent {name!r}. Known agents: {known}.")
+    return profile
+
 
 
 def paths():
@@ -54,30 +170,59 @@ def _permitted_settings(table, table_name, permitted):
         )
 
 
-def load_config(config_dir):
-    config_file = config_dir / "config.toml"
+def _read_config_toml(config_dir):
+    config_file = Path(config_dir) / "config.toml"
     if not config_file.is_file():
         raise ValueError(f"Missing {config_file}. Run `herdr plugin action invoke setup --plugin {PLUGIN_ID}`.")
     with config_file.open("rb") as stream:
-        config = tomllib.load(stream)
+        return config_file, tomllib.load(stream)
+
+
+def resolve_agent_home(config_dir, profile, config=None):
+    """Resolve the plugin-owned home for one agent profile.
+
+    Per-agent convention: default dirname is ``profile.home_dirname`` under the
+    config directory. A ``[<agent>].home`` table remains a compatibility
+    override. Every profile's normal user home is refused.
+    """
+    config_dir = Path(config_dir)
+    if config is None:
+        _, config = _read_config_toml(config_dir)
+    config_file = config_dir / "config.toml"
+    table = config.get(profile.name)
+    if table is None:
+        home = profile.home_dirname
+    elif not isinstance(table, dict):
+        raise ValueError(f"Expected [{profile.name}] table in {config_file}.")
+    else:
+        _permitted_settings(table, f"[{profile.name}]", {"home"})
+        home = table.get("home", profile.home_dirname)
+    if not isinstance(home, str) or home in ("", ".") or Path(home).is_absolute() or ".." in Path(home).parts:
+        raise ValueError(f"Set [{profile.name}].home to a relative path inside {config_dir}.")
+    agent_home = (config_dir / home).resolve()
+    if agent_home == config_dir.resolve() or not agent_home.is_relative_to(config_dir.resolve()):
+        raise ValueError(f"{profile.name} home escapes plugin config directory: {agent_home}.")
+    banned = {other.normal_user_home_path() for other in AGENT_PROFILES.values()}
+    if agent_home in banned:
+        raise ValueError(
+            f"The normal user {profile.name} home cannot be used by this plugin."
+        )
+    return agent_home
+
+
+def load_config(config_dir, profile=None):
+    """Load runtime image and the dedicated home for ``profile`` (default agent)."""
+    profile = DEFAULT_PROFILE if profile is None else profile
+    config_file, config = _read_config_toml(config_dir)
     runtime = config.get("runtime")
-    codex = config.get("codex")
-    if not isinstance(runtime, dict) or not isinstance(codex, dict):
-        raise ValueError(f"Expected [runtime] and [codex] tables in {config_file}.")
+    agent_table = config.get(profile.name)
+    if not isinstance(runtime, dict) or not isinstance(agent_table, dict):
+        raise ValueError(f"Expected [runtime] and [{profile.name}] tables in {config_file}.")
     _permitted_settings(runtime, "[runtime]", {"image", "network"})
-    _permitted_settings(codex, "[codex]", {"home"})
     image = runtime.get("image")
-    home = codex.get("home")
     if not isinstance(image, str) or not image.strip():
         raise ValueError(f"Set a nonempty [runtime].image in {config_file}.")
-    if not isinstance(home, str) or home in ("", ".") or Path(home).is_absolute() or ".." in Path(home).parts:
-        raise ValueError(f"Set [codex].home to a relative path inside {config_dir}.")
-    codex_home = (config_dir / home).resolve()
-    if codex_home == config_dir.resolve() or not codex_home.is_relative_to(config_dir.resolve()):
-        raise ValueError(f"Codex home escapes plugin config directory: {codex_home}.")
-    if codex_home == (Path.home() / ".codex").resolve():
-        raise ValueError("The normal user Codex home cannot be used by this plugin.")
-    return image, codex_home
+    return image, resolve_agent_home(config_dir, profile, config)
 
 
 def runtime_settings(config_dir):
@@ -603,7 +748,13 @@ if __name__ == "__main__":
     return hs_dest
 
 
-def check(repo=None, require_auth=False):
+def _login_hint(profile, agent_home):
+    login = " ".join(profile.login_argv)
+    return f"`{profile.home_env_var}={agent_home} {login}`"
+
+
+def check(repo=None, require_auth=False, profile=None):
+    profile = DEFAULT_PROFILE if profile is None else profile
     errors = host_errors()
     try:
         config_dir, state_dir = paths()
@@ -611,12 +762,20 @@ def check(repo=None, require_auth=False):
             errors.append(f"Plugin config directory is missing: {config_dir}. Run the setup action.")
         if not state_dir.is_dir():
             errors.append(f"Plugin state directory is missing: {state_dir}. Run the setup action.")
-        image, codex_home = load_config(config_dir)
+        image, agent_home = load_config(config_dir, profile)
         runtime_settings(config_dir)
-        if not codex_home.is_dir():
-            errors.append(f"Dedicated Codex home is missing: {codex_home}. Run the setup action.")
-        elif require_auth and not (codex_home / "auth.json").is_file():
-            errors.append(f"Codex authentication is missing in {codex_home}. Run `CODEX_HOME={codex_home} codex login --device-auth`.")
+        if not agent_home.is_dir():
+            errors.append(f"Dedicated {profile.name} home is missing: {agent_home}. Run the setup action.")
+        elif require_auth:
+            missing = [
+                name for name in profile.auth_files
+                if (agent_home / name).is_symlink() or not (agent_home / name).is_file()
+            ]
+            if missing:
+                errors.append(
+                    f"{profile.name} authentication is missing in {agent_home} "
+                    f"({', '.join(missing)}). Run {_login_hint(profile, agent_home)}."
+                )
         if shutil.which("podman") and platform.system() == "Linux":
             result = run("podman", "image", "exists", image)
             if result.returncode != 0:
@@ -642,9 +801,11 @@ def setup():
     boilerplate = image_dir / "Containerfile"
     if not boilerplate.exists():
         boilerplate.write_text((plugin_root() / "Containerfile").read_text())
-    image, codex_home = load_config(config_dir)
-    codex_home.mkdir(parents=True, exist_ok=True)
-    codex_home.chmod(0o700)
+    image, agent_home = load_config(config_dir, DEFAULT_PROFILE)
+    for profile in AGENT_PROFILES.values():
+        home = resolve_agent_home(config_dir, profile)
+        home.mkdir(parents=True, exist_ok=True)
+        home.chmod(0o700)
     launcher = write_launcher(config_dir, state_dir)
     try:
         hs_shim = install_hs_to_path()
@@ -653,11 +814,19 @@ def setup():
         if str(hs_shim.parent) not in os.environ.get("PATH", "").split(os.pathsep):
             hs_path_check = f"\nNote: {hs_shim.parent} is not on PATH. Add it or use the full path."
     except Exception as exc:
-        hs_installed = f"\nhs CLI installation failed: {exc}\nManually add {plugin_root() / 'bin'} to PATH to use `hs codex`"
+        hs_installed = (
+            f"\nhs CLI installation failed: {exc}\n"
+            f"Manually add {plugin_root() / 'bin'} to PATH to use `hs {DEFAULT_PROFILE.name}`"
+        )
         hs_path_check = ""
-    print(f"Config: {config_file}\nImage boilerplate: {boilerplate}\nLauncher: {launcher}\nState: {state_dir}\nCodex home: {codex_home}\nImage: {image}{hs_installed}{hs_path_check}")
+    print(
+        f"Config: {config_file}\nImage boilerplate: {boilerplate}\nLauncher: {launcher}\n"
+        f"State: {state_dir}\n{DEFAULT_PROFILE.name} home: {agent_home}\nImage: {image}"
+        f"{hs_installed}{hs_path_check}"
+    )
     print(f"Next: `herdr plugin action invoke build-image --plugin {PLUGIN_ID}`")
-    print(f"Authenticate: `CODEX_HOME={codex_home} codex login --device-auth`")
+    print(f"Authenticate: hs login {DEFAULT_PROFILE.name}")
+    print(f"  (or {_login_hint(DEFAULT_PROFILE, agent_home)})")
 
 
 def bootstrap():
@@ -665,15 +834,20 @@ def bootstrap():
     setup()
     build_image()
     config_dir, _ = paths()
-    _, codex_home = load_config(config_dir)
-    errors = check(require_auth=True)
-    remaining = [error for error in errors if "Codex authentication is missing" not in error]
+    _, agent_home = load_config(config_dir, DEFAULT_PROFILE)
+    errors = check(require_auth=True, profile=DEFAULT_PROFILE)
+    auth_marker = f"{DEFAULT_PROFILE.name} authentication is missing"
+    remaining = [error for error in errors if auth_marker not in error]
     if remaining:
         raise ValueError("Readiness checks failed:\n- " + "\n- ".join(remaining))
     if errors:
-        print(f"Almost ready. Authenticate once:\n  CODEX_HOME={codex_home} codex login --device-auth")
+        print(f"Almost ready. Authenticate once:\n  hs login {DEFAULT_PROFILE.name}")
+        print(f"  (or {_login_hint(DEFAULT_PROFILE, agent_home)})")
     else:
-        print("Sandbox setup is ready. Use `hs codex` from any Git repository pane, or create a worker with the Create Worker action.")
+        print(
+            f"Sandbox setup is ready. Use `hs {DEFAULT_PROFILE.name}` from any Git repository pane, "
+            "or create a worker with the Create Worker action."
+        )
 
 
 def build_image():
@@ -811,29 +985,113 @@ def validate_open_context(worker_id):
         )
 
 
-def fresh_codex_home(codex_home, worker_id):
-    """Create a disposable Codex home containing authentication but no history."""
-    auth_path = codex_home / "auth.json"
-    if auth_path.is_symlink() or not auth_path.is_file():
-        raise ValueError(f"Codex authentication is missing in {codex_home}.")
+def _auth_snapshot(path):
+    """Capture content and mtime of a regular auth file; refuse symlinks."""
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError(f"Auth file must not be a symlink: {path}")
+    if not path.is_file():
+        raise ValueError(f"Auth file is missing: {path}")
+    data = path.read_bytes()
+    mtime_ns = path.stat().st_mtime_ns
+    return {"path": path, "data": data, "mtime_ns": mtime_ns}
 
-    sessions_dir = codex_home / "sessions"
+
+def fresh_agent_home(agent_home, worker_id, profile):
+    """Create a disposable agent home containing auth files but no history.
+
+    Returns ``(session_home, launch_snapshots)`` where snapshots map auth file
+    names to the dedicated-home bytes/mtime captured at launch for write-back.
+    """
+    agent_home = Path(agent_home)
+    snapshots = {}
+    for name in profile.auth_files:
+        auth_path = agent_home / name
+        if auth_path.is_symlink() or not auth_path.is_file():
+            raise ValueError(f"{profile.name} authentication is missing in {agent_home}.")
+        snapshots[name] = _auth_snapshot(auth_path)
+
+    sessions_dir = agent_home / "sessions"
     if sessions_dir.is_symlink() or (sessions_dir.exists() and not sessions_dir.is_dir()):
-        raise ValueError(f"Codex session storage is not a real directory: {sessions_dir}.")
+        raise ValueError(f"{profile.name} session storage is not a real directory: {sessions_dir}.")
     sessions_dir.mkdir(mode=0o700, exist_ok=True)
     sessions_dir.chmod(0o700)
     session_home = Path(tempfile.mkdtemp(prefix=f"{worker_id}-", dir=sessions_dir))
     try:
         session_home.chmod(0o700)
-        shutil.copyfile(auth_path, session_home / "auth.json")
-        (session_home / "auth.json").chmod(0o600)
+        for name, snap in snapshots.items():
+            dest = session_home / name
+            with open(snap["path"], "rb") as src, open(dest, "wb") as out:
+                out.write(src.read())
+            dest.chmod(0o600)
     except (OSError, shutil.Error):
         shutil.rmtree(session_home, ignore_errors=True)
         raise
-    if not session_home.resolve().is_relative_to(codex_home.resolve()):
+    if not session_home.resolve().is_relative_to(agent_home.resolve()):
         shutil.rmtree(session_home, ignore_errors=True)
-        raise ValueError(f"Fresh Codex home escapes plugin config directory: {session_home}.")
-    return session_home
+        raise ValueError(f"Fresh {profile.name} home escapes plugin config directory: {session_home}.")
+    return session_home, snapshots
+
+
+def _atomic_write_bytes(path, data, mode=0o600):
+    """Write bytes atomically (temp + fsync + rename) without following symlinks."""
+    path = Path(path)
+    parent = path.parent
+    if path.is_symlink() or parent.is_symlink():
+        raise ValueError(f"Refusing to write through a symlink: {path}")
+    if path.exists() and not path.is_file():
+        raise ValueError(f"Auth destination is not a regular file: {path}")
+    fd, temp_path = tempfile.mkstemp(dir=parent, prefix=".tmp-auth-", suffix=".json")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+        path.chmod(mode)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def write_back_auth_files(agent_home, session_home, profile, launch_snapshots, state_dir=None):
+    """Write refreshed auth files back into the dedicated home (option a).
+
+    Under the state lock, copy each profile auth file from the session home only
+    when it is valid JSON with the expected shape and is newer or different from
+    the launch snapshot. Never follows symlinks; final mode is 0600.
+    """
+    agent_home = Path(agent_home)
+    session_home = Path(session_home)
+    written = []
+    with StateLock(state_dir):
+        for name in profile.auth_files:
+            src = session_home / name
+            dest = agent_home / name
+            if src.is_symlink() or dest.is_symlink():
+                continue
+            if not src.is_file():
+                continue
+            try:
+                payload = src.read_bytes()
+                data = json.loads(payload.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not profile.validate_auth_data(data):
+                continue
+            snap = launch_snapshots.get(name)
+            if snap is not None and payload == snap["data"]:
+                continue
+            try:
+                _atomic_write_bytes(dest, payload, mode=0o600)
+            except (OSError, ValueError):
+                continue
+            written.append(name)
+    return written
 
 
 def _container_missing(result):
@@ -1328,25 +1586,26 @@ def opportunistic_gc(state_dir=None, config_dir=None):
         return {"removed": [], "warnings": [str(exc)], "skipped": []}
 
 
-def sweep_stale_codex_sessions(codex_home, max_age_seconds=None, state_dir=None):
-    """Remove leftover per-launch session homes under <codex home>/sessions/.
+def sweep_stale_agent_sessions(agent_home, max_age_seconds=None, state_dir=None, profile=None):
+    """Remove leftover per-launch session homes under <agent home>/sessions/.
 
     Live sessions are those whose name is prefixed by a worker ID whose
     container is still running. Leftovers older than the oldest live session
     (or older than max_age when none are live) are removed. Symlinks are refused
     and deletion stays confined to the sessions directory.
     """
-    codex_home = Path(codex_home).expanduser().resolve()
-    sessions_dir = codex_home / "sessions"
+    profile = DEFAULT_PROFILE if profile is None else profile
+    agent_home = Path(agent_home).expanduser().resolve()
+    sessions_dir = agent_home / "sessions"
     if sessions_dir.is_symlink():
-        raise ValueError(f"Codex session storage is not a real directory: {sessions_dir}.")
+        raise ValueError(f"{profile.name} session storage is not a real directory: {sessions_dir}.")
     if not sessions_dir.exists():
         return []
     if not sessions_dir.is_dir():
-        raise ValueError(f"Codex session storage is not a real directory: {sessions_dir}.")
+        raise ValueError(f"{profile.name} session storage is not a real directory: {sessions_dir}.")
     sessions_root = sessions_dir.resolve()
-    if not sessions_root.is_relative_to(codex_home):
-        raise ValueError(f"Codex sessions directory escapes Codex home: {sessions_dir}.")
+    if not sessions_root.is_relative_to(agent_home):
+        raise ValueError(f"{profile.name} sessions directory escapes agent home: {sessions_dir}.")
 
     if max_age_seconds is None:
         try:
@@ -1720,7 +1979,7 @@ def warn_deprecated_integration_config(config_dir):
         )
     if "execute" in config:
         print(
-            "Note: [execute] is deprecated and ignored; use `hs codex --prompt \"...\"`.",
+            f'Note: [execute] is deprecated and ignored; use `hs {DEFAULT_PROFILE.name} --prompt "..."`.',
             file=sys.stderr,
         )
 
@@ -1753,27 +2012,37 @@ def _update_worker_metadata(worker_dir, updates):
 
 
 class PodmanSandboxRuntime:
-    """The single owner of the Podman worker isolation contract."""
+    """The single owner of the Podman worker isolation contract.
 
-    def __init__(self, worker_id, image, repo, codex_home, network, cpus, memory, pids):
+    Isolation flags (userns, capabilities, read-only root, network policy,
+    resource limits, workspace mount, tmp homes) are fixed here. A profile may
+    only supply agent-specific env, home mount, and argv values — never network
+    access, devices, capabilities, or extra mounts.
+    """
+
+    def __init__(self, worker_id, image, repo, agent_home, network, cpus, memory, pids, profile):
         self.worker_id = worker_id
         self.image = image
         self.repo = repo
-        self.codex_home = codex_home
+        self.agent_home = agent_home
         self.network = network
         self.cpus = cpus
         self.memory = memory
         self.pids = pids
+        self.profile = profile
 
     def _base_command(self, interactive=False):
         """Build the shared hardened Podman invocation for both execution modes."""
+        profile = self.profile
         invocation = [
             "podman", "run", "--rm",
             "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
             f"--pids-limit={self.pids}", f"--memory={self.memory}", f"--cpus={self.cpus}",
-            "--env", "HOME=/tmp/home", "--env", "CODEX_HOME=/codex", "--env", "XDG_CACHE_HOME=/tmp/cache",
+            "--env", "HOME=/tmp/home",
+            "--env", f"{profile.home_env_var}={profile.mount_point}",
+            "--env", "XDG_CACHE_HOME=/tmp/cache",
             "--mount", f"type=bind,src={self.repo.resolve()},dst=/workspace,rw",
-            "--mount", f"type=bind,src={self.codex_home.resolve()},dst=/codex,rw",
+            "--mount", f"type=bind,src={self.agent_home.resolve()},dst={profile.mount_point},rw",
             "--workdir", "/workspace",
         ]
         if interactive:
@@ -1788,8 +2057,8 @@ class PodmanSandboxRuntime:
         """Build a one-shot query invocation that cannot collide with the session.
 
         Unlike `_base_command`, this has no `--name herdr-<id>`, forces
-        `--network=none`, mounts the workspace read-only, and never mounts
-        `/codex` or sets `CODEX_HOME`.
+        `--network=none`, mounts the workspace read-only, and never mounts the
+        agent home or sets the agent home env var.
         """
         if not container_argv or any(not isinstance(arg, str) or not arg for arg in container_argv):
             raise ValueError("Query command must contain nonempty arguments.")
@@ -1812,53 +2081,50 @@ class PodmanSandboxRuntime:
         if not args or any(not isinstance(arg, str) or not arg for arg in args):
             raise ValueError("Interactive command must contain nonempty arguments.")
         if fresh:
-            if args[0] != "codex":
-                raise ValueError("Fresh Codex sessions must start with the codex command.")
-            if any(arg == "-C" or arg == "--cd" or arg.startswith("--cd=") for arg in args[1:]):
-                raise ValueError("Fresh Codex sessions must use the worker workspace at /workspace.")
-            args = ["codex", "--cd", "/workspace", *args[1:]]
+            args = self.profile.build_interactive_argv(args)
         return self._base_command(interactive=True) + [self.image] + args
 
     def noninteractive_command(self, prompt):
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError("Execution prompt must be a nonempty string.")
-        return self._base_command() + [self.image, "codex", "exec", "--sandbox", "danger-full-access", prompt]
+        return self._base_command() + [self.image] + self.profile.build_noninteractive_argv(prompt)
 
 
-def podman_runtime(worker_id, codex_home=None):
+def podman_runtime(worker_id, agent_home=None, profile=None):
     """Create the configured runtime only after validating its permitted paths."""
+    profile = DEFAULT_PROFILE if profile is None else profile
     validate_worker_id(worker_id)
     config_dir, state_dir = paths()
-    image, configured_codex_home = load_config(config_dir)
+    image, configured_home = load_config(config_dir, profile)
     network, cpus, memory, pids = runtime_settings(config_dir)
     _, worker_dir = worker_storage(worker_id, state_dir)
     repo = worker_dir / "repo"
     if not repo.is_dir() or repo.is_symlink() or not (repo / ".git").exists():
         raise ValueError(f"Worker repository does not exist: {repo}")
-    selected_codex_home = configured_codex_home if codex_home is None else Path(codex_home).expanduser().resolve()
-    if codex_home is not None and (
-        selected_codex_home == configured_codex_home
-        or not selected_codex_home.is_relative_to(configured_codex_home)
+    selected_home = configured_home if agent_home is None else Path(agent_home).expanduser().resolve()
+    if agent_home is not None and (
+        selected_home == configured_home
+        or not selected_home.is_relative_to(configured_home)
     ):
-        raise ValueError(f"Fresh Codex home must be inside the dedicated plugin home: {selected_codex_home}")
-    if not selected_codex_home.is_dir() or selected_codex_home.is_symlink():
-        raise ValueError(f"Dedicated Codex home does not exist: {selected_codex_home}")
-    return PodmanSandboxRuntime(worker_id, image, repo, selected_codex_home, network, cpus, memory, pids)
+        raise ValueError(f"Fresh {profile.name} home must be inside the dedicated plugin home: {selected_home}")
+    if not selected_home.is_dir() or selected_home.is_symlink():
+        raise ValueError(f"Dedicated {profile.name} home does not exist: {selected_home}")
+    return PodmanSandboxRuntime(
+        worker_id, image, repo, selected_home, network, cpus, memory, pids, profile,
+    )
 
 
-def open_command(worker_id, command=None, fresh=False, codex_home=None):
+def open_command(worker_id, command=None, fresh=False, agent_home=None, profile=None):
     """Build the central runtime's interactive invocation for a worker."""
-    return podman_runtime(worker_id, codex_home).interactive_command(command, fresh=fresh)
+    return podman_runtime(worker_id, agent_home, profile).interactive_command(command, fresh=fresh)
 
 
-def execute_command(worker_id, prompt):
-    """Build the shared runtime's noninteractive Codex invocation for a worker.
+def execute_command(worker_id, prompt, agent_home=None, profile=None):
+    """Build the shared runtime's noninteractive agent invocation for a worker.
 
-    Uses the shared dedicated Codex home (not a per-launch temp home). Long
-    noninteractive runs can refresh tokens in place; a temp home would discard
-    those writes. Issue #11 owns the token-refresh policy for all profiles.
+    Callers that need the per-launch temp home (interactive and ``--prompt``)
+    pass ``agent_home`` from ``fresh_agent_home``. Auth write-back after the
+    session is handled by ``write_back_auth_files``.
     """
-    return podman_runtime(worker_id).noninteractive_command(prompt)
+    return podman_runtime(worker_id, agent_home, profile).noninteractive_command(prompt)
 
 
 def resolve_pane_placement(placement, target_pane, direction):
@@ -1918,7 +2184,7 @@ def build_herdr_pane_open_command(placement, target_pane, direction):
     command = [
         herdr_bin, "plugin", "pane", "open",
         "--plugin", PLUGIN_ID,
-        "--entrypoint", "start-codex",
+        "--entrypoint", f"start-{DEFAULT_PROFILE.name}",
         "--placement", placement,
     ]
     if target_pane is not None:
@@ -1928,32 +2194,55 @@ def build_herdr_pane_open_command(placement, target_pane, direction):
     return command
 
 
-def open_worker(worker_id, command=None, fresh=False):
+def open_worker(worker_id, command=None, fresh=False, profile=None):
     """Open a terminal-attached worker session for Herdr to manage."""
+    profile = DEFAULT_PROFILE if profile is None else profile
     config_dir, state_dir = paths()
     _, worker_dir = worker_storage(worker_id, state_dir)
     validate_open_context(worker_id)
     command = list(command or ["bash"])
-    errors = check(require_auth=command[0] == "codex")
+    needs_auth = bool(command) and command[0] == profile.interactive_bin
+    errors = check(require_auth=needs_auth, profile=profile)
     if errors:
         raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
     session_home = None
+    launch_snapshots = None
+    configured_home = None
+    # Herdr reads HERDR_AGENT on the host wrapper, not inside the container.
+    previous_herdr_agent = os.environ.get("HERDR_AGENT")
     try:
         if fresh:
-            _, configured_codex_home = load_config(config_dir)
-            session_home = fresh_codex_home(configured_codex_home, worker_id)
-        invocation = open_command(worker_id, command, fresh=fresh, codex_home=session_home)
+            _, configured_home = load_config(config_dir, profile)
+            session_home, launch_snapshots = fresh_agent_home(configured_home, worker_id, profile)
+        invocation = open_command(
+            worker_id, command, fresh=fresh, agent_home=session_home, profile=profile,
+        )
+        run_kwargs = {"check": False}
+        if needs_auth or fresh:
+            os.environ["HERDR_AGENT"] = profile.herdr_agent
+            run_kwargs["env"] = profile.host_env()
         _write_worker_status(worker_dir, "running")
         try:
-            result = subprocess.run(invocation, check=False)
+            result = subprocess.run(invocation, **run_kwargs)
         except BaseException:
             _write_worker_status(worker_dir, "failed")
             raise
         _write_worker_status(worker_dir, "stopped" if result.returncode == 0 else "failed")
         return result.returncode
     finally:
-        if session_home is not None:
+        if session_home is not None and launch_snapshots is not None and configured_home is not None:
+            try:
+                write_back_auth_files(
+                    configured_home, session_home, profile, launch_snapshots, state_dir=state_dir,
+                )
+            except Exception as exc:  # noqa: BLE001 - session cleanup must proceed
+                print(f"Auth write-back skipped: {exc}", file=sys.stderr)
             shutil.rmtree(session_home, ignore_errors=True)
+        if previous_herdr_agent is None:
+            os.environ.pop("HERDR_AGENT", None)
+        else:
+            os.environ["HERDR_AGENT"] = previous_herdr_agent
+
 
 
 def _execution_run_paths(worker_dir):
@@ -2047,98 +2336,121 @@ def _stream_process(process, log_path):
     return process.wait(), {name: "".join(value) for name, value in output.items()}
 
 
-def execute_worker(worker_id, prompt):
-    """Run one Codex prompt with live output and a durable per-run result.
+def execute_worker(worker_id, prompt, profile=None):
+    """Run one agent prompt with live output and a durable per-run result.
 
-    After the agent exits, fetch into ``sandbox/<id>`` and take post-run HEAD and
-    commit count from the source repository against that ref. Host git never uses
-    the worker clone as cwd or ``-C``.
+    Uses the same per-launch temp home as interactive mode. After the agent
+    exits, auth files may be written back (option a), then the session home is
+    removed. Fetch lands in ``sandbox/<id>``; post-run HEAD and commit count
+    come from the source repository. Host git never uses the worker clone as
+    cwd or ``-C``.
     """
-    _, state_dir = paths()
+    profile = DEFAULT_PROFILE if profile is None else profile
+    config_dir, state_dir = paths()
     _, worker_dir = worker_storage(worker_id, state_dir)
-    errors = check(require_auth=True)
+    errors = check(require_auth=True, profile=profile)
     if errors:
         raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
-    invocation = execute_command(worker_id, prompt)
-    _write_worker_status(worker_dir, "running")
-    result_record, result_path, log_path = _start_execution_result(worker_dir, worker_id)
-    process = None
+    _, configured_home = load_config(config_dir, profile)
+    session_home, launch_snapshots = fresh_agent_home(configured_home, worker_id, profile)
+    previous_herdr_agent = os.environ.get("HERDR_AGENT")
+    os.environ["HERDR_AGENT"] = profile.herdr_agent
+    host_env = profile.host_env()
     try:
-        process = subprocess.Popen(
-            invocation,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-        )
-        exit_status, output = _stream_process(process, log_path)
-    except BaseException as exc:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
-        error = f"{type(exc).__name__}: {exc}"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as log_stream:
-            log_stream.write(f"\n[plugin error] {error}\n")
+        invocation = execute_command(worker_id, prompt, agent_home=session_home, profile=profile)
+        _write_worker_status(worker_dir, "running")
+        result_record, result_path, log_path = _start_execution_result(worker_dir, worker_id)
+        process = None
+        try:
+            process = subprocess.Popen(
+                invocation,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+                env=host_env,
+            )
+            exit_status, output = _stream_process(process, log_path)
+        except BaseException as exc:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            error = f"{type(exc).__name__}: {exc}"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as log_stream:
+                log_stream.write(f"\n[plugin error] {error}\n")
+            _finish_execution_result(
+                result_record,
+                result_path,
+                status="failed",
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                error=error,
+            )
+            _write_worker_status(worker_dir, "failed")
+            raise
+
+        status = "completed" if exit_status == 0 else "failed"
+        head_value = "unavailable"
+        result_branch = None
+        commit_count = None
+        snapshot = None
+        try:
+            fetch_result = fetch_worker(worker_id, state_dir)
+            head_value = fetch_result["commit"]
+            result_branch = fetch_result["branch"]
+            commit_count = fetch_result["commit_count"]
+            snapshot = fetch_result.get("git_snapshot")
+            if fetch_result.get("dirty_warning"):
+                print(fetch_result["dirty_warning"], file=sys.stderr)
+            if fetch_result.get("head_moved_notice"):
+                print(fetch_result["head_moved_notice"], file=sys.stderr)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            print(
+                f"Worker {worker_id} was left un-fetched. "
+                f"Switch away from sandbox/{worker_id} if it is checked out, then run: hs fetch {worker_id}",
+                file=sys.stderr,
+            )
+            _write_worker_status(worker_dir, status)
+
+        if snapshot is None:
+            snapshot = _query_worker_git_snapshot(worker_id)
+        if snapshot["error"]:
+            git_status_value = f"(unavailable: {snapshot['error']})"
+            dirty_value = None
+        else:
+            git_status_value = snapshot["status_short"]
+            dirty_value = bool(snapshot["status_porcelain"])
         _finish_execution_result(
             result_record,
             result_path,
-            status="failed",
+            status=status,
             finished_at=datetime.now(timezone.utc).isoformat(),
-            error=error,
+            exit_status=exit_status,
+            head=head_value,
+            dirty=dirty_value,
+            git_status=git_status_value,
+            result_branch=result_branch,
+            commit_count=commit_count,
         )
-        _write_worker_status(worker_dir, "failed")
-        raise
+        return {
+            **result_record,
+            "stdout": output["stdout"],
+            "stderr": output["stderr"],
+        }
+    finally:
+        try:
+            write_back_auth_files(
+                configured_home, session_home, profile, launch_snapshots, state_dir=state_dir,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Auth write-back skipped: {exc}", file=sys.stderr)
+        shutil.rmtree(session_home, ignore_errors=True)
+        if previous_herdr_agent is None:
+            os.environ.pop("HERDR_AGENT", None)
+        else:
+            os.environ["HERDR_AGENT"] = previous_herdr_agent
 
-    status = "completed" if exit_status == 0 else "failed"
-    head_value = "unavailable"
-    result_branch = None
-    commit_count = None
-    snapshot = None
-    try:
-        fetch_result = fetch_worker(worker_id, state_dir)
-        head_value = fetch_result["commit"]
-        result_branch = fetch_result["branch"]
-        commit_count = fetch_result["commit_count"]
-        snapshot = fetch_result.get("git_snapshot")
-        if fetch_result.get("dirty_warning"):
-            print(fetch_result["dirty_warning"], file=sys.stderr)
-        if fetch_result.get("head_moved_notice"):
-            print(fetch_result["head_moved_notice"], file=sys.stderr)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        print(
-            f"Worker {worker_id} was left un-fetched. "
-            f"Switch away from sandbox/{worker_id} if it is checked out, then run: hs fetch {worker_id}",
-            file=sys.stderr,
-        )
-        _write_worker_status(worker_dir, status)
-
-    if snapshot is None:
-        snapshot = _query_worker_git_snapshot(worker_id)
-    if snapshot["error"]:
-        git_status_value = f"(unavailable: {snapshot['error']})"
-        dirty_value = None
-    else:
-        git_status_value = snapshot["status_short"]
-        dirty_value = bool(snapshot["status_porcelain"])
-    _finish_execution_result(
-        result_record,
-        result_path,
-        status=status,
-        finished_at=datetime.now(timezone.utc).isoformat(),
-        exit_status=exit_status,
-        head=head_value,
-        dirty=dirty_value,
-        git_status=git_status_value,
-        result_branch=result_branch,
-        commit_count=commit_count,
-    )
-    return {
-        **result_record,
-        "stdout": output["stdout"],
-        "stderr": output["stderr"],
-    }
 
 
 def print_execution_result(result):
@@ -3051,15 +3363,17 @@ def resolve_prompt_argument(prompt):
     return prompt
 
 
-def create_worker(worker_id, repo=None, base_ref="HEAD", agent="codex"):
+def create_worker(worker_id, repo=None, base_ref="HEAD", agent=None):
     """Create a new worker with generated ID and pane tracking.
     
     Args:
         worker_id: Worker ID, or None to generate one
         repo: Source repository path
         base_ref: Base ref or commit (default: HEAD)
-        agent: Agent name (default: codex)
+        agent: Agent name (default: DEFAULT_PROFILE.name)
     """
+    if agent is None:
+        agent = DEFAULT_PROFILE.name
     if not base_ref or base_ref.startswith("-") or any(char.isspace() for char in base_ref):
         raise ValueError("Base ref must be a nonempty Git ref or commit without whitespace or a leading hyphen.")
     repo = repo or context_repo()
@@ -3186,12 +3500,15 @@ def resolve_source_repo_from_cwd():
     return Path(result.stdout.strip()).resolve()
 
 
-def prepare_hs_worker(agent="codex"):
+def prepare_hs_worker(agent=None):
     """Shared launcher setup: root check, GC, dirty refuse, create or reuse worker.
 
     Returns ``(worker_id, state_dir)``. Prints one-line errors to stderr and
     returns ``(None, None)`` when launch must abort with exit status 1.
     """
+    if agent is None:
+        agent = DEFAULT_PROFILE.name
+    profile = get_profile(agent)
     check_root()
 
     config_dir, state_dir = paths()
@@ -3199,10 +3516,10 @@ def prepare_hs_worker(agent="codex"):
     # Opportunistic GC must never fail the launch.
     opportunistic_gc(state_dir=state_dir, config_dir=config_dir)
     try:
-        _, codex_home = load_config(config_dir)
-        sweep_stale_codex_sessions(codex_home, state_dir=state_dir)
+        _, agent_home = load_config(config_dir, profile)
+        sweep_stale_agent_sessions(agent_home, state_dir=state_dir, profile=profile)
     except Exception as exc:  # noqa: BLE001 - launch must not fail because of session sweep
-        print(f"Codex session sweep skipped: {exc}", file=sys.stderr)
+        print(f"{profile.name} session sweep skipped: {exc}", file=sys.stderr)
 
     try:
         source_repo = resolve_source_repo_from_cwd()
@@ -3241,45 +3558,43 @@ def prepare_hs_worker(agent="codex"):
     return worker_id, state_dir
 
 
-def hs_codex(codex_args, prompt=None):
-    """hs codex entrypoint: create or reuse a worker and launch Codex.
+def hs_agent(profile, agent_args, prompt=None):
+    """Create or reuse a worker and launch the given agent profile.
 
-    Without ``prompt``, opens an interactive session (per-launch temp Codex home)
-    then auto-fetches into ``sandbox/<id>``. With ``prompt``, runs noninteractive
-    ``codex exec`` on the shared dedicated Codex home, writes
-    ``runs/<run-id>/result.json`` / ``output.log``, auto-fetches, and returns the
-    agent's exit status.
+    Without ``prompt``, opens an interactive session (per-launch temp home)
+    then auto-fetches into ``sandbox/<id>``. With ``prompt``, runs the profile's
+    noninteractive argv with the same per-launch home and auth write-back,
+    writes ``runs/<run-id>/result.json`` / ``output.log``, auto-fetches, and
+    returns the agent's exit status.
     """
-    worker_id, state_dir = prepare_hs_worker("codex")
+    worker_id, state_dir = prepare_hs_worker(profile.name)
     if worker_id is None:
         return 1
 
     if prompt is not None:
-        extra = [arg for arg in (codex_args or []) if arg != "--"]
+        extra = [arg for arg in (agent_args or []) if arg != "--"]
         if extra:
             print(
-                "Do not pass extra Codex arguments with --prompt; "
-                "use interactive `hs codex` without --prompt.",
+                f"Do not pass extra {profile.name} arguments with --prompt; "
+                f"use interactive `hs {profile.name}` without --prompt.",
                 file=sys.stderr,
             )
             return 1
         try:
             prompt = resolve_prompt_argument(prompt)
-            result = execute_worker(worker_id, prompt)
+            result = execute_worker(worker_id, prompt, profile=profile)
         except (ValueError, OSError) as exc:
             print(exc, file=sys.stderr)
             return 1
         print_execution_result(result)
         exit_status = result["exit_status"]
-        # Mirror interactive mode: a failed auto-fetch must not report success.
         if result.get("result_branch") is None:
             return exit_status if exit_status else 1
         return exit_status
 
-    # Interactive: fresh session home, then fetch results into sandbox/<id>.
     try:
-        command = ["codex"] + list(codex_args or [])
-        exit_code = open_worker(worker_id, command, fresh=True)
+        command = [profile.interactive_bin] + list(agent_args or [])
+        exit_code = open_worker(worker_id, command, fresh=True, profile=profile)
     except Exception as exc:
         print(f"Worker launch failed: {exc}", file=sys.stderr)
         return 1
@@ -3297,6 +3612,35 @@ def hs_codex(codex_args, prompt=None):
     return exit_code
 
 
+def login_agent(agent_name):
+    """Run the profile login with the home env pointed at the plugin-owned home.
+
+    Refuses every registered agent's normal user home.
+    """
+    profile = get_profile(agent_name)
+    config_dir, _ = paths()
+    try:
+        load_config(config_dir, profile)
+    except ValueError:
+        setup()
+    agent_home = resolve_agent_home(config_dir, profile)
+    banned = {other.normal_user_home_path() for other in AGENT_PROFILES.values()}
+    if agent_home in banned or agent_home == Path.home().resolve():
+        raise ValueError(
+            f"Refusing to run login against the normal user {profile.name} home "
+            f"({profile.normal_user_home_path()}). Use the plugin-owned home."
+        )
+    agent_home.mkdir(parents=True, exist_ok=True)
+    agent_home.chmod(0o700)
+    if not profile.login_argv or profile.login_argv[0].startswith("-"):
+        raise ValueError(f"Invalid login command for {profile.name}.")
+    env = os.environ.copy()
+    env[profile.home_env_var] = str(agent_home)
+    print(f"Logging in {profile.name} with {profile.home_env_var}={agent_home}")
+    result = subprocess.run(list(profile.login_argv), env=env, check=False)
+    return result.returncode
+
+
 def resolve_fetch_worker(worker_id, config_dir):
     """Resolve a fetch target from a positional/option ID, config, or sole worker."""
     if worker_id:
@@ -3312,7 +3656,11 @@ def main():
     commands.add_parser("build-image")
     check_parser = commands.add_parser("check")
     check_parser.add_argument("--repo", help="Also verify a source Git repository")
-    check_parser.add_argument("--execution", action="store_true", help="Also require dedicated Codex authentication")
+    check_parser.add_argument(
+        "--execution",
+        action="store_true",
+        help="Also require dedicated agent authentication",
+    )
     create_parser = commands.add_parser("create")
     create_parser.add_argument("--id", help="Worker ID (prompted for in an interactive terminal)")
     create_parser.add_argument("--repo", help="Source repository (defaults to the Herdr workspace)")
@@ -3364,17 +3712,32 @@ def main():
     open_parser = commands.add_parser("open", help="Open an interactive sandbox worker")
     open_parser.add_argument("worker_id", nargs="?", help="Worker ID")
     open_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
-    open_parser.add_argument("--codex", action="store_true", help="Start Codex instead of the default shell")
+    open_parser.add_argument(
+        f"--{DEFAULT_PROFILE.name}",
+        dest="start_default_agent",
+        action="store_true",
+        help=f"Start {DEFAULT_PROFILE.name} instead of the default shell",
+    )
     open_parser.add_argument("session_command", nargs=argparse.REMAINDER, help="Command and arguments to run in the worker")
-    start_parser = commands.add_parser("start-codex", help="Start a fresh Codex session in a sandbox worker")
+    start_name = f"start-{DEFAULT_PROFILE.name}"
+    start_parser = commands.add_parser(
+        start_name,
+        help=f"Start a fresh {DEFAULT_PROFILE.name} session in a sandbox worker",
+    )
     start_parser.add_argument("--id", help="Worker ID (or configure [open].id)")
-    pane_open_parser = commands.add_parser("pane-open", help="Open the start-codex pane through Herdr with validated placement")
+    pane_open_parser = commands.add_parser(
+        "pane-open",
+        help=f"Open the {start_name} pane through Herdr with validated placement",
+    )
     pane_open_parser.add_argument("--placement", help="Pane placement: overlay, split, or tab (default: overlay)")
     pane_open_parser.add_argument("--target-pane", help="Target pane for split placement (for example, w1:p1)")
     pane_open_parser.add_argument("--direction", help="Split direction: right or down")
     execute_parser = commands.add_parser(
         "execute",
-        help="Alias of codex --prompt: run one noninteractive Codex task (deprecated name; use hs codex --prompt)",
+        help=(
+            f"Alias of {DEFAULT_PROFILE.name} --prompt: run one noninteractive "
+            f"{DEFAULT_PROFILE.name} task (deprecated name; use hs {DEFAULT_PROFILE.name} --prompt)"
+        ),
     )
     execute_parser.add_argument(
         "--prompt",
@@ -3383,12 +3746,25 @@ def main():
     )
     workers_parser = commands.add_parser("workers", help=argparse.SUPPRESS)
     workers_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    codex_parser = commands.add_parser("codex", help="Create or reuse worker and launch Codex (RFC phase 1)")
-    codex_parser.add_argument(
-        "--prompt",
-        help='Run noninteractively with this task prompt (use "-" to read stdin)',
+    login_parser = commands.add_parser("login", help="Authenticate an agent into its plugin-owned home")
+    login_parser.add_argument(
+        "agent",
+        help=f"Agent name ({', '.join(sorted(AGENT_PROFILES))})",
     )
-    codex_parser.add_argument("codex_args", nargs=argparse.REMAINDER, help="Arguments to pass to codex")
+    for profile in AGENT_PROFILES.values():
+        agent_parser = commands.add_parser(
+            profile.name,
+            help=f"Create or reuse worker and launch {profile.name}",
+        )
+        agent_parser.add_argument(
+            "--prompt",
+            help='Run noninteractively with this task prompt (use "-" to read stdin)',
+        )
+        agent_parser.add_argument(
+            "agent_args",
+            nargs=argparse.REMAINDER,
+            help=f"Arguments to pass to {profile.name}",
+        )
     args = parser.parse_args()
     try:
         try:
@@ -3431,7 +3807,6 @@ def main():
                 if pane:
                     raise ValueError("Pass either --pane or --from-event, not both.")
                 pane = parse_plugin_event_json(os.environ.get("HERDR_PLUGIN_EVENT_JSON"))
-            # Explicit full `hs gc` may fetch-before-delete; pane/event paths must not.
             allow_fetch = pane is None and not args.from_event
             with StateLock(state_dir):
                 result = gc_collect_workers(
@@ -3447,12 +3822,18 @@ def main():
             else:
                 print("No workers collected.")
             try:
-                _, codex_home = load_config(config_dir)
-                swept = sweep_stale_codex_sessions(codex_home, state_dir=state_dir)
-                if swept:
-                    print(f"Swept Codex session homes: {', '.join(swept)}", file=sys.stderr)
+                for profile in AGENT_PROFILES.values():
+                    _, agent_home = load_config(config_dir, profile)
+                    swept = sweep_stale_agent_sessions(
+                        agent_home, state_dir=state_dir, profile=profile,
+                    )
+                    if swept:
+                        print(
+                            f"Swept {profile.name} session homes: {', '.join(swept)}",
+                            file=sys.stderr,
+                        )
             except ValueError as exc:
-                print(f"Codex session sweep skipped: {exc}", file=sys.stderr)
+                print(f"Agent session sweep skipped: {exc}", file=sys.stderr)
         elif args.command == "fetch":
             config_dir, _ = paths()
             worker_id = resolve_fetch_worker(
@@ -3480,14 +3861,19 @@ def main():
         elif args.command == "open":
             config_dir, _ = paths()
             worker_id = resolve_open_worker(args.worker_id or args.option_worker_id, config_dir)
-            command = args.session_command or (["codex"] if args.codex else ["bash"])
-            if command and command[0] == "codex":
-                return open_worker(worker_id, command, fresh=True)
+            if args.start_default_agent:
+                command = [DEFAULT_PROFILE.interactive_bin]
+            else:
+                command = args.session_command or ["bash"]
+            if command and command[0] == DEFAULT_PROFILE.interactive_bin:
+                return open_worker(worker_id, command, fresh=True, profile=DEFAULT_PROFILE)
             return open_worker(worker_id, command)
-        elif args.command == "start-codex":
+        elif args.command == start_name:
             config_dir, _ = paths()
             worker_id = resolve_open_worker(args.id, config_dir)
-            return open_worker(worker_id, ["codex"], fresh=True)
+            return open_worker(
+                worker_id, [DEFAULT_PROFILE.interactive_bin], fresh=True, profile=DEFAULT_PROFILE,
+            )
         elif args.command == "pane-open":
             command = build_herdr_pane_open_command(args.placement, args.target_pane, args.direction)
             return subprocess.run(command, check=False).returncode
@@ -3496,11 +3882,15 @@ def main():
                 raise ValueError(
                     'Task prompt is required. Pass `execute --prompt "..."` '
                     "(or --prompt - to read stdin). "
-                    "`execute` is an alias of `hs codex --prompt`; [execute] config is ignored."
+                    f"`execute` is an alias of `hs {DEFAULT_PROFILE.name} --prompt`; "
+                    "[execute] config is ignored."
                 )
-            return hs_codex([], prompt=args.option_prompt)
-        elif args.command == "codex":
-            return hs_codex(args.codex_args, prompt=args.prompt)
+            return hs_agent(DEFAULT_PROFILE, [], prompt=args.option_prompt)
+        elif args.command == "login":
+            return login_agent(args.agent)
+        elif args.command in AGENT_PROFILES:
+            profile = AGENT_PROFILES[args.command]
+            return hs_agent(profile, args.agent_args, prompt=args.prompt)
         else:
             errors = check(args.repo or context_repo(), args.execution)
             if errors:
@@ -3510,6 +3900,7 @@ def main():
         print(exc, file=sys.stderr)
         return 1
     return 0
+
 
 
 if __name__ == "__main__":

@@ -108,7 +108,7 @@ class OpenWorkerTests(unittest.TestCase):
         with patch.object(plugin, "check", return_value=[]) as check, patch.object(plugin.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
             self.assertEqual(plugin.open_worker("TEST-001", ["bash"]), 0)
 
-        check.assert_called_once_with(require_auth=False)
+        check.assert_called_once_with(require_auth=False, profile=plugin.DEFAULT_PROFILE)
         self.assertEqual(run.call_args.kwargs, {"check": False})
         self.assertIn("-it", run.call_args.args[0])
         metadata = json.loads((self.state / "workers" / "TEST-001" / "worker.json").read_text())
@@ -137,13 +137,17 @@ class OpenWorkerTests(unittest.TestCase):
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "open", "TEST-001", "--", "codex", "--model", "gpt-5"]), \
                 patch.object(plugin, "open_worker", return_value=0) as open_worker:
             self.assertEqual(plugin.main(), 0)
-        open_worker.assert_called_once_with("TEST-001", ["codex", "--model", "gpt-5"], fresh=True)
+        open_worker.assert_called_once_with(
+            "TEST-001", ["codex", "--model", "gpt-5"], fresh=True, profile=plugin.DEFAULT_PROFILE,
+        )
 
     def test_start_codex_subcommand_selects_a_fresh_worker_session(self):
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "start-codex", "--id", "TEST-001"]), \
                 patch.object(plugin, "open_worker", return_value=0) as open_worker:
             self.assertEqual(plugin.main(), 0)
-        open_worker.assert_called_once_with("TEST-001", ["codex"], fresh=True)
+        open_worker.assert_called_once_with(
+            "TEST-001", ["codex"], fresh=True, profile=plugin.DEFAULT_PROFILE,
+        )
 
     def test_start_codex_uses_selected_worker_not_active_workspace_or_shared_history(self):
         root = Path(self.temp.name)

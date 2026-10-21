@@ -319,7 +319,7 @@ class FetchTests(unittest.TestCase):
                 patch.object(plugin, "find_reusable_worker", return_value=("AUTO-001", None)), \
                 patch.object(plugin, "open_worker", return_value=0) as opened, \
                 patch("sys.stdout", new_callable=io.StringIO) as stdout:
-            code = plugin.hs_codex([])
+            code = plugin.hs_agent(plugin.DEFAULT_PROFILE, [])
         self.assertEqual(code, 0)
         opened.assert_called_once()
         self.assertEqual(

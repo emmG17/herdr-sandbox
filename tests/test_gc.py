@@ -423,7 +423,7 @@ class GcTests(unittest.TestCase):
         old = sessions / "OLDWORKER-001-abc123"
         old.mkdir()
         os.utime(old, (time.time() - 10 * 86400, time.time() - 10 * 86400))
-        removed = plugin.sweep_stale_codex_sessions(
+        removed = plugin.sweep_stale_agent_sessions(
             codex_home,
             max_age_seconds=86400,
             state_dir=self.state,
