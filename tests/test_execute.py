@@ -66,7 +66,13 @@ class ExecuteWorkerTests(unittest.TestCase):
 
         with patch.object(plugin, "check", return_value=[]) as check, \
                 patch.object(plugin, "execute_command", return_value=[sys.executable, "-c", code]), \
-                patch.object(plugin, "_query_worker_git_in_container", return_value=(0, " M persisted.txt", "")), \
+                patch.object(plugin, "_query_worker_git_snapshot", return_value={
+                    "status_porcelain": " M persisted.txt",
+                    "log": "",
+                    "status_short": " M persisted.txt",
+                    "diff": "",
+                    "error": None,
+                }), \
                 patch.object(plugin.sys, "stdout", new_callable=io.StringIO) as stdout, \
                 patch.object(plugin.sys, "stderr", new_callable=io.StringIO) as stderr:
             result = plugin.execute_worker("TEST-001", "write persisted.txt")
@@ -97,7 +103,13 @@ class ExecuteWorkerTests(unittest.TestCase):
     def test_execute_failure_is_actionable_and_marks_worker_failed(self):
         with patch.object(plugin, "check", return_value=[]), \
                 patch.object(plugin, "execute_command", return_value=[sys.executable, "-c", "import sys; print('task failed', file=sys.stderr, flush=True); sys.exit(9)"]), \
-                patch.object(plugin, "_git_read", return_value=(0, "", "")), \
+                patch.object(plugin, "_query_worker_git_snapshot", return_value={
+                    "status_porcelain": "",
+                    "log": "",
+                    "status_short": "",
+                    "diff": "",
+                    "error": None,
+                }), \
                 patch.object(plugin.sys, "stdout", new_callable=io.StringIO), \
                 patch.object(plugin.sys, "stderr", new_callable=io.StringIO) as stderr:
             result = plugin.execute_worker("TEST-001", "fail")

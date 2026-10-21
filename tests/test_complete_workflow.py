@@ -61,7 +61,13 @@ class CompleteWorkflowTests(unittest.TestCase):
                     "-c",
                     f"from pathlib import Path; Path({str(worker_repo / 'worker.txt')!r}).write_text('worker-only change\\n'); print('completed', flush=True)",
                 ]), \
-                patch.object(plugin, "_query_worker_git_in_container", return_value=(0, "?? worker.txt", "")), \
+                patch.object(plugin, "_query_worker_git_snapshot", return_value={
+                    "status_porcelain": "?? worker.txt",
+                    "log": "",
+                    "status_short": "?? worker.txt",
+                    "diff": "",
+                    "error": None,
+                }), \
                 patch.object(plugin.sys, "stdout", new_callable=io.StringIO) as worker_output:
             result = plugin.execute_worker("FLOW-001", "write worker.txt")
         self.assertEqual(result["exit_status"], 0)
@@ -75,13 +81,13 @@ class CompleteWorkflowTests(unittest.TestCase):
         worker_head = git("-C", worker_repo, "rev-parse", "HEAD")
 
         with patch.object(plugin, "container_status", return_value="not-found"), \
-                patch.object(plugin, "_query_worker_git_in_container") as query:
-            query.side_effect = [
-                (0, "", ""),  # status --porcelain
-                (0, "abc worker change", ""),  # log
-                (0, "## agent/FLOW-001", ""),  # status --short --branch
-                (0, "worker-only change", ""),  # diff
-            ]
+                patch.object(plugin, "_query_worker_git_snapshot", return_value={
+                    "status_porcelain": "",
+                    "log": "abc worker change",
+                    "status_short": "## agent/FLOW-001",
+                    "diff": "worker-only change",
+                    "error": None,
+                }):
             inspection = plugin.inspect_worker("FLOW-001")
         self.assertEqual(inspection["head"], worker_head)
         self.assertIn("worker-only change", inspection["git_diff"])

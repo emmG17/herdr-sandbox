@@ -84,13 +84,13 @@ class WorkerInspectionTests(unittest.TestCase):
         git("-C", clone, "commit", "-qam", "worker change")
         (clone / "untracked.txt").write_text("untracked\n")
 
-        with patch.object(plugin, "_query_worker_git_in_container") as query:
-            query.side_effect = [
-                (0, " M value.txt\n?? untracked.txt", ""),  # status --porcelain
-                (0, "abc123 worker change", ""),  # log
-                (0, "## agent/TEST-001\n M value.txt\n?? untracked.txt", ""),  # status --short
-                (0, "diff --git a/value.txt\nworker change", ""),  # diff
-            ]
+        with patch.object(plugin, "_query_worker_git_snapshot", return_value={
+            "status_porcelain": " M value.txt\n?? untracked.txt",
+            "log": "abc123 worker change",
+            "status_short": "## agent/TEST-001\n M value.txt\n?? untracked.txt",
+            "diff": "diff --git a/value.txt\nworker change",
+            "error": None,
+        }):
             record = plugin.inspect_worker("TEST-001")
 
         self.assertEqual(record["actual_branch"], "agent/TEST-001")
