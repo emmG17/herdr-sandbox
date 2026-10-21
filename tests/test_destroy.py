@@ -49,6 +49,9 @@ class DestroyTests(unittest.TestCase):
         ready = patch.object(plugin, "check", return_value=[])
         ready.start()
         self.addCleanup(ready.stop)
+        containers = patch.object(plugin, "container_status", return_value="not-found")
+        containers.start()
+        self.addCleanup(containers.stop)
 
     def create_worker(self, worker_id="TEST-001"):
         return plugin.create_worker(worker_id, str(self.source))
@@ -75,7 +78,7 @@ class DestroyTests(unittest.TestCase):
             self.assertTrue(plugin.destroy_worker("TEST-001"))
 
         self.assertEqual(events[0], ("podman", ("podman", "rm", "-f", "herdr-TEST-001")))
-        self.assertEqual(events[1], ("rmtree", worker))
+        self.assertEqual(events[1], ("rmtree", worker.resolve()))
         self.assertFalse(worker.exists())
         self.assertTrue((other / "keep.txt").exists())
         self.assertEqual(git("-C", self.source, "rev-parse", "HEAD"), self.source_head)
@@ -122,41 +125,64 @@ class DestroyTests(unittest.TestCase):
         self.assertTrue((outside / "do-not-delete").exists())
 
         workers = self.state / "workers"
-        workers.mkdir()
+        workers.mkdir(exist_ok=True)
         (workers / "escape").symlink_to(outside, target_is_directory=True)
         with self.assertRaisesRegex(ValueError, "real directory"):
             plugin.destroy_worker("escape")
         self.assertTrue((outside / "do-not-delete").exists())
 
-    def test_destroy_action_uses_configured_id(self):
-        (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + '\n[destroy]\nid = "configured"\n')
-        with patch.object(plugin.sys, "argv", [str(SCRIPT), "destroy"]), \
-                patch.object(plugin, "destroy_worker", return_value=True) as destroy:
-            self.assertEqual(plugin.main(), 0)
-        destroy.assert_called_once_with("configured")
+    def test_rm_refuses_running_container_without_force(self):
+        self.create_worker()
+        with patch.object(plugin, "container_status", return_value="running"):
+            with self.assertRaisesRegex(ValueError, "running container"):
+                plugin.destroy_worker("TEST-001", force=False)
+        self.assertTrue((self.state / "workers" / "TEST-001").exists())
 
-    def test_manifest_exposes_destroy_action(self):
+    def test_rm_force_removes_running_container(self):
+        self.create_worker()
+        with patch.object(plugin, "container_status", return_value="running"), \
+                patch.object(plugin, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.assertTrue(plugin.destroy_worker("TEST-001", force=True))
+        self.assertFalse((self.state / "workers" / "TEST-001").exists())
+
+    def test_rm_warns_when_unfetched(self):
+        self.create_worker()
+        stderr = io.StringIO()
+        with patch.object(plugin, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                patch.object(plugin.sys, "stderr", stderr):
+            plugin.destroy_worker("TEST-001", warn_unfetched=True)
+        self.assertIn("never fetched", stderr.getvalue())
+
+    def test_destroy_is_alias_of_rm_and_ignores_destroy_config(self):
+        (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + '\n[destroy]\nid = "configured"\n')
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "destroy"]), \
+                patch.object(plugin.sys, "stderr", stderr):
+            self.assertEqual(plugin.main(), 1)
+        self.assertIn("Worker ID is required", stderr.getvalue())
+        self.assertNotIn("destroy_options", dir(plugin))
+
+    def test_manifest_exposes_destroy_as_rm_alias(self):
         with (SCRIPT.parent.parent / "herdr-plugin.toml").open("rb") as stream:
             manifest = tomllib.load(stream)
         action = next(action for action in manifest["actions"] if action["id"] == "destroy")
         self.assertEqual(action["command"], ["python3", "bin/herdr-sandbox", "destroy"])
+        rm = next(action for action in manifest["actions"] if action["id"] == "rm")
+        self.assertEqual(rm["command"], ["python3", "bin/herdr-sandbox", "rm"])
 
-    def test_destroy_action_requires_deliberate_id(self):
-        stderr = io.StringIO()
-        with patch.object(plugin.sys, "argv", [str(SCRIPT), "destroy"]), patch.object(plugin.sys, "stderr", stderr):
-            self.assertEqual(plugin.main(), 1)
-        self.assertIn("Worker ID is required", stderr.getvalue())
-
-    def test_direct_id_does_not_read_destroy_config(self):
-        (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + '\n[destroy]\nid = "STALE"\n')
-        config_before = (self.config / "config.toml").read_bytes()
-        with patch.object(plugin, "destroy_options", side_effect=AssertionError("direct input read config")), \
-                patch.object(plugin.sys, "argv", [str(SCRIPT), "destroy", "--id", "TEST-001"]), \
-                patch.object(plugin, "destroy_worker", return_value=True) as destroy:
+    def test_direct_id_removes_worker(self):
+        self.create_worker()
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "rm", "--id", "TEST-001"]), \
+                patch.object(plugin, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.assertEqual(plugin.main(), 0)
+        self.assertFalse((self.state / "workers" / "TEST-001").exists())
 
-        destroy.assert_called_once_with("TEST-001")
-        self.assertEqual((self.config / "config.toml").read_bytes(), config_before)
+    def test_destroy_dash_id_still_works(self):
+        self.create_worker()
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "destroy", "--id", "TEST-001"]), \
+                patch.object(plugin, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.assertEqual(plugin.main(), 0)
+        self.assertFalse((self.state / "workers" / "TEST-001").exists())
 
 
 if __name__ == "__main__":
