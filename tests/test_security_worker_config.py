@@ -172,7 +172,9 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
         """Test that 'list' command never executes worker config."""
         worker_id, _ = self.create_malicious_worker()
 
-        with patch.object(plugin, "_query_worker_git_in_container", return_value=(0, "", "")):
+        with patch.object(plugin, "_query_worker_git_snapshot", return_value={
+            "status_porcelain": "", "log": "", "status_short": "", "diff": "", "error": None,
+        }):
             workers = plugin.list_workers(self.state)
 
         self.assertTrue(any(w["id"] == worker_id for w in workers))
@@ -183,7 +185,9 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
         worker_id, _ = self.create_malicious_worker()
 
         with patch.object(plugin, "container_status", return_value="not-found"), \
-                patch.object(plugin, "_query_worker_git_in_container", return_value=(0, "", "")):
+                patch.object(plugin, "_query_worker_git_snapshot", return_value={
+                    "status_porcelain": "", "log": "", "status_short": "", "diff": "", "error": None,
+                }):
             inspection = plugin.inspect_worker(worker_id, self.state)
 
         self.assertEqual(inspection["id"], worker_id)
@@ -230,7 +234,9 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
         worker_id, worker_dir = self.create_malicious_worker()
 
         with patch.object(plugin, "container_status", return_value="not-found"), \
-                patch.object(plugin, "_query_worker_git_in_container", return_value=(0, "", "")):
+                patch.object(plugin, "_query_worker_git_snapshot", return_value={
+                    "status_porcelain": "", "log": "", "status_short": "", "diff": "", "error": None,
+                }):
             inspection = plugin.inspect_worker(worker_id, self.state)
 
         self.assertEqual(inspection["id"], worker_id)
@@ -355,21 +361,135 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
         self.assert_no_markers()
 
 
+class TestGitQueryCommandHardening(unittest.TestCase):
+    """Query containers must not collide with sessions or expose Codex/network."""
+
+    def test_git_query_command_is_isolated(self):
+        runtime = plugin.PodmanSandboxRuntime(
+            worker_id="TEST-001",
+            image="localhost/herdr-codex-worker:latest",
+            repo=Path("/tmp/worker-repo"),
+            codex_home=Path("/tmp/codex-home"),
+            network="online",
+            cpus=4,
+            memory="8g",
+            pids=1024,
+        )
+        command = plugin.build_worker_git_query_command(runtime, base_commit="a" * 40)
+        self.assertNotIn("--name", command)
+        self.assertNotIn("herdr-TEST-001", command)
+        self.assertIn("--network=none", command)
+        self.assertTrue(any(part.endswith(",ro") and "/workspace" in part for part in command if isinstance(part, str)))
+        self.assertFalse(any("/codex" in part for part in command if isinstance(part, str)))
+        self.assertNotIn("CODEX_HOME=/codex", command)
+        joined = " ".join(command)
+        self.assertIn("type=bind,src=/tmp/worker-repo,dst=/workspace,ro", joined)
+
+
+class TestObjectImportFiltering(unittest.TestCase):
+    """Only loose objects and pack payloads may enter the trusted temp repo."""
+
+    def test_auxiliary_object_metadata_is_not_copied(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            worker_objects = root / "worker-objects"
+            dest = root / "dest-objects"
+            (worker_objects / "ab").mkdir(parents=True)
+            loose = worker_objects / "ab" / ("c" * 38)
+            loose.write_bytes(b"fake-loose")
+            pack_dir = worker_objects / "pack"
+            pack_dir.mkdir()
+            pack = pack_dir / ("pack-" + ("d" * 40) + ".pack")
+            pack.write_bytes(b"PACK")
+            (pack_dir / ("pack-" + ("d" * 40) + ".idx")).write_bytes(b"IDX")
+            (pack_dir / ("pack-" + ("d" * 40) + ".bitmap")).write_bytes(b"BITMAP")
+            (pack_dir / "multi-pack-index").write_bytes(b"MIDX")
+            info = worker_objects / "info"
+            info.mkdir()
+            (info / "commit-graph").write_bytes(b"GRAPH")
+            (info / "alternates").write_text("/evil\n")
+            graphs = info / "commit-graphs"
+            graphs.mkdir()
+            (graphs / "graph-1").write_bytes(b"GRAPHDIR")
+
+            copied_packs = plugin._copy_worker_objects(worker_objects, dest)
+            self.assertEqual([p.name for p in copied_packs], [pack.name])
+            self.assertTrue((dest / "ab" / ("c" * 38)).is_file())
+            self.assertTrue((dest / "pack" / pack.name).is_file())
+            self.assertFalse((dest / "pack" / (pack.stem + ".idx")).exists())
+            self.assertFalse((dest / "pack" / (pack.stem + ".bitmap")).exists())
+            self.assertFalse((dest / "pack" / "multi-pack-index").exists())
+            self.assertFalse((dest / "info").exists())
+
+
+class TestCorruptObjectFetch(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.config = root / "config"
+        self.config.mkdir()
+        self.state = root / "state"
+        self.state.mkdir()
+        (self.config / "codex").mkdir()
+        (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG)
+        self.env = patch.dict(os.environ, {
+            "HERDR_PLUGIN_CONFIG_DIR": str(self.config),
+            "HERDR_PLUGIN_STATE_DIR": str(self.state),
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.source = root / "source"
+        self.source.mkdir()
+        git("-C", self.source, "init", "-q")
+        git("-C", self.source, "config", "user.name", "Test")
+        git("-C", self.source, "config", "user.email", "test@example.invalid")
+        (self.source / "file.txt").write_text("initial\n")
+        git("-C", self.source, "add", "file.txt")
+        git("-C", self.source, "commit", "-qm", "initial")
+        self.source_head = git("-C", self.source, "rev-parse", "HEAD")
+
+    def test_corrupt_loose_object_fails_fetch_without_mutating_source(self):
+        with patch.object(plugin, "check", return_value=[]):
+            worker = plugin.create_worker("CORRUPT-001", str(self.source))
+        repo = worker / "repo"
+        git("-C", repo, "config", "user.name", "Worker")
+        git("-C", repo, "config", "user.email", "worker@example.invalid")
+        (repo / "change.txt").write_text("change\n")
+        git("-C", repo, "add", "change.txt")
+        git("-C", repo, "commit", "-qm", "worker change")
+        tip = git("-C", repo, "rev-parse", "HEAD")
+        # Overwrite the tip commit object with garbage while keeping the path.
+        tip_path = repo / ".git" / "objects" / tip[:2] / tip[2:]
+        tip_path.chmod(0o644)
+        tip_path.write_bytes(b"not-a-valid-git-object")
+
+        with self.assertRaises(ValueError):
+            plugin.fetch_worker("CORRUPT-001", self.state)
+
+        self.assertEqual(git("-C", self.source, "rev-parse", "HEAD"), self.source_head)
+        self.assertFalse((self.source / ".git" / "refs" / "heads" / "sandbox/CORRUPT-001").exists())
+        self.assertFalse((self.source / ".git" / "objects" / "info" / "alternates").exists())
+
+
 class TestGitCommandAudit(unittest.TestCase):
     """Grep-style test to enforce no vulnerable git -C <worker-repo> calls."""
 
     def test_no_git_c_worker_repo_in_main_script(self):
-        """Verify host worker inspection uses safe helpers, not _git_read."""
+        """Verify host worker inspection uses safe helpers and one query container."""
         script = Path(__file__).parent.parent / "bin" / "herdr-sandbox"
         content = script.read_text()
 
-        self.assertIn("DEPRECATED for worker repos", content)
+        self.assertNotIn("def _git_read(", content)
         self.assertIn("def _safe_read_worker_head(", content)
         self.assertIn("def _safe_read_worker_branch(", content)
         self.assertIn("def _safe_read_worker_ref(", content)
         self.assertIn("def _safe_fetch_from_worker(", content)
+        self.assertIn("def build_worker_git_query_command(", content)
+        self.assertIn("def _query_worker_git_snapshot(", content)
         self.assertIn('["git", "bundle", "verify"', content)
-        # Safe fetch must not mutate the source repo via alternates/repack.
+        self.assertIn("fetch.fsckObjects=true", content)
+        self.assertIn("index-pack", content)
         self.assertNotIn('alternates_file = source_repo', content)
         self.assertNotIn('"repack"', content)
         self.assertNotIn("'repack'", content)
@@ -379,9 +499,8 @@ class TestGitCommandAudit(unittest.TestCase):
         git_reality_body = content[git_reality_start:git_reality_end]
         self.assertIn("_safe_read_worker_head", git_reality_body)
         self.assertIn("_safe_read_worker_branch", git_reality_body)
-        self.assertIn("_query_worker_git_in_container", git_reality_body)
-        self.assertNotIn("_git_read(repo,", git_reality_body)
-        self.assertNotIn("_git_read(worker_repo,", git_reality_body)
+        self.assertIn("_query_worker_git_snapshot", git_reality_body)
+        self.assertEqual(git_reality_body.count("_query_worker_git_snapshot"), 1)
 
 
 if __name__ == "__main__":
