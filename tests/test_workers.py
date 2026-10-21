@@ -45,9 +45,12 @@ class WorkerInspectionTests(unittest.TestCase):
         self.env = patch.dict(os.environ, {
             "HERDR_PLUGIN_CONFIG_DIR": str(self.config),
             "HERDR_PLUGIN_STATE_DIR": str(self.state),
-        })
+        }, clear=False)
         self.env.start()
         self.addCleanup(self.env.stop)
+        # Clear pane context by default so create_worker records null pane.
+        for key in ("HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH"):
+            os.environ.pop(key, None)
         ready = patch.object(plugin, "check", return_value=[])
         ready.start()
         self.addCleanup(ready.stop)
@@ -55,25 +58,54 @@ class WorkerInspectionTests(unittest.TestCase):
         self.container.start()
         self.addCleanup(self.container.stop)
 
-    def create_worker(self, worker_id="TEST-001"):
-        return plugin.create_worker(worker_id, str(self.source), "base")
+    def create_worker(self, worker_id="TEST-001", agent="codex"):
+        return plugin.create_worker(worker_id, str(self.source), "base", agent=agent)
 
-    def test_list_rebuilds_view_from_persisted_state_and_git_reality(self):
-        self.create_worker()
+    def test_list_shows_rfc_columns_without_git_query(self):
+        with patch.dict(os.environ, {
+            "HERDR_PANE_ID": "w1:p1",
+            "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_SOCKET_PATH": "/tmp/herdr.sock",
+        }):
+            self.create_worker()
 
-        records = plugin.list_workers()
+        with patch.object(plugin, "_query_worker_git_snapshot") as query:
+            records = plugin.list_workers()
+            query.assert_not_called()
 
         self.assertEqual([record["id"] for record in records], ["TEST-001"])
         record = records[0]
+        self.assertEqual(record["agent"], "codex")
         self.assertEqual(record["source_repo"], str(self.source))
-        self.assertEqual(record["repository"], str(self.state / "workers" / "TEST-001" / "repo"))
-        self.assertEqual(record["base_ref"], "base")
-        self.assertEqual(record["branch"], "agent/TEST-001")
+        self.assertEqual(record["pane_id"], "w1:p1")
         self.assertEqual(record["status"], "created")
-        self.assertEqual(record["head"], self.first)
-        self.assertFalse(record["dirty"])
+        self.assertIsNone(record["result_branch"])
+        self.assertIsNone(record["head"])
+        self.assertIsNone(record["dirty"])
         self.assertEqual(record["container"], "not-found")
-        self.assertIn("TEST-001", plugin.format_workers(records))
+        rendered = plugin.format_workers(records)
+        self.assertIn("AGENT", rendered)
+        self.assertIn("SOURCE", rendered)
+        self.assertIn("PANE", rendered)
+        self.assertIn("RESULT", rendered)
+        self.assertIn("TEST-001", rendered)
+        self.assertIn("codex", rendered)
+        self.assertIn("w1:p1", rendered)
+        self.assertNotIn("DIRTY", rendered)
+        self.assertNotIn("LATEST", rendered)
+
+    def test_list_shows_fetched_result_branch(self):
+        worker = self.create_worker()
+        metadata_path = worker / "worker.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["status"] = "fetched"
+        metadata["result_branch"] = "sandbox/TEST-001"
+        metadata_path.write_text(json.dumps(metadata))
+
+        records = plugin.list_workers()
+        self.assertEqual(records[0]["status"], "fetched")
+        self.assertEqual(records[0]["result_branch"], "sandbox/TEST-001")
+        self.assertIn("sandbox/TEST-001", plugin.format_workers(records))
 
     def test_inspect_exposes_ordinary_git_log_status_and_base_diff(self):
         worker = self.create_worker()
@@ -102,6 +134,9 @@ class WorkerInspectionTests(unittest.TestCase):
         self.assertIn("Git log:", rendered)
         self.assertIn("Git status:", rendered)
         self.assertIn("Git diff", rendered)
+        self.assertIn("Review (run in source repo", rendered)
+        self.assertIn(f"git log base..sandbox/TEST-001", rendered)
+        self.assertIn(f"git diff base...sandbox/TEST-001", rendered)
 
     def test_live_container_overrides_persisted_lifecycle_status(self):
         worker = self.create_worker()
@@ -195,22 +230,94 @@ class WorkerInspectionTests(unittest.TestCase):
         self.assertEqual(record["container"], "error: cannot connect to Podman socket")
         self.assertTrue(any("Unable to inspect worker container" in issue for issue in record["issues"]))
 
-    def test_cli_list_json_and_inspect_text(self):
+    def test_cli_ls_json_and_inspect_text(self):
         self.create_worker()
-        with patch.object(plugin.sys, "argv", [str(SCRIPT), "list", "--json"]), contextlib.redirect_stdout(io.StringIO()) as output:
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "ls", "--json"]), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(plugin.main(), 0)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload[0]["id"], "TEST-001")
+        self.assertEqual(payload[0]["agent"], "codex")
+        self.assertIn("pane_id", payload[0])
+        self.assertIn("result_branch", payload[0])
 
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect", "TEST-001"]), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(plugin.main(), 0)
-        self.assertIn("Worker: TEST-001", output.getvalue())
-        self.assertIn("Git status:", output.getvalue())
+        text = output.getvalue()
+        self.assertIn("Worker: TEST-001", text)
+        self.assertIn("Git status:", text)
+        self.assertIn("Review (run in source repo", text)
 
         (self.config / "config.toml").unlink()
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect", "TEST-001"]), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(plugin.main(), 0)
         self.assertIn("Worker: TEST-001", output.getvalue())
+
+    def test_inspect_config_table_is_ignored_with_deprecation_notice(self):
+        self.create_worker()
+        (self.config / "config.toml").write_text(
+            plugin.DEFAULT_CONFIG + '\n[inspect]\nid = "WRONG-ID"\n'
+        )
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect", "TEST-001"]), \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(plugin.main(), 0)
+        self.assertIn("Worker: TEST-001", output.getvalue())
+        self.assertIn("[inspect] is deprecated and ignored", stderr.getvalue())
+
+    def test_inspect_without_id_requires_pane_and_lists_candidates(self):
+        self.create_worker("ALPHA-001")
+        self.create_worker("BETA-002")
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(plugin.main(), 1)
+        message = stderr.getvalue()
+        self.assertIn("HERDR_PANE_ID is unset", message)
+        self.assertIn("ALPHA-001", message)
+        self.assertIn("BETA-002", message)
+
+    def test_inspect_without_id_resolves_pane_worker(self):
+        with patch.dict(os.environ, {
+            "HERDR_PANE_ID": "w1:p9",
+            "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_SOCKET_PATH": "/tmp/herdr.sock",
+        }):
+            self.create_worker("PANE-001")
+        self.create_worker("OTHER-002")
+
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p9"}), \
+                patch.object(plugin, "cwd_repo_root", return_value=self.source.resolve()), \
+                patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(plugin.main(), 0)
+        self.assertIn("Worker: PANE-001", output.getvalue())
+
+    def test_inspect_without_id_errors_when_pane_match_is_ambiguous(self):
+        with patch.dict(os.environ, {
+            "HERDR_PANE_ID": "w1:p1",
+            "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_SOCKET_PATH": "/tmp/herdr.sock",
+        }):
+            self.create_worker("ONE-001", agent="codex")
+            self.create_worker("TWO-002", agent="claude")
+
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}), \
+                patch.object(plugin, "cwd_repo_root", return_value=self.source.resolve()), \
+                patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(plugin.main(), 1)
+        message = stderr.getvalue()
+        self.assertIn("Multiple workers match pane w1:p1", message)
+        self.assertIn("ONE-001", message)
+        self.assertIn("TWO-002", message)
+
+    def test_inspect_ignores_sole_worker_fallback(self):
+        self.create_worker("ONLY-001")
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(plugin.main(), 1)
+        self.assertIn("HERDR_PANE_ID is unset", stderr.getvalue())
+        self.assertIn("ONLY-001", stderr.getvalue())
 
     def test_manifest_exposes_list_and_inspect_actions(self):
         manifest = tomllib.loads((SCRIPT.parent.parent / "herdr-plugin.toml").read_text())

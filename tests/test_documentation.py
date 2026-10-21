@@ -51,6 +51,8 @@ class DocumentationTests(unittest.TestCase):
             "\"$SANDBOX_LAUNCHER\" destroy --id WORKER-001",
             "hs rm <id>",
             "hs gc",
+            "hs ls",
+            "hs inspect",
             "[gc].max_age",
             "git log main..sandbox/<id>",
             "git diff main...sandbox/<id>",

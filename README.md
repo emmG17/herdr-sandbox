@@ -111,6 +111,20 @@ git merge sandbox/<id>    # or cherry-pick or rebase
 hs fetch <id>   # re-run fetch by hand (for example after switching off a checked-out sandbox branch)
 ```
 
+List workers and inspect the current pane's worker:
+
+```sh
+hs ls
+hs inspect          # defaults to this pane's worker when HERDR_PANE_ID is set
+hs inspect <id>     # explicit ID when the pane is ambiguous or unset
+```
+
+`hs ls` shows id, agent, source repo, pane, status (including `fetched`),
+result branch (`sandbox/<id>` or `-`), and created time. It reads the state
+store and container status only—no per-worker git query. `hs inspect` adds the
+latest run result, container-side dirty status, and review commands that run in
+the **source** repo against `sandbox/<id>`.
+
 Alternatively, use the plugin actions:
 
 ```sh
@@ -122,8 +136,10 @@ herdr plugin action invoke fetch --plugin dev.herdr.sandbox
 
 `create` generates a worker ID and clones the workspace repository.
 `start-codex` opens a fresh Codex session in that disposable clone. With exactly
-one worker, `start-codex`, `inspect`, and `fetch` select it automatically; when
-several workers exist, configure `[open].id` in `config.toml` for the pane.
+one worker, `start-codex` and `fetch` select it automatically; when several
+workers exist, configure `[open].id` in `config.toml` for the pane. `inspect`
+resolves the current pane's worker (or requires an explicit ID)—it no longer
+reads `[inspect].id`.
 
 `fetch` writes `refs/heads/sandbox/<id>` and prints the same review and
 integration commands. After keeping or discarding the result, remove the
@@ -153,6 +169,7 @@ absence requires a structured `pane_not_found` from `herdr pane get`.
 List durable worker state at any time:
 
 ```sh
+hs ls
 herdr plugin action invoke list --plugin dev.herdr.sandbox
 ```
 
@@ -274,9 +291,10 @@ then invoke `execute`. Codex stdout and stderr are streamed to the action while
 it runs. Every invocation also writes a durable result and output log beneath
 the worker directory at `runs/<run-id>/result.json` and
 `runs/<run-id>/output.log`. The final action summary prints both paths, and
-`list`/`inspect` expose the latest run as a compact summary. You may configure
-action-specific IDs for `fetch`, `inspect`, or the interactive `start-codex` pane
-via `[open].id` when multiple workers exist. Direct script use requires Herdr's
+`hs inspect` (and the inspect action) expose the latest run as a compact
+summary; `hs ls` stays limited to the RFC columns. You may configure
+action-specific IDs for `fetch` or the interactive `start-codex` pane via
+`[open].id` when multiple workers exist. Direct script use requires Herdr's
 own paths; do not invent storage locations:
 
 ```sh
@@ -329,7 +347,7 @@ directory, including its run history. Prefer `hs gc` for routine cleanup.
 - **Worker image missing:** run `bootstrap` or `build-image`, then `check`.
 - **Codex authentication missing:** rerun the dedicated `CODEX_HOME=...` login;
   never copy credentials from `~/.codex`.
-- **Worker failed or stale:** use `inspect` and `list`; use `hs rm <id>` or
+- **Worker failed or stale:** use `hs inspect` and `hs ls`; use `hs rm <id>` or
   wait for `hs gc` after fetch.
 - **Task needs network:** use the online profile; offline workers cannot fetch
   dependencies or contact model APIs.
