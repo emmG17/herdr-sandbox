@@ -23,7 +23,7 @@ For a new installation, prepare and authenticate the plugin-owned Codex home. Ne
 
 ```sh
 herdr plugin action invoke bootstrap --plugin dev.herdr.sandbox
-CODEX_HOME="$(herdr plugin config-dir dev.herdr.sandbox)/codex" codex login --device-auth
+hs login codex
 herdr plugin action invoke check --plugin dev.herdr.sandbox
 ```
 
@@ -92,10 +92,10 @@ Herdr 0.9.0 runs plugin actions in their invoking workspace and cannot let an
 action dynamically create or move its own pane. Use the manifest `start-codex`
 pane entrypoint for an interactive Herdr pane, and invoke it from the selected
 worker's source workspace. The plugin refuses a `workspace_cwd` mismatch. The
-Podman worker still mounts the selected clone at `/workspace`; interactive
-start-codex sessions use a temporary Codex home with only authentication, while
-noninteractive `hs codex --prompt` keeps the shared dedicated home (issue #11
-owns token-refresh write-back).
+Podman worker still mounts the selected clone at `/workspace`. Interactive and
+noninteractive (`hs codex --prompt`) sessions both use a temporary Codex home
+with only authentication; refreshed `auth.json` is written back atomically into
+the dedicated plugin home after the session.
 
 Set `[runtime].network = "offline"` only for self-contained tasks. Use the default `"online"` mode for model access or dependency installation. Customize project dependencies in the plugin-owned `image/Containerfile` and run `build-image`; the source repository and credentials are deliberately outside that build context.
 

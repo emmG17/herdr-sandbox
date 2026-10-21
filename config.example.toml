@@ -18,6 +18,8 @@ pids = 1024
 # first and deleted only on success; otherwise they are skipped with a warning.
 max_age = "7d"
 
+# Per-agent home under the plugin config directory. Default dirname matches the
+# agent name when omitted. Never point this at a normal user agent home.
 [codex]
 home = "codex"
 
@@ -26,3 +28,4 @@ home = "codex"
 # id = "WORKER-001"
 
 # [execute] is removed. Use: hs codex --prompt "..." (or execute --prompt as a thin alias).
+# Authenticate with: hs login codex
