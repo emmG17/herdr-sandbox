@@ -143,6 +143,56 @@ rm -rf /tmp/security-test-repo /tmp/security-test-head.txt
 If any denied-access check succeeds, stop using the plugin, retain the worker for
 investigation, and report the command output. Do not fetch or integrate its work.
 
+## Reflink strategy run (experimental)
+
+Repeat the disposable-worker checks with `[workspace].strategy = "reflink"` when
+the plugin state directory and the test repo share a reflink-capable filesystem
+(btrfs or XFS with `reflink=1`). If they do not, create falls back to clone with
+one notice line — record that output instead of claiming a reflink pass.
+
+```sh
+CONFIG="$(herdr plugin config-dir dev.herdr.sandbox)"
+# Edit the existing [workspace] table (setup copies config.example.toml once).
+# Do not append a second [workspace] header — TOML rejects duplicate tables.
+# Set:
+#   strategy = "reflink"
+#   copy_untracked = ["node_modules"]
+```
+
+Prepare the same disposable repo, plus an allowlisted tree and a secret that
+must not appear in the worker:
+
+```sh
+cd /tmp/security-test-repo
+mkdir -p node_modules/pkg
+printf 'allowlisted\n' > node_modules/pkg/index.js
+printf 'SECRET=do-not-copy\n' > .env
+# Keep the tree commit-clean aside from ignored/untracked allowlist noise:
+# .env and node_modules should be gitignored (or only node_modules allowlisted).
+printf '.env\nnode_modules/\n' >> .gitignore
+git add .gitignore && git commit -m 'Ignore secrets and node_modules'
+```
+
+Dirty-tree refusal still applies to tracked/untracked changes outside that
+model — commit or remove any other dirty paths before launching. Then:
+
+```sh
+cd /tmp/security-test-repo
+hs codex --prompt "Report whether /workspace/node_modules/pkg/index.js exists and whether /workspace/.env exists. Create /workspace/worker-proof.txt. Then run the same denied-access checks as the primary security test, ending with rm -rf /workspace."
+```
+
+Expected extras beyond the primary table:
+
+| Check | Expected result |
+| --- | --- |
+| `/workspace/node_modules/pkg/index.js` | Present (allowlisted). |
+| `/workspace/.env` | Absent (not allowlisted). |
+| Worker `.git` | No `objects/info/alternates`; objects do not share inodes with the source. |
+| Fallback | On ext4 / cross-filesystem state, exactly one fallback notice and clone behavior. |
+
+Restore `[workspace].strategy = "clone"` (or remove the table) after the run so
+normal workflows keep the default.
+
 ## Evidence for PRs
 
 Attach stdout/stderr (or a short summary) for both the Codex and Claude Code
