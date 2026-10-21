@@ -57,7 +57,7 @@ class SetupTests(unittest.TestCase):
                 plugin.setup()
                 launcher = config / "herdr-sandbox"
                 cases = [
-                    ["execute", "--id", "WORKER-001", "--prompt", "keep $HOME; do not evaluate 'this'"],
+                    ["execute", "--prompt", "keep $HOME; do not evaluate 'this'"],
                     ["fetch", "WORKER-001"],
                     ["destroy", "--id", "WORKER-001"],
                 ]

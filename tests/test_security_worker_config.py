@@ -248,17 +248,31 @@ class TestMaliciousWorkerConfig(unittest.TestCase):
         )
 
     def test_execute_post_run_does_not_execute_worker_config(self):
-        """Test that post-run HEAD reading never executes worker config."""
-        worker_id, worker_dir = self.create_malicious_worker()
+        """Post-run accounting must use source-repo refs, never worker git config."""
+        worker_id, worker_dir = self.create_malicious_worker(make_worker_change=True)
+        worker_head = plugin._safe_read_worker_ref(
+            worker_dir / "repo", f"agent/{worker_id}"
+        )
 
-        with patch.object(plugin, "container_status", return_value="not-found"), \
+        with patch.object(plugin, "check", return_value=[]), \
+                patch.object(plugin, "execute_command", return_value=[
+                    sys.executable, "-c", "print('ok', flush=True)",
+                ]), \
                 patch.object(plugin, "_query_worker_git_snapshot", return_value={
                     "status_porcelain": "", "log": "", "status_short": "", "diff": "", "error": None,
-                }):
-            inspection = plugin.inspect_worker(worker_id, self.state)
+                }), \
+                patch.object(plugin.sys, "stdout", new_callable=io.StringIO), \
+                patch.object(plugin.sys, "stderr", new_callable=io.StringIO):
+            result = plugin.execute_worker(worker_id, "noop")
 
-        self.assertEqual(inspection["id"], worker_id)
-        self.assertIsNotNone(inspection["head"])
+        self.assertEqual(result["exit_status"], 0)
+        self.assertEqual(result["head"], worker_head)
+        self.assertEqual(result["result_branch"], f"sandbox/{worker_id}")
+        self.assertEqual(result["commit_count"], 2)
+        self.assertEqual(
+            git("-C", self.source, "rev-parse", f"refs/heads/sandbox/{worker_id}"),
+            worker_head,
+        )
         self.assert_no_markers()
 
     def test_packed_refs_are_read_without_host_git(self):

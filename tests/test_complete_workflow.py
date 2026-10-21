@@ -55,30 +55,36 @@ class CompleteWorkflowTests(unittest.TestCase):
         self.assertNotEqual(worker_repo.resolve(), self.source.resolve())
         self.assertEqual(git("-C", self.source, "rev-parse", "HEAD"), self.source_head)
 
+        commit_code = (
+            "from pathlib import Path; "
+            "import subprocess; "
+            f"repo = Path({str(worker_repo)!r}); "
+            "(repo / 'worker.txt').write_text('worker-only change\\n'); "
+            "subprocess.run(['git', '-C', str(repo), 'config', 'user.name', 'Worker'], check=True); "
+            "subprocess.run(['git', '-C', str(repo), 'config', 'user.email', 'worker@example.invalid'], check=True); "
+            "subprocess.run(['git', '-C', str(repo), 'add', 'worker.txt'], check=True); "
+            "subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'worker change'], check=True); "
+            "print('completed', flush=True)"
+        )
         with patch.object(plugin, "check", return_value=[]), \
-                patch.object(plugin, "execute_command", return_value=[
-                    sys.executable,
-                    "-c",
-                    f"from pathlib import Path; Path({str(worker_repo / 'worker.txt')!r}).write_text('worker-only change\\n'); print('completed', flush=True)",
-                ]), \
+                patch.object(plugin, "execute_command", return_value=[sys.executable, "-c", commit_code]), \
                 patch.object(plugin, "_query_worker_git_snapshot", return_value={
-                    "status_porcelain": "?? worker.txt",
-                    "log": "",
-                    "status_short": "?? worker.txt",
-                    "diff": "",
+                    "status_porcelain": "",
+                    "log": "abc worker change",
+                    "status_short": "## agent/FLOW-001",
+                    "diff": "worker-only change",
                     "error": None,
                 }), \
-                patch.object(plugin.sys, "stdout", new_callable=io.StringIO) as worker_output:
+                patch.object(plugin.sys, "stdout", new_callable=io.StringIO) as worker_output, \
+                patch.object(plugin.sys, "stderr", new_callable=io.StringIO):
             result = plugin.execute_worker("FLOW-001", "write worker.txt")
         self.assertEqual(result["exit_status"], 0)
-        self.assertTrue(result["dirty"])
+        self.assertFalse(result["dirty"])
         self.assertIn("completed\n", worker_output.getvalue())
-
-        git("-C", worker_repo, "config", "user.name", "Worker")
-        git("-C", worker_repo, "config", "user.email", "worker@example.invalid")
-        git("-C", worker_repo, "add", "worker.txt")
-        git("-C", worker_repo, "commit", "-qm", "worker change")
         worker_head = git("-C", worker_repo, "rev-parse", "HEAD")
+        self.assertEqual(result["head"], worker_head)
+        self.assertEqual(result["result_branch"], "sandbox/FLOW-001")
+        self.assertEqual(result["commit_count"], 1)
 
         with patch.object(plugin, "container_status", return_value="not-found"), \
                 patch.object(plugin, "_query_worker_git_snapshot", return_value={
@@ -92,13 +98,6 @@ class CompleteWorkflowTests(unittest.TestCase):
         self.assertEqual(inspection["head"], worker_head)
         self.assertIn("worker-only change", inspection["git_diff"])
 
-        fetched = plugin.fetch_worker("FLOW-001")
-        self.assertEqual(fetched["commit"], worker_head)
-        self.assertEqual(fetched["branch"], "sandbox/FLOW-001")
-        self.assertEqual(fetched["commit_count"], 1)
-        review = plugin.format_fetch_result(fetched)
-        self.assertIn("worker.txt", review)
-        self.assertIn("Branch: sandbox/FLOW-001", review)
         self.assertEqual(
             git("-C", self.source, "rev-parse", "refs/heads/sandbox/FLOW-001"),
             worker_head,
