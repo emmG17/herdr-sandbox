@@ -25,9 +25,10 @@ Podman/Docker sockets. It uses `--userns=keep-id`, drops capabilities, enables
 **Host-side Git operations**: The plugin never runs git commands with a worker  
 repository as cwd or `-C` target. Worker `.git/config` is attacker-controlled  
 and could execute arbitrary commands through settings like `core.fsmonitor` or  
-`core.hooksPath`. Instead, the plugin reads worker state by parsing `.git/HEAD`  
-and `.git/refs/*` directly, or by using git alternates to make worker objects  
-visible to the source repository without running git in the worker context.
+`core.hooksPath`. Instead it reads refs from confined files under the worker  
+`.git`, imports results through a verified git bundle built in a temporary  
+bare repo, and runs status/log/diff queries inside the sandbox container. See  
+`docs/security-host-git.md`.
 
 This is container isolation, not a VM: containers share the host Linux kernel.
 Do not use it for hostile-code workloads or where kernel-vulnerability

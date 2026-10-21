@@ -2,101 +2,99 @@
 
 ## Problem
 
-Worker repositories are mounted read-write at `/workspace` inside containers, allowing workers to modify `.git/config`. If host-side git operations use the worker repository as cwd or `-C` target, malicious config can execute arbitrary commands on the host through:
+Worker repositories are mounted read-write at `/workspace` inside containers, so
+the worker controls `.git/config`. Host-side `git -C <worker-repo> ...` can
+execute arbitrary commands through settings such as:
 
-- `core.fsmonitor` - executes a command when checking file status
-- `core.hooksPath` - directory containing hook scripts
-- `core.sshCommand` - command for SSH operations  
-- `diff.<driver>.textconv` with `.gitattributes` - filters arbitrary files through commands
-- `core.pager` - command for paging git output
+- `core.fsmonitor`
+- `core.hooksPath`
+- `core.sshCommand`
+- `diff.<driver>.textconv` with `.gitattributes`
+- `core.pager`
 
-This violates the security invariant that workers never get write access to the source repository or host, including indirectly.
+That breaks the invariant that a worker must not gain write access to the source
+repository or host, including indirectly.
 
-## Solution
+## Approach
 
-### 1. Safe File-Based Helpers
+### Fetch: temporary bare repo + verified bundle
 
-Host-side operations that need to read worker state use safe helpers that parse `.git/HEAD` and `.git/refs/*` directly without running git:
+Alternatives considered:
 
-- `_safe_read_worker_head(repo)` - reads HEAD by parsing files
-- `_safe_read_worker_branch(repo)` - reads current branch from HEAD file
-- `_git_read(repo, ...)` - marked DEPRECATED with warning for worker repos
+1. **Source-repo alternates + `repack -a -d`** (rejected). Mutates the user's
+   real repository, races on `objects/info/alternates`, can leave a permanent
+   dependency on an attacker-writable object store if interrupted, ignores
+   repack failures, and rewrites every pack on each fetch.
+2. **`git bundle` inside the worker container, then host `bundle verify` +
+   `fetch`** (sound, but couples every fetch to Podman/image availability).
+3. **Copy worker object files into a temporary bare repo we own, create a
+   bundle there, verify it, then `git fetch <bundle>` into the source repo**
+   (chosen). Host git never uses the worker clone as cwd/`-C`. The source repo
+   is untouched until the final verified bundle fetch. Failure or a crash
+   before that fetch leaves no alternates, no dangling `sandbox/<id>` ref, and
+   no dependency on the worker object store. Concurrent fetches use distinct
+   temp directories and git's own source-repo ref locking.
 
-### 2. Safe Fetch Using Alternates
+Steps for `_safe_fetch_from_worker`:
 
-`_safe_fetch_from_worker()` fetches worker commits without spawning upload-pack or running git in the worker repo:
+1. Read the worker tip from loose refs or `packed-refs` (no git; refuse
+   symlinks; confine paths under the worker `.git`).
+2. `git init --bare` in a temporary directory.
+3. Copy only object files from the worker (refuse symlinks; skip
+   `objects/info/alternates`).
+4. Write the branch tip in the temp repo and `git bundle create`.
+5. `git bundle verify`, then `git -C <source> fetch <bundle> <branch>:refs/heads/sandbox/<id>`.
+6. Delete the temporary directory.
 
-1. Read worker branch SHA from `.git/refs/heads/<branch>` directly (no git command)
-2. Temporarily add worker's `.git/objects` as an alternate in source repo
-3. Run `git update-ref` in SOURCE repo only to update target branch
-4. Run `git repack` in SOURCE repo to copy objects permanently
-5. Restore original alternates file
+### Ref and HEAD reads
 
-This avoids running any git command with the worker repo as cwd or `-C` target.
+`_safe_read_worker_ref`, `_safe_read_worker_head`, and
+`_safe_read_worker_branch` parse `.git/HEAD`, loose refs, and `packed-refs`.
+They refuse symlinks and require every path to stay under the worker `.git`.
 
-### 3. Omitted Information
+### Inspect / execute status, log, and diff
 
-For security, certain operations that would require running git in the worker context are intentionally omitted:
+Those need a live worktree view. They run via
+`_query_worker_git_in_container`: a short-lived Podman invocation that runs
+`git` inside the sandbox. Worker config may execute only inside the container.
+When Podman or the worker runtime is unavailable, the fields report
+`(unavailable: ...)` with an issue entry rather than silent placeholders.
 
-- `git status` - would honor `core.fsmonitor`
-- `git log` - could trigger pager or hooks
-- `git diff` - could trigger textconv or ext-diff
+HEAD and branch for list/inspect still come from the file-based helpers so a
+missing container does not block identity reporting.
 
-These are returned as `"(omitted: query after fetch for safety)"`. Users can get this information by fetching the worker branch into the source repo and querying there.
+### Deprecated helper
 
-### 4. Test Coverage
+`_git_read(repo, ...)` remains for non-worker paths but is marked deprecated for
+worker clones. Grep-style tests require `_git_reality` to use the safe helpers
+and container query instead.
 
-Regression tests in `tests/test_security_worker_config.py` verify that malicious worker config never executes:
+## Tests
 
-- Creates workers with `core.fsmonitor`, `core.hooksPath`, etc. pointing at marker files
-- Runs list, inspect, fetch, cherry-pick, and execute operations
-- Asserts that no markers are created (no code execution)
+`tests/test_security_worker_config.py` covers:
 
-### 5. Grep-Style Enforcement
-
-The audit test `TestGitCommandAudit` verifies:
-
-- `_git_read` has a deprecation warning for worker repos
-- Safe functions `_safe_read_worker_head` and `_safe_read_worker_branch` exist
-- `_git_reality` uses safe functions, not `_git_read`
-
-## What's Still Exposed
-
-`git fetch` from a local worker repo path uses Git's "local" transport, which directly accesses the object database without spawning upload-pack. However, Git may still read some config during this operation. Defense-in-depth environment variables (`GIT_OPTIONAL_LOCKS=0`) are set.
-
-The alternates-based approach avoids this by never running fetch with the worker repo as a source - it only manipulates the source repo.
+- Malicious `core.fsmonitor` / hooks / textconv / sshCommand markers for list,
+  inspect, fetch, cherry-pick, and post-run HEAD reads
+- Packed-refs resolution and fetch
+- Symlinked refs and objects rejected; source left without sandbox ref or
+  alternates
+- Simulated bundle-create failure leaving the source unchanged
+- Concurrent fetches of two workers
+- Audit that safe fetch does not use source-repo alternates/repack
 
 ## Usage
 
-Workers are created, used, and destroyed normally. The security changes are transparent:
-
-```bash
-hs codex                    # Create/reuse worker, launch Codex
-hs list                     # Query worker state (no code execution)
-hs inspect <id>             # Detailed worker info (no code execution)
-hs fetch <id>               # Safe fetch into sandbox/<id> branch
-git diff main...sandbox/<id> # Review in source repo (safe)
-```
-
-Status, log, and diff information are omitted from `inspect` output. To see these, fetch the worker branch and query in the source repo:
-
-```bash
+```sh
+hs list
+hs inspect <id>
 hs fetch <id>
-git log sandbox/<id>
+git log main..sandbox/<id>
 git diff main...sandbox/<id>
-git show sandbox/<id>
 ```
 
-## Acceptance Criteria Met
+## README rule
 
-✅ No `run("git", "-C", <worker repo>, ...)` calls remain on host  
-✅ Malicious config regression tests pass for list, inspect, fetch, execute, cherry-pick  
-✅ Grep-style test enforces no vulnerable patterns  
-✅ All 146 existing tests pass  
-✅ README safety section documents the rule (see below)
-
-## README Update
-
-Added to README.md safety section:
-
-> **Host-side Git Operations**: The plugin never runs git commands with a worker repository as cwd or `-C` target. Worker `.git/config` is attacker-controlled and could execute arbitrary commands through settings like `core.fsmonitor` or `core.hooksPath`. Instead, the plugin reads worker state by parsing `.git/HEAD` and `.git/refs/*` directly, or by using git alternates to make worker objects visible to the source repository without running git in the worker context.
+The README safety section states that host-side git never uses a worker
+repository as cwd or `-C`. Worker state is read from confined ref files, via a
+verified bundle import into the source repo, or via git inside the sandbox
+container.
