@@ -94,9 +94,15 @@ class CompleteWorkflowTests(unittest.TestCase):
 
         fetched = plugin.fetch_worker("FLOW-001")
         self.assertEqual(fetched["commit"], worker_head)
+        self.assertEqual(fetched["branch"], "sandbox/FLOW-001")
+        self.assertEqual(fetched["commit_count"], 1)
         review = plugin.format_fetch_result(fetched)
         self.assertIn("worker.txt", review)
-        self.assertEqual(git("-C", self.source, "rev-parse", "FETCH_HEAD"), worker_head)
+        self.assertIn("Branch: sandbox/FLOW-001", review)
+        self.assertEqual(
+            git("-C", self.source, "rev-parse", "refs/heads/sandbox/FLOW-001"),
+            worker_head,
+        )
         self.assertEqual(git("-C", self.source, "rev-parse", "HEAD"), self.source_head)
         self.assertEqual((self.source / "source.txt").read_text(), "source stays protected\n")
 

@@ -41,7 +41,7 @@ class DocumentationTests(unittest.TestCase):
             "plugin action invoke",
             "workspace_cwd",
             "temporary plugin-owned `CODEX_HOME`",
-            "FETCH_HEAD",
+            "refs/heads/sandbox/",
             "Herdr 0.9.0 plugin actions have fixed command arguments",
             "does not forward arguments after the action ID",
             "SANDBOX_LAUNCHER=\"$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox\"",
