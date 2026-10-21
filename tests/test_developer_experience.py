@@ -1,7 +1,6 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
-import tempfile
 import tomllib
 import unittest
 
@@ -14,24 +13,31 @@ loader.exec_module(plugin)
 
 
 class DeveloperExperienceTests(unittest.TestCase):
-    def test_sole_worker_selection_requires_exactly_one_real_worker_directory(self):
-        with tempfile.TemporaryDirectory() as root:
-            state = Path(root) / "state"
-            workers = state / "workers"
-            workers.mkdir(parents=True)
-            self.assertIsNone(plugin.sole_worker_id(state))
-            (workers / "WORKER-001").mkdir()
-            self.assertEqual(plugin.sole_worker_id(state), "WORKER-001")
-            (workers / "WORKER-002").mkdir()
-            self.assertIsNone(plugin.sole_worker_id(state))
-
-    def test_manifest_exposes_the_low_configuration_entrypoints(self):
+    def test_manifest_exposes_bootstrap_check_and_hs_panes(self):
         manifest = tomllib.loads((SCRIPT.parent.parent / "herdr-plugin.toml").read_text())
-        self.assertIn("bootstrap", [action["id"] for action in manifest["actions"]])
-        self.assertNotIn("start-codex", [action["id"] for action in manifest["actions"]])
-        start_panes = [pane for pane in manifest["panes"] if pane["id"] == "start-codex"]
-        self.assertEqual(len(start_panes), 1)
-        self.assertEqual(start_panes[0]["placement"], "overlay")
+        action_ids = [action["id"] for action in manifest["actions"]]
+        self.assertIn("bootstrap", action_ids)
+        self.assertIn("check", action_ids)
+        for removed in ("create", "open", "execute", "destroy"):
+            self.assertNotIn(removed, action_ids)
+        self.assertNotIn("start-codex", action_ids)
+
+        panes = {pane["id"]: pane for pane in manifest["panes"]}
+        self.assertEqual(panes["start-codex"]["command"], ["python3", "bin/hs", "codex"])
+        self.assertEqual(panes["start-codex"]["placement"], "overlay")
+        self.assertEqual(panes["start-claude"]["command"], ["python3", "bin/hs", "claude"])
+
+        for action_id, hs_args in (
+            ("list", ["ls"]),
+            ("inspect", ["inspect"]),
+            ("fetch", ["fetch"]),
+            ("gc", ["gc"]),
+            ("rm", ["rm"]),
+        ):
+            action = next(a for a in manifest["actions"] if a["id"] == action_id)
+            self.assertEqual(action["command"], ["python3", "bin/hs", *hs_args])
+
+        self.assertNotIn("sole_worker_id", dir(plugin))
 
     def test_manifest_readiness_check_requires_execution_authentication(self):
         manifest = (SCRIPT.parent.parent / "herdr-plugin.toml").read_text()

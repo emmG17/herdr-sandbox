@@ -209,31 +209,32 @@ class ExecuteWorkerTests(unittest.TestCase):
         self.assertIn("Latest result:", inspected)
         self.assertIn(str(run_dir / "output.log"), inspected)
 
-    def test_execute_config_table_is_ignored_with_deprecation_notice(self):
+    def test_legacy_execute_table_prints_single_deprecation_notice(self):
         (self.config / "config.toml").write_text(
             plugin.DEFAULT_CONFIG + '\n[execute]\nid = "STALE"\nprompt = "stale prompt"\n'
         )
         stderr = io.StringIO()
-        with patch.object(plugin.sys, "argv", [str(SCRIPT), "execute", "--prompt", "one-shot prompt"]), \
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "list"]), \
+                patch.object(plugin.sys, "stderr", stderr):
+            self.assertEqual(plugin.main(), 0)
+        message = stderr.getvalue()
+        self.assertEqual(message.count("legacy per-action config tables"), 1)
+        self.assertIn("[execute]", message)
+        self.assertIn("deprecated and ignored", message)
+        self.assertNotIn("stale prompt", message)
+
+    def test_codex_prompt_ignores_execute_config_table(self):
+        (self.config / "config.toml").write_text(
+            plugin.DEFAULT_CONFIG + '\n[execute]\nid = "STALE"\nprompt = "stale prompt"\n'
+        )
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "codex", "--prompt", "one-shot prompt"]), \
                 patch.object(plugin.sys, "stderr", stderr), \
                 patch.object(plugin, "hs_agent", return_value=0) as hs_agent:
             self.assertEqual(plugin.main(), 0)
         hs_agent.assert_called_once_with(plugin.DEFAULT_PROFILE, [], prompt="one-shot prompt")
-        self.assertIn("[execute] is deprecated and ignored", stderr.getvalue())
-
-    def test_execute_without_prompt_does_not_read_execute_config(self):
-        (self.config / "config.toml").write_text(
-            plugin.DEFAULT_CONFIG + '\n[execute]\nid = "STALE"\nprompt = "stale prompt"\n'
-        )
-        stderr = io.StringIO()
-        with patch.object(plugin.sys, "argv", [str(SCRIPT), "execute"]), \
-                patch.object(plugin.sys, "stderr", stderr), \
-                patch.object(plugin, "hs_agent", side_effect=AssertionError("should not launch")):
-            self.assertEqual(plugin.main(), 1)
-        message = stderr.getvalue()
-        self.assertIn("[execute] is deprecated and ignored", message)
-        self.assertIn("Task prompt is required", message)
-        self.assertNotIn("stale prompt", message)
+        self.assertIn("legacy per-action config tables", stderr.getvalue())
+        self.assertIn("[execute]", stderr.getvalue())
 
     def test_codex_prompt_reads_stdin_when_dash(self):
         stderr = io.StringIO()

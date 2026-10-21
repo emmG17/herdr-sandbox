@@ -174,20 +174,19 @@ class CreateTests(unittest.TestCase):
                 plugin.create_worker("partial", str(self.source))
         self.assertFalse((self.state / "workers" / "partial").exists())
 
-    def test_noninteractive_action_generates_worker_id(self):
-        with patch.object(plugin.sys, "argv", [str(SCRIPT), "create"]), \
-                patch.object(plugin.sys, "stdin", io.StringIO()), \
-                patch.object(plugin, "create_worker", return_value=Path("/tmp/generated")) as create:
+    def test_legacy_create_table_is_ignored_with_single_notice(self):
+        (self.config / "config.toml").write_text(
+            plugin.DEFAULT_CONFIG
+            + f'\n[create]\nid = "chosen"\nsource_repo = "{self.source}"\nbase_ref = "base"\n'
+        )
+        stderr = io.StringIO()
+        with patch.object(plugin.sys, "argv", [str(SCRIPT), "list"]), \
+                patch.object(plugin.sys, "stderr", stderr):
             self.assertEqual(plugin.main(), 0)
-        self.assertIsNone(create.call_args.args[0])
-
-    def test_noninteractive_action_uses_configured_inputs(self):
-        (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG + f'\n[create]\nid = "chosen"\nsource_repo = "{self.source}"\nbase_ref = "base"\n')
-        with patch.object(plugin.sys, "argv", [str(SCRIPT), "create"]), \
-                patch.object(plugin.sys, "stdin", io.StringIO()), \
-                patch.object(plugin, "create_worker", return_value=Path("/tmp/chosen")) as create:
-            self.assertEqual(plugin.main(), 0)
-        create.assert_called_once_with("chosen", str(self.source), "base")
+        message = stderr.getvalue()
+        self.assertEqual(message.count("legacy per-action config tables"), 1)
+        self.assertIn("[create]", message)
+        self.assertNotIn("create_options", dir(plugin))
 
 
 if __name__ == "__main__":

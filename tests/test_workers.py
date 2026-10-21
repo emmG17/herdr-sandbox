@@ -267,7 +267,10 @@ class WorkerInspectionTests(unittest.TestCase):
                 contextlib.redirect_stderr(stderr):
             self.assertEqual(plugin.main(), 0)
         self.assertIn("Worker: TEST-001", output.getvalue())
-        self.assertIn("[inspect] is deprecated and ignored", stderr.getvalue())
+        notice = stderr.getvalue()
+        self.assertEqual(notice.count("legacy per-action config tables"), 1)
+        self.assertIn("[inspect]", notice)
+        self.assertIn("deprecated and ignored", notice)
 
     def test_inspect_without_id_requires_pane_and_lists_candidates(self):
         self.create_worker("ALPHA-001")
@@ -355,7 +358,9 @@ class WorkerInspectionTests(unittest.TestCase):
                 contextlib.redirect_stderr(stderr):
             self.assertEqual(plugin.main(), 1)
         message = stderr.getvalue()
-        self.assertIn("[inspect] is deprecated and ignored", message)
+        self.assertEqual(message.count("legacy per-action config tables"), 1)
+        self.assertIn("[inspect]", message)
+        self.assertIn("deprecated and ignored", message)
         self.assertIn("HERDR_PANE_ID is unset", message)
         self.assertIn("REAL-001", message)
 

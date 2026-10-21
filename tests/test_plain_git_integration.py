@@ -103,7 +103,10 @@ class PlainGitIntegrationTests(unittest.TestCase):
         with patch.object(plugin.sys, "argv", [str(SCRIPT), "list"]), \
                 patch.object(plugin.sys, "stderr", stderr):
             self.assertEqual(plugin.main(), 0)
-        self.assertIn("[cherry_pick] is deprecated and ignored", stderr.getvalue())
+        notice = stderr.getvalue()
+        self.assertEqual(notice.count("legacy per-action config tables"), 1)
+        self.assertIn("[cherry_pick]", notice)
+        self.assertIn("deprecated and ignored", notice)
 
     def test_manifest_no_longer_exposes_cherry_pick_action(self):
         with (SCRIPT.parent.parent / "herdr-plugin.toml").open("rb") as stream:
@@ -111,7 +114,7 @@ class PlainGitIntegrationTests(unittest.TestCase):
         ids = {action["id"] for action in manifest["actions"]}
         self.assertNotIn("cherry-pick", ids)
         fetch = next(action for action in manifest["actions"] if action["id"] == "fetch")
-        self.assertEqual(fetch["command"], ["python3", "bin/herdr-sandbox", "fetch"])
+        self.assertEqual(fetch["command"], ["python3", "bin/hs", "fetch"])
         self.assertIn("sandbox/<id>", fetch["description"])
 
 

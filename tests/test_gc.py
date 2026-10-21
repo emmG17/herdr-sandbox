@@ -439,7 +439,7 @@ class GcTests(unittest.TestCase):
         events = manifest.get("events", [])
         self.assertTrue(events)
         self.assertEqual(events[0]["on"], "pane.closed")
-        self.assertEqual(events[0]["command"], ["python3", "bin/herdr-sandbox", "gc", "--from-event"])
+        self.assertEqual(events[0]["command"], ["python3", "bin/hs", "gc", "--from-event"])
         self.assertFalse(any(event.get("on") == "pane.exited" for event in events))
 
     def test_without_hook_next_launch_opportunistic_gc_collects(self):
