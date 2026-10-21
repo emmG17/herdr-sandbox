@@ -46,9 +46,7 @@ home = "claude"
 # the repo, or the image.
 # forward_api_key = false
 
-# Interactive pane worker selection for start-codex/open when several workers exist.
-# [open]
-# id = "WORKER-001"
-
-# [execute] is removed. Use: hs codex --prompt "..." or hs claude --prompt "..."
 # Authenticate with: hs login codex  or  hs login claude
+# Launch with: hs codex / hs claude  (or the start-* Herdr panes)
+# Legacy per-action tables ([open], [execute], [cherry_pick], [destroy],
+# [create], [fetch], [inspect]) are ignored with one deprecation notice.

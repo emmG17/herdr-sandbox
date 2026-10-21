@@ -30,71 +30,47 @@ description = "Check host tools, image, and plugin-owned paths"
 command = ["python3", "bin/herdr-sandbox", "check", "--execution"]
 
 [[actions]]
-id = "create"
-title = "Sandbox: Create Worker"
-description = "Create an isolated worker clone from the current Git workspace"
-command = ["python3", "bin/herdr-sandbox", "create"]
-
-[[actions]]
 id = "list"
 title = "Sandbox: List Workers"
-description = "List persisted workers and their current Git and container state"
-command = ["python3", "bin/herdr-sandbox", "list"]
+description = "List persisted workers (hs ls)"
+command = ["python3", "bin/hs", "ls"]
 
 [[actions]]
 id = "inspect"
 title = "Sandbox: Inspect Worker"
-description = "Inspect a worker's metadata, Git history, status, and base diff"
-command = ["python3", "bin/herdr-sandbox", "inspect"]
-
-[[actions]]
-id = "destroy"
-title = "Sandbox: Destroy Worker"
-description = "Alias of rm: stop and remove a worker (pass --id; [destroy] config removed)"
-command = ["python3", "bin/herdr-sandbox", "destroy"]
-
-[[actions]]
-id = "rm"
-title = "Sandbox: Remove Worker"
-description = "Stop and remove a worker container and its disposable state"
-command = ["python3", "bin/herdr-sandbox", "rm"]
-
-[[actions]]
-id = "gc"
-title = "Sandbox: Garbage-Collect Workers"
-description = "Remove fetched workers whose panes are gone, or workers older than [gc].max_age"
-command = ["python3", "bin/herdr-sandbox", "gc"]
+description = "Inspect a worker (hs inspect; defaults to this pane's worker)"
+command = ["python3", "bin/hs", "inspect"]
 
 [[actions]]
 id = "fetch"
 title = "Sandbox: Fetch Worker for Review"
-description = "Fetch a worker tip into refs/heads/sandbox/<id> and print plain-git review commands"
-command = ["python3", "bin/herdr-sandbox", "fetch"]
+description = "Fetch a worker tip into refs/heads/sandbox/<id> (hs fetch)"
+command = ["python3", "bin/hs", "fetch"]
 
 [[actions]]
-id = "open"
-title = "Sandbox: Open Worker"
-description = "Open an interactive Podman session in a Herdr-managed pane"
-command = ["python3", "bin/herdr-sandbox", "open"]
+id = "gc"
+title = "Sandbox: Garbage-Collect Workers"
+description = "Remove fetched workers whose panes are gone, or workers older than [gc].max_age (hs gc)"
+command = ["python3", "bin/hs", "gc"]
+
+[[actions]]
+id = "rm"
+title = "Sandbox: Remove Worker"
+description = "Stop and remove a worker container and its disposable state (hs rm)"
+command = ["python3", "bin/hs", "rm"]
 
 [[panes]]
 id = "start-codex"
 title = "Sandbox: Start Codex"
 placement = "overlay"
-command = ["python3", "bin/herdr-sandbox", "start-codex"]
+command = ["python3", "bin/hs", "codex"]
 
 [[panes]]
 id = "start-claude"
 title = "Sandbox: Start Claude Code"
 placement = "overlay"
-command = ["python3", "bin/herdr-sandbox", "start-claude"]
-
-[[actions]]
-id = "execute"
-title = "Sandbox: Execute Task"
-description = "Alias of hs codex --prompt: run one noninteractive Codex task (pass --prompt; [execute] config removed)"
-command = ["python3", "bin/herdr-sandbox", "execute"]
+command = ["python3", "bin/hs", "claude"]
 
 [[events]]
 on = "pane.closed"
-command = ["python3", "bin/herdr-sandbox", "gc", "--from-event"]
+command = ["python3", "bin/hs", "gc", "--from-event"]

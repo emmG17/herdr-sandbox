@@ -2514,107 +2514,6 @@ def sweep_stale_agent_sessions(agent_home, max_age_seconds=None, state_dir=None,
     return removed
 
 
-def fetch_options(config_dir):
-    """Read the fixed worker ID used by the non-prompting fetch action."""
-    config_file = config_dir / "config.toml"
-    with config_file.open("rb") as stream:
-        config = tomllib.load(stream)
-    options = config.get("fetch", {})
-    if not isinstance(options, dict):
-        raise ValueError(f"Expected a [fetch] table in {config_file}.")
-    if "id" in options and not isinstance(options["id"], str):
-        raise ValueError(f"Set [fetch].id to a string in {config_file}.")
-    return options
-
-
-def sole_worker_id(state_dir=None):
-    """Return the only persisted worker, or None when selection is ambiguous."""
-    workers_dir = state_workers_dir(state_dir)
-    if not workers_dir.is_dir() or workers_dir.is_symlink():
-        return None
-    worker_ids = sorted(
-        entry.name for entry in workers_dir.iterdir()
-        if entry.is_dir() and not entry.is_symlink() and WORKER_ID_RE.fullmatch(entry.name)
-    )
-    return worker_ids[0] if len(worker_ids) == 1 else None
-
-
-def configured_or_sole_worker(worker_id, config_dir, option_loader, action):
-    """Prefer explicit/configured selection; make the one-worker path config-free."""
-    if worker_id:
-        return worker_id
-    configured = option_loader(config_dir).get("id")
-    if configured:
-        return configured
-    _, state_dir = paths()
-    selected = sole_worker_id(state_dir)
-    if selected:
-        return selected
-    raise ValueError(
-        f"Worker ID is required when there is not exactly one worker. "
-        f"Pass `{action} --id WORKER_ID` or set the action's id in the plugin config."
-    )
-
-
-def workspace_sole_worker_id(workspace, state_dir=None):
-    """Return the only worker in the given workspace, or None when ambiguous.
-
-    Invalid worker entries are ignored so a single valid worker in scope still
-    resolves. When workspace is None, any valid worker qualifies (direct-launcher
-    use without Herdr context).
-    """
-    workers_dir = state_workers_dir(state_dir)
-    if not workers_dir.is_dir() or workers_dir.is_symlink():
-        return None
-    candidates = []
-    for entry in workers_dir.iterdir():
-        if not entry.is_dir() or entry.is_symlink() or not WORKER_ID_RE.fullmatch(entry.name):
-            continue
-        if workspace is not None:
-            try:
-                source = worker_source_repo(entry.name, state_dir)
-            except ValueError:
-                continue
-            if source != workspace:
-                continue
-        candidates.append(entry.name)
-    return candidates[0] if len(candidates) == 1 else None
-
-
-def _require_open_worker_id(reason):
-    raise ValueError(
-        f"Worker ID is required when {reason}. "
-        "Pass `--id WORKER_ID` or set [open].id in the plugin config."
-    )
-
-
-def resolve_open_worker(worker_id, config_dir):
-    """Resolve the worker for an interactive open, scoping fallback to the workspace.
-
-    Explicit IDs and configured [open].id are validated against the current
-    workspace; the sole-worker fallback only considers workers that belong to
-    that workspace. This keeps an unrelated worker in another workspace from
-    being selected when no ID is supplied, and ensures no pane is created when
-    the context is stale, missing, or ambiguous.
-    """
-    if worker_id:
-        validate_open_context(worker_id)
-        return worker_id
-    configured = open_options(config_dir).get("id")
-    if configured:
-        validate_open_context(configured)
-        return configured
-    _, state_dir = paths()
-    workspace = context_repo_root()
-    selected = workspace_sole_worker_id(workspace, state_dir)
-    if selected:
-        validate_open_context(selected)
-        return selected
-    if workspace is not None:
-        _require_open_worker_id("the current workspace has no sandbox worker")
-    _require_open_worker_id("there is not exactly one worker")
-
-
 def fetch_worker(worker_id, state_dir=None):
     """Fetch a worker branch into its source repository for later review.
 
@@ -2799,8 +2698,13 @@ def format_fetch_result(result):
     return "\n".join(lines)
 
 
+LEGACY_ACTION_CONFIG_TABLES = (
+    "open", "execute", "cherry_pick", "destroy", "create", "fetch", "inspect",
+)
+
+
 def warn_deprecated_integration_config(config_dir):
-    """Ignore legacy config tables with a one-line notice (never an error)."""
+    """Ignore legacy per-action config tables with one stderr notice (never an error)."""
     config_file = Path(config_dir) / "config.toml"
     if not config_file.is_file():
         return
@@ -2809,35 +2713,12 @@ def warn_deprecated_integration_config(config_dir):
             config = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError):
         return
-    if "cherry_pick" in config:
+    if any(name in config for name in LEGACY_ACTION_CONFIG_TABLES):
         print(
-            "Note: [cherry_pick] is deprecated and ignored; integrate with plain git on sandbox/<id>.",
+            "Note: legacy per-action config tables ([open], [execute], [cherry_pick], "
+            "[destroy], [create], [fetch], [inspect]) are deprecated and ignored; use hs.",
             file=sys.stderr,
         )
-    if "inspect" in config:
-        print(
-            "Note: [inspect] is deprecated and ignored; pass `inspect WORKER_ID` "
-            "or run `hs inspect` in the worker's pane.",
-            file=sys.stderr,
-        )
-    if "execute" in config:
-        print(
-            f'Note: [execute] is deprecated and ignored; use `hs {DEFAULT_PROFILE.name} --prompt "..."`.',
-            file=sys.stderr,
-        )
-
-
-def open_options(config_dir):
-    """Read the fixed worker chosen by the non-prompting Herdr open action."""
-    config_file = config_dir / "config.toml"
-    with config_file.open("rb") as stream:
-        config = tomllib.load(stream)
-    options = config.get("open", {})
-    if not isinstance(options, dict):
-        raise ValueError(f"Expected an [open] table in {config_file}.")
-    if "id" in options and not isinstance(options["id"], str):
-        raise ValueError(f"Set [open].id to a string in {config_file}.")
-    return options
 
 
 def _write_worker_status(worker_dir, status):
@@ -2968,7 +2849,12 @@ def _forwarded_container_env_names(config, profile, host_env=None):
 
 
 def podman_runtime(worker_id, agent_home=None, profile=None, forwarded_env_names=None):
-    """Create the configured runtime only after validating its permitted paths."""
+    """Create the configured runtime only after validating its permitted paths.
+
+    ``agent_home`` must be an explicit per-launch session home under the
+    configured plugin agent home (issue #29). Never pass ``None`` or the
+    configured home itself — those paths are refused.
+    """
     profile = DEFAULT_PROFILE if profile is None else profile
     validate_worker_id(worker_id)
     config_dir, state_dir = paths()
@@ -2979,11 +2865,14 @@ def podman_runtime(worker_id, agent_home=None, profile=None, forwarded_env_names
     repo = worker_dir / "repo"
     if not repo.is_dir() or repo.is_symlink() or not (repo / ".git").exists():
         raise ValueError(f"Worker repository does not exist: {repo}")
-    selected_home = configured_home if agent_home is None else Path(agent_home).expanduser().resolve()
-    if agent_home is not None and (
-        selected_home == configured_home
-        or not selected_home.is_relative_to(configured_home)
-    ):
+    if agent_home is None:
+        raise ValueError(
+            "podman_runtime requires an explicit per-launch session home "
+            "(issue #29); never mount the configured agent home."
+        )
+    selected_home = Path(agent_home).expanduser().resolve()
+    configured_resolved = configured_home.resolve()
+    if selected_home == configured_resolved or not selected_home.is_relative_to(configured_resolved):
         raise ValueError(f"Fresh {profile.name} home must be inside the dedicated plugin home: {selected_home}")
     if not selected_home.is_dir() or selected_home.is_symlink():
         raise ValueError(f"Dedicated {profile.name} home does not exist: {selected_home}")
@@ -3001,6 +2890,8 @@ def podman_runtime(worker_id, agent_home=None, profile=None, forwarded_env_names
 
 def open_command(worker_id, command=None, fresh=False, agent_home=None, profile=None):
     """Build the central runtime's interactive invocation for a worker."""
+    if agent_home is None:
+        raise ValueError("open_command requires an explicit per-launch agent_home.")
     return podman_runtime(worker_id, agent_home, profile).interactive_command(command, fresh=fresh)
 
 
@@ -3083,7 +2974,12 @@ def build_herdr_pane_open_command(placement, target_pane, direction):
 
 
 def open_worker(worker_id, command=None, fresh=False, profile=None):
-    """Open a terminal-attached worker session for Herdr to manage."""
+    """Open a terminal-attached worker session for Herdr to manage.
+
+    Always creates a per-launch session home under the configured agent home
+    (issue #29), including non-fresh bash opens. Never bind-mounts the
+    configured home wholesale.
+    """
     profile = DEFAULT_PROFILE if profile is None else profile
     config_dir, state_dir = paths()
     _, worker_dir = worker_storage(worker_id, state_dir)
@@ -3093,21 +2989,17 @@ def open_worker(worker_id, command=None, fresh=False, profile=None):
     errors = check(require_auth=needs_auth, profile=profile)
     if errors:
         raise ValueError("Readiness checks failed:\n- " + "\n- ".join(errors))
-    session_home = None
-    launch_snapshots = None
-    configured_home = None
+    _, configured_home = load_config(config_dir, profile)
+    _, config = _read_config_toml(config_dir)
+    allow_missing_auth = (not needs_auth) or bool(
+        agent_forward_api_key(config, profile) and api_key_from_host(profile)
+    )
+    session_home, launch_snapshots = fresh_agent_home(
+        configured_home, worker_id, profile, allow_missing_auth=allow_missing_auth,
+    )
     # Herdr reads HERDR_AGENT on the host wrapper, not inside the container.
     previous_herdr_agent = os.environ.get("HERDR_AGENT")
     try:
-        if fresh:
-            _, configured_home = load_config(config_dir, profile)
-            _, config = _read_config_toml(config_dir)
-            allow_missing = bool(
-                agent_forward_api_key(config, profile) and api_key_from_host(profile)
-            )
-            session_home, launch_snapshots = fresh_agent_home(
-                configured_home, worker_id, profile, allow_missing_auth=allow_missing,
-            )
         invocation = open_command(
             worker_id, command, fresh=fresh, agent_home=session_home, profile=profile,
         )
@@ -3124,14 +3016,13 @@ def open_worker(worker_id, command=None, fresh=False, profile=None):
         _write_worker_status(worker_dir, "stopped" if result.returncode == 0 else "failed")
         return result.returncode
     finally:
-        if session_home is not None and launch_snapshots is not None and configured_home is not None:
-            try:
-                write_back_auth_files(
-                    configured_home, session_home, profile, launch_snapshots, state_dir=state_dir,
-                )
-            except Exception as exc:  # noqa: BLE001 - session cleanup must proceed
-                print(f"Auth write-back skipped: {exc}", file=sys.stderr)
-            shutil.rmtree(session_home, ignore_errors=True)
+        try:
+            write_back_auth_files(
+                configured_home, session_home, profile, launch_snapshots, state_dir=state_dir,
+            )
+        except Exception as exc:  # noqa: BLE001 - session cleanup must proceed
+            print(f"Auth write-back skipped: {exc}", file=sys.stderr)
+        shutil.rmtree(session_home, ignore_errors=True)
         if previous_herdr_agent is None:
             os.environ.pop("HERDR_AGENT", None)
         else:
@@ -3508,15 +3399,32 @@ def _query_worker_git_snapshot(worker_id, base_commit=None):
     }
     if shutil.which("podman") is None:
         return {**empty, "error": "Podman is unavailable"}
+    query_home = None
     try:
-        runtime = podman_runtime(worker_id)
+        config_dir, _ = paths()
+        _, configured_home = load_config(config_dir)
+        sessions_dir = configured_home / "sessions"
+        if sessions_dir.is_symlink() or (sessions_dir.exists() and not sessions_dir.is_dir()):
+            raise ValueError(f"Session storage is not a real directory: {sessions_dir}.")
+        sessions_dir.mkdir(mode=0o700, exist_ok=True)
+        sessions_dir.chmod(0o700)
+        # git_query_command never mounts agent_home; this temp dir only satisfies
+        # podman_runtime's per-launch session-home requirement (issue #29).
+        query_home = Path(tempfile.mkdtemp(prefix=f"{worker_id}-git-query-", dir=sessions_dir))
+        query_home.chmod(0o700)
+        runtime = podman_runtime(worker_id, agent_home=query_home)
         command = build_worker_git_query_command(runtime, base_commit=base_commit)
     except (ValueError, OSError) as exc:
+        if query_home is not None:
+            shutil.rmtree(query_home, ignore_errors=True)
         return {**empty, "error": str(exc)}
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     except (FileNotFoundError, OSError) as exc:
         return {**empty, "error": str(exc)}
+    finally:
+        if query_home is not None:
+            shutil.rmtree(query_home, ignore_errors=True)
     if result.returncode:
         detail = (result.stderr or result.stdout or "Git query container failed").strip()
         return {**empty, "error": detail}
@@ -3921,8 +3829,9 @@ def _workers_for_pane_and_repo(pane_id, source_repo, state_dir=None):
 def resolve_inspect_worker(worker_id=None, state_dir=None):
     """Resolve the inspect target from an explicit ID or the current pane.
 
-    With no ID, match workers for (HERDR_PANE_ID, cwd repo, any agent). Never
-    fall back to ``[inspect].id`` or ``sole_worker_id()``.
+    With no ID, match workers for (``HERDR_PANE_ID`` from the Herdr plugin env
+    — see https://herdr.dev/docs/plugins/ — plus the cwd repo, any agent).
+    Config table and sole-worker fallbacks are gone.
     """
     if worker_id:
         return worker_id
@@ -4239,19 +4148,6 @@ def find_reusable_worker(source_repo, agent, state_dir=None):
     return None, None
 
 
-def create_options(config_dir):
-    config_file = config_dir / "config.toml"
-    with config_file.open("rb") as stream:
-        config = tomllib.load(stream)
-    options = config.get("create", {})
-    if not isinstance(options, dict):
-        raise ValueError(f"Expected a [create] table in {config_file}.")
-    for key in ("id", "source_repo", "base_ref"):
-        if key in options and not isinstance(options[key], str):
-            raise ValueError(f"Set [create].{key} to a string in {config_file}.")
-    return options
-
-
 def resolve_prompt_argument(prompt):
     """Resolve ``--prompt`` text, including ``--prompt -`` reading stdin."""
     if prompt is None:
@@ -4548,10 +4444,9 @@ def ensure_login_home(state_dir, profile):
     """Return a plugin-owned 0700 HOME for ``hs login`` when isolating.
 
     Placed at ``<state_dir>/login-homes/<agent>``, a sibling of worker state —
-    not under the dedicated agent home. ``fresh_agent_home`` only copies
-    ``auth_files`` into a per-launch session, but non-fresh opens can bind-mount
-    the configured agent home wholesale at the profile mount point, so a login
-    HOME under agent_home would enter the container. Symlink components under
+    not under the dedicated agent home. The configured agent home is never
+    bind-mounted into workers (issue #29); ``fresh_agent_home`` only copies
+    ``auth_files`` into a per-launch session. Symlink components under
     ``state_dir`` are refused.
     """
     state_dir = Path(state_dir)
@@ -4610,11 +4505,9 @@ def login_agent(agent_name):
     return result.returncode
 
 
-def resolve_fetch_worker(worker_id, config_dir):
-    """Resolve a fetch target from a positional/option ID, config, or sole worker."""
-    if worker_id:
-        return worker_id
-    return configured_or_sole_worker(None, config_dir, fetch_options, "fetch")
+def resolve_fetch_worker(worker_id=None, state_dir=None):
+    """Resolve a fetch target from an explicit ID or the current pane context."""
+    return resolve_inspect_worker(worker_id, state_dir=state_dir)
 
 
 def main():
@@ -4630,13 +4523,12 @@ def main():
         action="store_true",
         help="Also require dedicated agent authentication",
     )
-    create_parser = commands.add_parser("create")
-    create_parser.add_argument("--id", help="Worker ID (prompted for in an interactive terminal)")
-    create_parser.add_argument("--repo", help="Source repository (defaults to the Herdr workspace)")
-    create_parser.add_argument("--base", help="Base ref or commit (default: HEAD)")
-    fetch_parser = commands.add_parser("fetch", help="Fetch worker HEAD into refs/heads/sandbox/<id>")
+    fetch_parser = commands.add_parser(
+        "fetch",
+        help="Fetch worker HEAD into refs/heads/sandbox/<id> (defaults to this pane's worker)",
+    )
     fetch_parser.add_argument("worker_id", nargs="?", help="Worker ID")
-    fetch_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (or configure [fetch].id)")
+    fetch_parser.add_argument("--id", dest="option_worker_id", help="Worker ID")
     destroy_parser = commands.add_parser(
         "destroy",
         help="Alias of rm: remove one sandbox worker (deprecated name; use rm)",
@@ -4678,25 +4570,6 @@ def main():
     inspect_parser.add_argument("worker_id", nargs="?", help="Worker ID")
     inspect_parser.add_argument("--id", dest="option_worker_id", help="Worker ID")
     inspect_parser.add_argument("--json", action="store_true", help="Print structured JSON")
-    open_parser = commands.add_parser("open", help="Open an interactive sandbox worker")
-    open_parser.add_argument("worker_id", nargs="?", help="Worker ID")
-    open_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (for Herdr action configuration)")
-    open_parser.add_argument(
-        f"--{DEFAULT_PROFILE.name}",
-        dest="start_default_agent",
-        action="store_true",
-        help=f"Start {DEFAULT_PROFILE.name} instead of the default shell",
-    )
-    open_parser.add_argument("session_command", nargs=argparse.REMAINDER, help="Command and arguments to run in the worker")
-    start_commands = {}
-    for profile in AGENT_PROFILES.values():
-        start_name = f"start-{profile.name}"
-        start_parser = commands.add_parser(
-            start_name,
-            help=f"Start a fresh {profile.name} session in a sandbox worker",
-        )
-        start_parser.add_argument("--id", help="Worker ID (or configure [open].id)")
-        start_commands[start_name] = profile
     pane_open_parser = commands.add_parser(
         "pane-open",
         help=f"Open the start-{DEFAULT_PROFILE.name} pane through Herdr with validated placement",
@@ -4704,18 +4577,6 @@ def main():
     pane_open_parser.add_argument("--placement", help="Pane placement: overlay, split, or tab (default: overlay)")
     pane_open_parser.add_argument("--target-pane", help="Target pane for split placement (for example, w1:p1)")
     pane_open_parser.add_argument("--direction", help="Split direction: right or down")
-    execute_parser = commands.add_parser(
-        "execute",
-        help=(
-            f"Alias of {DEFAULT_PROFILE.name} --prompt: run one noninteractive "
-            f"{DEFAULT_PROFILE.name} task (deprecated name; use hs {DEFAULT_PROFILE.name} --prompt)"
-        ),
-    )
-    execute_parser.add_argument(
-        "--prompt",
-        dest="option_prompt",
-        help='Task prompt (use "-" to read stdin)',
-    )
     workers_parser = commands.add_parser("workers", help=argparse.SUPPRESS)
     workers_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     login_parser = commands.add_parser("login", help="Authenticate an agent into its plugin-owned home")
@@ -4750,18 +4611,6 @@ def main():
             bootstrap()
         elif args.command == "build-image":
             build_image()
-        elif args.command == "create":
-            config_dir, _ = paths()
-            options = create_options(config_dir)
-            worker_id = args.id or options.get("id")
-            if not worker_id and sys.stdin.isatty():
-                worker_id = input("Worker ID: ").strip()
-            worker_dir = create_worker(
-                worker_id or None,
-                args.repo or options.get("source_repo"),
-                args.base or options.get("base_ref") or "HEAD"
-            )
-            print(worker_dir)
         elif args.command in {"destroy", "rm"}:
             worker_id = args.worker_id or args.option_worker_id
             if not worker_id:
@@ -4807,10 +4656,10 @@ def main():
             except ValueError as exc:
                 print(f"Agent session sweep skipped: {exc}", file=sys.stderr)
         elif args.command == "fetch":
-            config_dir, _ = paths()
+            _, state_dir = paths()
             worker_id = resolve_fetch_worker(
                 args.worker_id or args.option_worker_id,
-                config_dir,
+                state_dir=state_dir,
             )
             print(format_fetch_result(fetch_worker(worker_id)))
         elif args.command in {"list", "ls", "workers"}:
@@ -4830,35 +4679,9 @@ def main():
                 print(json.dumps(record, indent=2))
             else:
                 print(format_worker(record))
-        elif args.command == "open":
-            config_dir, _ = paths()
-            worker_id = resolve_open_worker(args.worker_id or args.option_worker_id, config_dir)
-            if args.start_default_agent:
-                command = [DEFAULT_PROFILE.interactive_bin]
-            else:
-                command = args.session_command or ["bash"]
-            if command and command[0] == DEFAULT_PROFILE.interactive_bin:
-                return open_worker(worker_id, command, fresh=True, profile=DEFAULT_PROFILE)
-            return open_worker(worker_id, command)
-        elif args.command in start_commands:
-            start_profile = start_commands[args.command]
-            config_dir, _ = paths()
-            worker_id = resolve_open_worker(args.id, config_dir)
-            return open_worker(
-                worker_id, [start_profile.interactive_bin], fresh=True, profile=start_profile,
-            )
         elif args.command == "pane-open":
             command = build_herdr_pane_open_command(args.placement, args.target_pane, args.direction)
             return subprocess.run(command, check=False).returncode
-        elif args.command == "execute":
-            if args.option_prompt is None:
-                raise ValueError(
-                    'Task prompt is required. Pass `execute --prompt "..."` '
-                    "(or --prompt - to read stdin). "
-                    f"`execute` is an alias of `hs {DEFAULT_PROFILE.name} --prompt`; "
-                    "[execute] config is ignored."
-                )
-            return hs_agent(DEFAULT_PROFILE, [], prompt=args.option_prompt)
         elif args.command == "login":
             return login_agent(args.agent)
         elif args.command in AGENT_PROFILES:
