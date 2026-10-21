@@ -136,13 +136,19 @@ hs gc
 
 Closing a Herdr pane triggers a `pane.closed` plugin event that runs
 `hs gc --from-event` for that pane's fetched workers. Each `hs codex` launch
-also runs a short opportunistic GC. GC never deletes or rewrites refs in the
+also runs a short opportunistic GC (non-blocking state lock, no
+fetch-before-GC, 2s budget). GC never deletes or rewrites refs in the
 source repository (including `sandbox/*` branches).
 
-Configure retention with `[gc].max_age` (default `7d`). An unfetched worker
-older than `max_age` is fetched first and deleted only on success; otherwise
-GC skips it with a one-line warning. Workers with a running container are
-never collected. `pane.exited` is not a GC trigger.
+Configure retention with `[gc].max_age` (default `7d`). Explicit `hs gc`
+fetches an unfetched worker older than `max_age` first and deletes only on
+success; otherwise it skips with a one-line warning. Before deleting any
+`fetched` worker, GC also requires the current `agent/<id>` tip and
+`refs/heads/sandbox/<id>` to equal `fetched_commit` (re-fetch on explicit
+`hs gc`, skip on event/opportunistic paths if they diverge). Containers are
+collected only when status is `not-found`, `exited`, or `stopped`. Pane
+absence requires a structured `pane_not_found` from `herdr pane get`.
+`pane.exited` is not a GC trigger.
 
 List durable worker state at any time:
 
