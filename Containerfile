@@ -8,11 +8,12 @@ RUN apt-get update \
        build-essential ca-certificates curl git jq nodejs npm procps python3 python3-pip \
        python3-venv ripgrep unzip wget \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install --global pnpm @openai/codex @anthropic-ai/claude-code
+    && npm install --global pnpm @openai/codex@0.163.0 @anthropic-ai/claude-code@2.1.306
 
 # Add project-specific system tools and language runtimes below. The default
 # boilerplate assumes a Debian/Ubuntu-compatible base with apt-get available.
-# Agent profile image_npm_packages: @openai/codex (codex), @anthropic-ai/claude-code (claude).
+# Agent profile image_npm_packages (pinned): @openai/codex@0.163.0,
+# @anthropic-ai/claude-code@2.1.306.
 
 WORKDIR /workspace
 CMD ["bash"]

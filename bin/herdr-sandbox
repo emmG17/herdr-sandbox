@@ -48,11 +48,36 @@ DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 AGENT_CONFIG_KEYS = {"home", "forward_api_key"}
 AGENT_PROFILES = {}
 DEFAULT_PROFILE = None
+# Env keys the runtime always sets (or reserves). Profiles cannot override these
+# via container_env; runtime-forced values are emitted last so they win.
+RUNTIME_RESERVED_ENV_KEYS = frozenset({"HOME", "XDG_CACHE_HOME", "GIT_OPTIONAL_LOCKS"})
+ENV_NAME_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _env_string_is_safe(value):
+    """Return True when value has no CR, LF, or NUL (unsafe in --env argv)."""
+    return isinstance(value, str) and ("\n" not in value) and ("\r" not in value) and ("\0" not in value)
+
+
+def _validate_env_name(name, *, what):
+    if not isinstance(name, str) or not ENV_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"{what} must match {ENV_NAME_RE.pattern} (got {name!r})."
+        )
+    if not _env_string_is_safe(name):
+        raise ValueError(f"{what} must not contain CR, LF, or NUL (got {name!r}).")
 
 
 @dataclass(frozen=True)
 class AgentProfile:
-    """Agent-specific launch and auth values. Cannot widen runtime isolation."""
+    """Agent-specific launch and auth values.
+
+    Cannot widen runtime isolation: profiles may not add mounts, capabilities,
+    devices, or network. ``container_env`` cannot override runtime-forced keys
+    (``HOME``, ``XDG_CACHE_HOME``, ``GIT_OPTIONAL_LOCKS``, the profile home env
+    var, or any ``HERDR_*`` key); those are validated at construction and the
+    runtime emits its forced env last.
+    """
 
     name: str
     home_dirname: str
@@ -69,18 +94,55 @@ class AgentProfile:
     herdr_agent: str
     normal_user_home: str
     noninteractive_prefix: tuple
-    # npm packages the shared Containerfile must install for this agent.
+    # npm packages (with version pins) the shared Containerfile must install.
     image_npm_packages: tuple = ()
-    # Extra container --env pairs beyond HOME / home_env_var / XDG_CACHE_HOME.
-    # Values are literals; host env is never forwarded implicitly.
+    # Extra literal container --env pairs. Cannot override reserved runtime keys.
+    # Host env is never forwarded implicitly; secrets must not appear here.
     container_env: tuple = ()
     # Extra host paths (relative to Path.home()) refused as the plugin home,
     # beyond normal_user_home (for example a sibling global config file).
     banned_host_names: tuple = ()
-    # Optional host env var name for an API-key auth path. Only forwarded into
-    # the container when [agent].forward_api_key = true. Never written into the
-    # repo, image, or config file.
+    # Optional host env var name for an API-key auth path. When
+    # [agent].forward_api_key = true and the var is set, Podman gets
+    # ``--env NAME`` with no value (inherits from the subprocess env). The key
+    # value never appears on argv. Never written into the repo, image, or config.
     api_key_env: str | None = None
+
+    def __post_init__(self):
+        _validate_env_name(self.home_env_var, what=f"{self.name} home_env_var")
+        if self.api_key_env is not None:
+            _validate_env_name(self.api_key_env, what=f"{self.name} api_key_env")
+            if self.api_key_env in RUNTIME_RESERVED_ENV_KEYS or self.api_key_env.startswith("HERDR_"):
+                raise ValueError(
+                    f"{self.name} api_key_env cannot be a reserved runtime key: {self.api_key_env}."
+                )
+            if self.api_key_env == self.home_env_var:
+                raise ValueError(
+                    f"{self.name} api_key_env cannot equal home_env_var ({self.home_env_var})."
+                )
+        reserved = set(RUNTIME_RESERVED_ENV_KEYS) | {self.home_env_var}
+        if self.api_key_env:
+            reserved.add(self.api_key_env)
+        seen = set()
+        for item in self.container_env:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError(
+                    f"{self.name} container_env entries must be (key, value) pairs."
+                )
+            key, value = item
+            _validate_env_name(key, what=f"{self.name} container_env key")
+            if not _env_string_is_safe(value):
+                raise ValueError(
+                    f"{self.name} container_env value for {key} must be a string "
+                    "without CR, LF, or NUL."
+                )
+            if key in reserved or key.startswith("HERDR_"):
+                raise ValueError(
+                    f"{self.name} container_env cannot set reserved runtime key {key}."
+                )
+            if key in seen:
+                raise ValueError(f"{self.name} container_env duplicates key {key}.")
+            seen.add(key)
 
     def normal_user_home_path(self):
         return (Path.home() / self.normal_user_home).expanduser().resolve()
@@ -174,7 +236,7 @@ CODEX_PROFILE = _CodexAgentProfile(
     herdr_agent="codex",
     normal_user_home=".codex",
     noninteractive_prefix=("exec", "--sandbox", "danger-full-access"),
-    image_npm_packages=("@openai/codex",),
+    image_npm_packages=("@openai/codex@0.163.0",),
 )
 AGENT_PROFILES[CODEX_PROFILE.name] = CODEX_PROFILE
 DEFAULT_PROFILE = CODEX_PROFILE
@@ -183,25 +245,24 @@ DEFAULT_PROFILE = CODEX_PROFILE
 
 # BEGIN AGENT PROFILE: claude
 def _claude_validate_auth_data(data):
-    """Accept Claude Code credential JSON under CLAUDE_CONFIG_DIR/.credentials.json.
+    """Accept Claude Code OAuth credentials under CLAUDE_CONFIG_DIR/.credentials.json.
 
     Official storage: https://code.claude.com/docs/en/authentication
     (Linux: ``.credentials.json`` under ``CLAUDE_CONFIG_DIR``, default ``~/.claude``).
+    Claude Code writes a ``claudeAiOauth`` object with access and refresh tokens.
     """
-    if not isinstance(data, dict) or not data:
+    if not isinstance(data, dict):
         return False
     oauth = data.get("claudeAiOauth")
-    if isinstance(oauth, dict):
-        if any(
-            isinstance(oauth.get(key), str) and oauth.get(key).strip()
-            for key in ("accessToken", "refreshToken")
-        ):
-            return True
-    for key in ("apiKey", "primaryApiKey", "accessToken"):
-        if isinstance(data.get(key), str) and data.get(key).strip():
-            return True
-    # Non-empty credential object from /login; shape varies by account type.
-    return any(value not in (None, "", {}, []) for value in data.values())
+    if not isinstance(oauth, dict):
+        return False
+    access = oauth.get("accessToken")
+    refresh = oauth.get("refreshToken")
+    if not (isinstance(access, str) and access.strip()):
+        return False
+    if not (isinstance(refresh, str) and refresh.strip()):
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -225,7 +286,7 @@ CLAUDE_PROFILE = _ClaudeAgentProfile(
     normal_user_home=".claude",
     # --prompt maps to -p; full in-container permissions match interactive.
     noninteractive_prefix=("--dangerously-skip-permissions", "-p"),
-    image_npm_packages=("@anthropic-ai/claude-code",),
+    image_npm_packages=("@anthropic-ai/claude-code@2.1.306",),
     banned_host_names=(".claude.json",),
     api_key_env="ANTHROPIC_API_KEY",
 )
@@ -1288,8 +1349,16 @@ def write_back_auth_files(agent_home, session_home, profile, launch_snapshots, s
                 payload = _read_regular_file_nofollow(src, session_home)
                 data = json.loads(payload.decode("utf-8"))
             except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                print(
+                    f"Auth write-back skipped for {name}: unreadable or invalid JSON.",
+                    file=sys.stderr,
+                )
                 continue
             if not profile.validate_auth_data(data):
+                print(
+                    f"Auth write-back skipped for {name}: invalid auth JSON shape.",
+                    file=sys.stderr,
+                )
                 continue
             snap = launch_snapshots.get(name)
             if snap is not None and payload == snap["data"]:
@@ -2245,7 +2314,7 @@ class PodmanSandboxRuntime:
 
     def __init__(
         self, worker_id, image, repo, agent_home, network, cpus, memory, pids, profile,
-        forwarded_env=None,
+        forwarded_env_names=None,
     ):
         self.worker_id = worker_id
         self.image = image
@@ -2256,7 +2325,9 @@ class PodmanSandboxRuntime:
         self.memory = memory
         self.pids = pids
         self.profile = profile
-        self.forwarded_env = dict(forwarded_env or {})
+        # Names only: emitted as ``--env NAME`` (no value) so Podman inherits from
+        # the subprocess environment without putting secrets on argv.
+        self.forwarded_env_names = tuple(forwarded_env_names or ())
 
     def _base_command(self, interactive=False):
         """Build the shared hardened Podman invocation for both execution modes."""
@@ -2266,22 +2337,23 @@ class PodmanSandboxRuntime:
             raise ValueError(
                 f"Refusing to mount banned host path as {profile.name} home: {agent_home}"
             )
-        # Profile-owned env first (home + extras), then explicit opt-in forwards.
-        env_pairs = [
-            ("HOME", "/tmp/home"),
-            (profile.home_env_var, profile.mount_point),
-            ("XDG_CACHE_HOME", "/tmp/cache"),
-            *list(profile.container_env),
-            *self.forwarded_env.items(),
-        ]
         invocation = [
             "podman", "run", "--rm",
             "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
             f"--pids-limit={self.pids}", f"--memory={self.memory}", f"--cpus={self.cpus}",
         ]
-        for key, value in env_pairs:
-            if not isinstance(key, str) or not key or not isinstance(value, str):
-                raise ValueError(f"Invalid container env pair for {profile.name}: {key!r}")
+        # Profile extras first, then inherit-only forwards, then runtime-forced
+        # env last so reserved keys always win.
+        for key, value in profile.container_env:
+            invocation.extend(["--env", f"{key}={value}"])
+        for name in self.forwarded_env_names:
+            _validate_env_name(name, what="forwarded container env")
+            invocation.extend(["--env", name])
+        for key, value in (
+            ("HOME", "/tmp/home"),
+            (profile.home_env_var, profile.mount_point),
+            ("XDG_CACHE_HOME", "/tmp/cache"),
+        ):
             invocation.extend(["--env", f"{key}={value}"])
         invocation.extend([
             "--mount", f"type=bind,src={self.repo.resolve()},dst=/workspace,rw",
@@ -2331,17 +2403,17 @@ class PodmanSandboxRuntime:
         return self._base_command() + [self.image] + self.profile.build_noninteractive_argv(prompt)
 
 
-def _forwarded_container_env(config, profile, host_env=None):
-    """Build explicit opt-in container env (API key only when configured)."""
-    forwarded = {}
-    if agent_forward_api_key(config, profile):
-        value = api_key_from_host(profile, host_env)
-        if value is not None:
-            forwarded[profile.api_key_env] = value
-    return forwarded
+def _forwarded_container_env_names(config, profile, host_env=None):
+    """Return env var names to pass as ``--env NAME`` (inherit, no argv secret).
+
+    Only when ``[agent].forward_api_key`` is true and the host var is set.
+    """
+    if agent_forward_api_key(config, profile) and api_key_from_host(profile, host_env):
+        return (profile.api_key_env,)
+    return ()
 
 
-def podman_runtime(worker_id, agent_home=None, profile=None, forwarded_env=None):
+def podman_runtime(worker_id, agent_home=None, profile=None, forwarded_env_names=None):
     """Create the configured runtime only after validating its permitted paths."""
     profile = DEFAULT_PROFILE if profile is None else profile
     validate_worker_id(worker_id)
@@ -2365,11 +2437,11 @@ def podman_runtime(worker_id, agent_home=None, profile=None, forwarded_env=None)
         raise ValueError(
             f"Refusing to mount banned host path as {profile.name} home: {selected_home}"
         )
-    if forwarded_env is None:
-        forwarded_env = _forwarded_container_env(config, profile)
+    if forwarded_env_names is None:
+        forwarded_env_names = _forwarded_container_env_names(config, profile)
     return PodmanSandboxRuntime(
         worker_id, image, repo, selected_home, network, cpus, memory, pids, profile,
-        forwarded_env=forwarded_env,
+        forwarded_env_names=forwarded_env_names,
     )
 
 

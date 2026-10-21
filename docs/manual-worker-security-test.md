@@ -18,6 +18,26 @@ hs login codex     # Codex run
 hs login claude    # Claude Code run
 ```
 
+### Claude login and host `~/.claude.json`
+
+`CLAUDE_CONFIG_DIR` (set by `hs login claude` to the plugin-owned home) relocates
+the `~/.claude` directory — including `.credentials.json` — but does **not**
+relocate the separate global `~/.claude.json` under the host home
+([Claude directory](https://code.claude.com/docs/en/claude-directory)). Before
+and after `hs login claude`, confirm the host file is untouched:
+
+```sh
+# Optional: create a sentinel if the file does not exist yet
+test -f ~/.claude.json || printf '{}\n' > ~/.claude.json
+cp -a ~/.claude.json /tmp/claude-json-before-login
+sha256sum ~/.claude.json /tmp/claude-json-before-login
+hs login claude
+sha256sum ~/.claude.json /tmp/claude-json-before-login
+cmp /tmp/claude-json-before-login ~/.claude.json
+# Expected: identical checksums / cmp silent success. If they differ, stop and
+# investigate; do not treat the host ~/.claude.json as plugin-owned state.
+```
+
 Create a test repository with a sentinel file:
 
 ```sh

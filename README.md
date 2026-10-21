@@ -92,9 +92,14 @@ to work after plugin updates. `hs login codex` runs device auth with
 `CODEX_HOME` pointed at the plugin-owned home. `hs login claude` runs
 `claude auth login` with `CLAUDE_CONFIG_DIR` pointed at the plugin-owned Claude
 home (see [Claude Code authentication](https://code.claude.com/docs/en/authentication)
-and [`CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/env-vars)). Login
+and [`CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/env-vars)).
+`CLAUDE_CONFIG_DIR` relocates the `~/.claude` config directory (including
+`.credentials.json`), but it does **not** relocate the separate global
+`~/.claude.json` file under the host home
+([Claude directory](https://code.claude.com/docs/en/claude-directory)). Login
 refuses normal user homes (`~/.codex`, `~/.claude`) and banned host paths such
-as `~/.claude.json`.
+as `~/.claude.json`. After `hs login claude`, confirm the host `~/.claude.json`
+is unchanged (see `docs/manual-worker-security-test.md`).
 
 Then, in a Herdr pane containing the Git repository you want to change:
 
@@ -257,10 +262,12 @@ is removed when the agent exits, so history from another worker or workspace
 cannot be resumed. For Claude, `--prompt` maps to `-p`.
 
 Optional Claude API-key auth: set `[claude].forward_api_key = true` and export
-`ANTHROPIC_API_KEY` on the host. That single variable is then passed as a
-container `--env`. Host env is never forwarded implicitly; never put the key
-in the repo, image, or config file. Prefer `hs login claude` so credentials
-live under the plugin-owned `CLAUDE_CONFIG_DIR` instead
+`ANTHROPIC_API_KEY` on the host. Podman then receives `--env ANTHROPIC_API_KEY`
+with **no value** (inherits from the `hs` process environment), so the secret
+never appears on argv / `ps` / `/proc/*/cmdline`. Host env is never forwarded
+implicitly; never put the key in the repo, image, or config file. Prefer
+`hs login claude` so credentials live under the plugin-owned
+`CLAUDE_CONFIG_DIR` instead
 ([docs](https://code.claude.com/docs/en/authentication)).
 
 **Token refresh (option a):** write-back is always attempted in a `finally`
