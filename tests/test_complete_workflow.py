@@ -39,6 +39,9 @@ class CompleteWorkflowTests(unittest.TestCase):
         self.state = root / "state"
         self.state.mkdir()
         (self.config / "codex").mkdir()
+        (self.config / "codex" / "auth.json").write_text(
+            '{"tokens":{"access_token":"test","refresh_token":"test"}}\n'
+        )
         (self.config / "config.toml").write_text(plugin.DEFAULT_CONFIG)
         self.env = patch.dict(os.environ, {
             "HERDR_PLUGIN_CONFIG_DIR": str(self.config),

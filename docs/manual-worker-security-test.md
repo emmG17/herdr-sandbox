@@ -10,7 +10,7 @@ Complete plugin setup, build the image, and authenticate the dedicated Codex hom
 
 ```sh
 herdr plugin action invoke bootstrap --plugin dev.herdr.sandbox
-CODEX_HOME="$(herdr plugin config-dir dev.herdr.sandbox)/codex" codex login --device-auth
+hs login codex
 ```
 
 Create a test repository with a sentinel file:

@@ -78,7 +78,7 @@ Run the first three commands once:
 
 ```sh
 herdr plugin action invoke bootstrap --plugin dev.herdr.sandbox
-CODEX_HOME="$(herdr plugin config-dir dev.herdr.sandbox)/codex" codex login --device-auth
+hs login codex
 herdr plugin action invoke check --plugin dev.herdr.sandbox
 ```
 
@@ -86,8 +86,8 @@ herdr plugin action invoke check --plugin dev.herdr.sandbox
 dedicated Codex home, and the worker image. It also installs a small `hs` shim
 to `~/.local/bin/hs` (ensure `~/.local/bin` is on your PATH). The shim resolves
 the current plugin root from Herdr at runtime, so it continues to work after
-plugin updates. Authenticate only in that dedicated home, never in the normal
-user Codex home.
+plugin updates. `hs login codex` runs device auth with `CODEX_HOME` pointed at
+that plugin-owned home. It refuses the normal user Codex home (`~/.codex`).
 
 Then, in a Herdr pane containing the Git repository you want to change:
 
@@ -238,18 +238,26 @@ SANDBOX_LAUNCHER="$(herdr plugin config-dir dev.herdr.sandbox)/herdr-sandbox"
 
 The Podman command is independent of Herdr's pane cwd: it mounts only the
 selected worker clone at `/workspace`, sets the container workdir to
-`/workspace`, and starts Codex with `--cd /workspace`. Each interactive
-`start-codex` / `hs codex` launch also gets a temporary plugin-owned `CODEX_HOME`
-containing only `auth.json`; the directory is removed when the session exits,
-so history from another worker or workspace cannot be resumed.
+`/workspace`, and starts Codex with `--cd /workspace`. Both interactive
+`start-codex` / `hs codex` and noninteractive `hs codex --prompt "..."` (plus
+the thin `execute --prompt` alias) use the same per-launch temporary
+plugin-owned `CODEX_HOME` that contains only `auth.json`. The session directory
+is removed when the agent exits, so history from another worker or workspace
+cannot be resumed.
 
-Noninteractive `hs codex --prompt "..."` (and the thin `execute --prompt`
-alias) keeps the shared dedicated Codex home mount. Long noninteractive runs
-can refresh tokens in place under that home; a per-launch temp home would
-discard those writes when the session ends. Issue #11 owns the token-refresh
-decision for every profile (write-back of `auth.json`, never write back, or
-mount auth alone). Until #11 lands, `--prompt` continues to use the shared
-home and does not write tokens back from a temp home.
+**Token refresh (option a):** if the agent refreshes credentials in the session
+home, `hs` writes back only the profile auth file(s) into the dedicated plugin
+home after the session. Write-back is atomic (temp file in the same directory,
+fsync, rename), runs under the state lock, keeps mode `0600`, refuses symlinks,
+and applies only when the file is valid JSON with the expected shape and is
+actually newer or different from the copy taken at launch. Invalid or unchanged
+files are left alone. Re-run `hs login <agent>` only if authentication is
+missing or write-back rejected a bad file.
+
+For Herdr screen-based agent detection when Podman wraps the real CLI, `hs`
+sets `HERDR_AGENT` on the **host** pane/wrapper process (not only inside the
+container). Isolation flags stay fixed on the runtime; agent profiles may only
+supply home mount, env, argv, auth files, forbidden args, and `HERDR_AGENT`.
 
 ## Customize the worker image
 
@@ -363,8 +371,9 @@ directory, including its run history. Prefer `hs gc` for routine cleanup.
 - **Podman unavailable or running as root:** repair rootless Podman and check
   `podman info --format '{{.Host.Security.Rootless}}'` returns `true`.
 - **Worker image missing:** run `bootstrap` or `build-image`, then `check`.
-- **Codex authentication missing:** rerun the dedicated `CODEX_HOME=...` login;
-  never copy credentials from `~/.codex`.
+- **Codex authentication missing:** run `hs login codex` (or the equivalent
+  `CODEX_HOME=... codex login --device-auth`); never copy credentials from
+  `~/.codex`.
 - **Worker failed or stale:** use `hs inspect` and `hs ls`; use `hs rm <id>` or
   wait for `hs gc` after fetch.
 - **Task needs network:** use the online profile; offline workers cannot fetch
