@@ -17,8 +17,9 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
+import time
 
 
 PLUGIN_ID = "dev.herdr.sandbox"
@@ -29,6 +30,10 @@ DEFAULT_BASE_IMAGE = "node:22-bookworm-slim"
 SUPPORTED_PANE_PLACEMENTS = {"overlay", "split", "tab"}
 SPLIT_DIRECTIONS = {"right", "down"}
 MAX_WORKER_ID_LENGTH = 64
+DEFAULT_GC_MAX_AGE = "7d"
+GC_OPPORTUNISTIC_BUDGET_SECONDS = 2.0
+DURATION_RE = re.compile(r"\A([1-9][0-9]*)([smhd])\Z")
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def paths():
@@ -849,14 +854,435 @@ def remove_worker_container(worker_id):
         raise ValueError(f"Unable to remove worker container herdr-{worker_id}: {detail}.")
 
 
-def destroy_worker(worker_id, state_dir=None):
-    """Stop/remove a worker container, then remove only that worker's storage."""
-    _, worker_dir = worker_storage(worker_id, state_dir)
+def parse_duration(value, setting_name="[gc].max_age"):
+    """Parse a compact duration like 7d, 12h, 30m, or 90s into seconds."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Set {setting_name} to a nonempty duration such as '7d'.")
+    match = DURATION_RE.fullmatch(value.strip())
+    if not match:
+        raise ValueError(
+            f"Set {setting_name} to a positive duration with unit s, m, h, or d "
+            f"(for example '7d'); got {value!r}."
+        )
+    amount, unit = match.groups()
+    return int(amount) * DURATION_UNITS[unit]
+
+
+def gc_settings(config_dir):
+    """Load the optional [gc] table; default max_age is 7d."""
+    config_file = Path(config_dir) / "config.toml"
+    if not config_file.is_file():
+        return {"max_age": DEFAULT_GC_MAX_AGE, "max_age_seconds": parse_duration(DEFAULT_GC_MAX_AGE)}
+    with config_file.open("rb") as stream:
+        config = tomllib.load(stream)
+    options = config.get("gc", {})
+    if not isinstance(options, dict):
+        raise ValueError(f"Expected a [gc] table in {config_file}.")
+    _permitted_settings(options, "[gc]", {"max_age"})
+    max_age = options.get("max_age", DEFAULT_GC_MAX_AGE)
+    return {"max_age": max_age, "max_age_seconds": parse_duration(max_age)}
+
+
+def _herdr_bin():
+    if "HERDR_BIN_PATH" in os.environ:
+        herdr = Path(os.environ["HERDR_BIN_PATH"]).expanduser().resolve()
+        if herdr.is_file():
+            return str(herdr)
+    found = shutil.which("herdr")
+    if found:
+        return found
+    return None
+
+
+def pane_exists(pane_id):
+    """Return True/False when pane existence is known; None when it cannot be determined.
+
+    Uses `herdr pane get <pane_id>` (verified in docs/herdr-pane-lifecycle.md).
+    """
+    if not isinstance(pane_id, str) or not pane_id.strip():
+        return False
+    herdr = _herdr_bin()
+    if herdr is None:
+        return None
+    result = run(herdr, "pane", "get", pane_id.strip())
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    combined = f"{stdout}\n{stderr}".strip()
+    if result.returncode == 0:
+        try:
+            payload = json.loads(stdout) if stdout else {}
+        except json.JSONDecodeError:
+            return True
+        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+            code = payload["error"].get("code")
+            if code == "pane_not_found":
+                return False
+            return None
+        return True
+    try:
+        payload = json.loads(stdout) if stdout else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        if payload["error"].get("code") == "pane_not_found":
+            return False
+    if "pane_not_found" in combined.lower() or "not found" in combined.lower():
+        return False
+    return None
+
+
+def _read_worker_metadata(worker_dir):
+    metadata_path = worker_dir / "worker.json"
+    try:
+        with metadata_path.open() as stream:
+            metadata = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid worker metadata: {metadata_path}") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Invalid worker metadata: {metadata_path}")
+    return metadata
+
+
+def _parse_created_at(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        created = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return created.astimezone(timezone.utc)
+
+
+def _worker_container_running(worker_id):
+    return container_status(worker_id) == "running"
+
+
+def _delete_worker_directory(worker_dir, workers_dir):
+    """Delete one worker directory after refusing symlinks and path escapes."""
+    workers_root = Path(workers_dir).resolve()
+    candidate = Path(worker_dir)
+    if candidate.is_symlink():
+        raise ValueError(f"Worker path is not a real directory inside plugin workers: {candidate}")
+    if not candidate.exists():
+        return False
+    if not candidate.is_dir():
+        raise ValueError(f"Worker path is not a directory: {candidate}")
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(workers_root):
+        raise ValueError(f"Worker path escapes plugin workers directory: {candidate}")
+    if resolved == workers_root:
+        raise ValueError(f"Refusing to delete the workers directory itself: {candidate}")
+    # Refuse if any path component under workers_root is a symlink.
+    try:
+        relative = resolved.relative_to(workers_root)
+    except ValueError as exc:
+        raise ValueError(f"Worker path escapes plugin workers directory: {candidate}") from exc
+    current = workers_root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"Worker path contains a symlink: {current}")
+    shutil.rmtree(resolved)
+    return True
+
+
+def destroy_worker(worker_id, state_dir=None, force=False, warn_unfetched=False):
+    """Stop/remove a worker container, then remove only that worker's storage.
+
+    Without force, refuse when the worker container is running. Optionally warn
+    when the result was never fetched (status is not 'fetched').
+    """
+    workers_dir, worker_dir = worker_storage(worker_id, state_dir)
+    if worker_dir.exists() and warn_unfetched:
+        try:
+            metadata = _read_worker_metadata(worker_dir)
+            if metadata.get("status") != "fetched":
+                print(
+                    f"Warning: worker {worker_id} result was never fetched "
+                    f"(status={metadata.get('status', 'unknown')}).",
+                    file=sys.stderr,
+                )
+        except ValueError:
+            print(
+                f"Warning: worker {worker_id} metadata is unreadable; removing anyway.",
+                file=sys.stderr,
+            )
+    if not force and worker_dir.exists() and _worker_container_running(worker_id):
+        raise ValueError(
+            f"Worker {worker_id} has a running container. Pass --force to remove it."
+        )
     remove_worker_container(worker_id)
     if not worker_dir.exists():
         return False
-    shutil.rmtree(worker_dir)
-    return True
+    return _delete_worker_directory(worker_dir, workers_dir)
+
+
+def parse_plugin_event_json(raw):
+    """Strictly parse HERDR_PLUGIN_EVENT_JSON for a pane.closed payload."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("HERDR_PLUGIN_EVENT_JSON is missing or empty.")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid HERDR_PLUGIN_EVENT_JSON: {exc}.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("HERDR_PLUGIN_EVENT_JSON must be a JSON object.")
+    event = payload.get("event")
+    data = payload.get("data")
+    if event != "pane_closed":
+        raise ValueError(
+            f"HERDR_PLUGIN_EVENT_JSON event must be 'pane_closed', got {event!r}."
+        )
+    if not isinstance(data, dict):
+        raise ValueError("HERDR_PLUGIN_EVENT_JSON data must be an object.")
+    if data.get("type") not in {None, "pane_closed"}:
+        raise ValueError(
+            f"HERDR_PLUGIN_EVENT_JSON data.type must be 'pane_closed', got {data.get('type')!r}."
+        )
+    pane_id = data.get("pane_id")
+    if not isinstance(pane_id, str) or not pane_id.strip():
+        raise ValueError("HERDR_PLUGIN_EVENT_JSON data.pane_id must be a nonempty string.")
+    return pane_id.strip()
+
+
+def _iter_worker_dirs(state_dir=None):
+    workers_dir = state_workers_dir(state_dir)
+    if not workers_dir.is_dir() or workers_dir.is_symlink():
+        return workers_dir, []
+    entries = []
+    for entry in sorted(workers_dir.iterdir(), key=lambda path: path.name):
+        if entry.is_symlink() or not entry.is_dir() or not WORKER_ID_RE.fullmatch(entry.name):
+            continue
+        entries.append(entry)
+    return workers_dir, entries
+
+
+def _worker_is_stale(metadata, max_age_seconds, now=None):
+    created = _parse_created_at(metadata.get("created_at"))
+    if created is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return (now - created) >= timedelta(seconds=max_age_seconds)
+
+
+def _pane_gone_for_gc(metadata):
+    """Whether the worker's pane is gone for fetched-pane GC.
+
+    Null pane_id means no Herdr pane was recorded (popup / non-Herdr); treat as gone.
+    When the existence query is inconclusive, do not guess — keep the worker.
+    """
+    pane_id = metadata.get("pane_id")
+    if pane_id is None or (isinstance(pane_id, str) and not pane_id.strip()):
+        return True
+    if not isinstance(pane_id, str):
+        return False
+    exists = pane_exists(pane_id)
+    if exists is None:
+        return False
+    return not exists
+
+
+def _try_fetch_before_gc(worker_id, state_dir, warnings):
+    """Attempt fetch for max_age GC; return True only when fetch succeeds."""
+    try:
+        fetch_worker(worker_id, state_dir)
+        return True
+    except (ValueError, OSError) as exc:
+        warnings.append(
+            f"Skipping unfetched worker {worker_id}: fetch before GC failed ({exc})."
+        )
+        return False
+
+
+def gc_collect_workers(
+    state_dir=None,
+    config_dir=None,
+    pane_id=None,
+    opportunistic=False,
+    deadline=None,
+    now=None,
+):
+    """Collect eligible workers without rewriting refs in any source repository.
+
+    max_age rule for unfetched workers: attempt fetch first; delete only on
+    success; otherwise skip with a one-line warning naming the worker.
+    """
+    removed = []
+    warnings = []
+    skipped = []
+    now = now or datetime.now(timezone.utc)
+    if config_dir is None:
+        config_dir, _ = paths()
+    settings = gc_settings(config_dir)
+    max_age_seconds = settings["max_age_seconds"]
+    workers_dir, entries = _iter_worker_dirs(state_dir)
+
+    for entry in entries:
+        if deadline is not None and time.monotonic() >= deadline:
+            warnings.append("GC budget exhausted; remaining workers left for later.")
+            break
+        worker_id = entry.name
+        try:
+            metadata = _read_worker_metadata(entry)
+        except ValueError as exc:
+            warnings.append(f"Skipping worker {worker_id}: {exc}")
+            continue
+        if pane_id is not None:
+            recorded = metadata.get("pane_id")
+            if recorded != pane_id:
+                continue
+            # Event / --pane path: only fetched workers for that pane.
+            if metadata.get("status") != "fetched":
+                skipped.append(worker_id)
+                continue
+        else:
+            status = metadata.get("status")
+            fetched_and_pane_gone = status == "fetched" and _pane_gone_for_gc(metadata)
+            stale = _worker_is_stale(metadata, max_age_seconds, now=now)
+            if not fetched_and_pane_gone and not stale:
+                continue
+            if stale and status != "fetched":
+                if not _try_fetch_before_gc(worker_id, state_dir, warnings):
+                    continue
+                # Re-read status after fetch.
+                try:
+                    metadata = _read_worker_metadata(entry)
+                except ValueError as exc:
+                    warnings.append(f"Skipping worker {worker_id}: {exc}")
+                    continue
+                if metadata.get("status") != "fetched":
+                    warnings.append(
+                        f"Skipping unfetched worker {worker_id}: fetch did not mark status fetched."
+                    )
+                    continue
+
+        if _worker_container_running(worker_id):
+            skipped.append(worker_id)
+            warnings.append(f"Skipping worker {worker_id}: container is running.")
+            continue
+        try:
+            if destroy_worker(worker_id, state_dir=state_dir, force=True, warn_unfetched=False):
+                removed.append(worker_id)
+            else:
+                skipped.append(worker_id)
+        except ValueError as exc:
+            warnings.append(f"Skipping worker {worker_id}: {exc}")
+    return {"removed": removed, "warnings": warnings, "skipped": skipped, "workers_dir": str(workers_dir)}
+
+
+def opportunistic_gc(state_dir=None, config_dir=None):
+    """Best-effort GC at launch: hold the state lock, bound time, never raise."""
+    try:
+        if state_dir is None or config_dir is None:
+            config_dir, state_dir = paths()
+        deadline = time.monotonic() + GC_OPPORTUNISTIC_BUDGET_SECONDS
+        with StateLock(state_dir):
+            result = gc_collect_workers(
+                state_dir=state_dir,
+                config_dir=config_dir,
+                opportunistic=True,
+                deadline=deadline,
+            )
+        for warning in result["warnings"]:
+            print(warning, file=sys.stderr)
+        if result["removed"]:
+            print(
+                f"Opportunistic GC removed: {', '.join(result['removed'])}",
+                file=sys.stderr,
+            )
+        return result
+    except Exception as exc:  # noqa: BLE001 - launch must not fail because of GC
+        print(f"Opportunistic GC skipped: {exc}", file=sys.stderr)
+        return {"removed": [], "warnings": [str(exc)], "skipped": []}
+
+
+def sweep_stale_codex_sessions(codex_home, max_age_seconds=None, state_dir=None):
+    """Remove leftover per-launch session homes under <codex home>/sessions/.
+
+    Live sessions are those whose name is prefixed by a worker ID whose
+    container is still running. Leftovers older than the oldest live session
+    (or older than max_age when none are live) are removed. Symlinks are refused
+    and deletion stays confined to the sessions directory.
+    """
+    codex_home = Path(codex_home).expanduser().resolve()
+    sessions_dir = codex_home / "sessions"
+    if sessions_dir.is_symlink():
+        raise ValueError(f"Codex session storage is not a real directory: {sessions_dir}.")
+    if not sessions_dir.exists():
+        return []
+    if not sessions_dir.is_dir():
+        raise ValueError(f"Codex session storage is not a real directory: {sessions_dir}.")
+    sessions_root = sessions_dir.resolve()
+    if not sessions_root.is_relative_to(codex_home):
+        raise ValueError(f"Codex sessions directory escapes Codex home: {sessions_dir}.")
+
+    if max_age_seconds is None:
+        try:
+            config_dir, _ = paths()
+            max_age_seconds = gc_settings(config_dir)["max_age_seconds"]
+        except ValueError:
+            max_age_seconds = parse_duration(DEFAULT_GC_MAX_AGE)
+
+    _, worker_dirs = _iter_worker_dirs(state_dir)
+    worker_ids = [entry.name for entry in worker_dirs]
+
+    def _owner_worker_id(session_name):
+        matches = [worker_id for worker_id in worker_ids if session_name.startswith(f"{worker_id}-")]
+        if not matches:
+            return None
+        return max(matches, key=len)
+
+    live = []
+    leftovers = []
+    for entry in sessions_dir.iterdir():
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        try:
+            resolved = entry.resolve()
+        except OSError:
+            continue
+        if not resolved.is_relative_to(sessions_root) or resolved == sessions_root:
+            continue
+        owner = _owner_worker_id(entry.name)
+        if owner is not None and _worker_container_running(owner):
+            live.append(entry)
+        else:
+            leftovers.append(entry)
+
+    if live:
+        cutoff = min(path.stat().st_mtime for path in live)
+    else:
+        cutoff = time.time() - max_age_seconds
+
+    removed = []
+    for entry in leftovers:
+        try:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            resolved = entry.resolve()
+            if not resolved.is_relative_to(sessions_root) or resolved == sessions_root:
+                continue
+            cursor = sessions_root
+            safe = True
+            for part in resolved.relative_to(sessions_root).parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    safe = False
+                    break
+            if not safe:
+                continue
+            shutil.rmtree(resolved)
+            removed.append(entry.name)
+        except OSError:
+            continue
+    return removed
 
 
 def fetch_options(config_dir):
@@ -2211,21 +2637,6 @@ def create_options(config_dir):
     return options
 
 
-def destroy_options(config_dir):
-    """Read the optional worker ID used by the noninteractive destroy action."""
-    config_file = config_dir / "config.toml"
-    if not config_file.is_file():
-        return {}
-    with config_file.open("rb") as stream:
-        config = tomllib.load(stream)
-    options = config.get("destroy", {})
-    if not isinstance(options, dict):
-        raise ValueError(f"Expected a [destroy] table in {config_file}.")
-    if "id" in options and not isinstance(options["id"], str):
-        raise ValueError(f"Set [destroy].id to a string in {config_file}.")
-    return options
-
-
 def resolve_execute_inputs(worker_id, prompt, config_dir):
     """Resolve one complete invocation or the configured Herdr action inputs.
 
@@ -2392,6 +2803,14 @@ def hs_codex(codex_args):
     check_root()
     
     config_dir, state_dir = paths()
+
+    # Opportunistic GC must never fail the launch.
+    opportunistic_gc(state_dir=state_dir, config_dir=config_dir)
+    try:
+        _, codex_home = load_config(config_dir)
+        sweep_stale_codex_sessions(codex_home, state_dir=state_dir)
+    except Exception as exc:  # noqa: BLE001 - launch must not fail because of session sweep
+        print(f"Codex session sweep skipped: {exc}", file=sys.stderr)
     
     # Resolve source repository from cwd
     try:
@@ -2474,8 +2893,38 @@ def main():
     fetch_parser = commands.add_parser("fetch", help="Fetch worker HEAD into refs/heads/sandbox/<id>")
     fetch_parser.add_argument("worker_id", nargs="?", help="Worker ID")
     fetch_parser.add_argument("--id", dest="option_worker_id", help="Worker ID (or configure [fetch].id)")
-    destroy_parser = commands.add_parser("destroy", help="Destroy one sandbox worker")
-    destroy_parser.add_argument("--id", help="Worker ID (or configure [destroy].id)")
+    destroy_parser = commands.add_parser(
+        "destroy",
+        help="Alias of rm: remove one sandbox worker (deprecated name; use rm)",
+    )
+    destroy_parser.add_argument("worker_id", nargs="?", help="Worker ID")
+    destroy_parser.add_argument("--id", dest="option_worker_id", help="Worker ID")
+    destroy_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Remove even if the worker container is running",
+    )
+    rm_parser = commands.add_parser("rm", help="Remove one sandbox worker")
+    rm_parser.add_argument("worker_id", nargs="?", help="Worker ID")
+    rm_parser.add_argument("--id", dest="option_worker_id", help="Worker ID")
+    rm_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Remove even if the worker container is running",
+    )
+    gc_parser = commands.add_parser(
+        "gc",
+        help="Remove fetched workers whose panes are gone, or workers older than [gc].max_age",
+    )
+    gc_parser.add_argument(
+        "--pane",
+        help="Collect only fetched workers recorded for this Herdr pane ID",
+    )
+    gc_parser.add_argument(
+        "--from-event",
+        action="store_true",
+        help="Read pane_id from HERDR_PLUGIN_EVENT_JSON (pane.closed hook)",
+    )
     list_parser = commands.add_parser("list", help="List persisted sandbox workers")
     list_parser.add_argument("--json", action="store_true", help="Print structured JSON")
     inspect_parser = commands.add_parser("inspect", help="Inspect one sandbox worker")
@@ -2527,15 +2976,42 @@ def main():
                 args.base or options.get("base_ref") or "HEAD"
             )
             print(worker_dir)
-        elif args.command == "destroy":
-            worker_id = args.id
-            if worker_id is None:
-                config_dir, _ = paths()
-                worker_id = destroy_options(config_dir).get("id")
+        elif args.command in {"destroy", "rm"}:
+            worker_id = args.worker_id or args.option_worker_id
             if not worker_id:
-                raise ValueError("Worker ID is required. Pass `destroy --id WORKER_ID` or set [destroy].id in the plugin config.")
-            removed = destroy_worker(worker_id)
-            print(f"Destroyed worker: {worker_id}" if removed else f"Worker already absent: {worker_id}")
+                raise ValueError(
+                    "Worker ID is required. Pass `rm WORKER_ID` or `rm --id WORKER_ID` "
+                    "(destroy --id remains an alias)."
+                )
+            removed = destroy_worker(worker_id, force=args.force, warn_unfetched=True)
+            verb = "Removed" if args.command == "rm" else "Destroyed"
+            print(f"{verb} worker: {worker_id}" if removed else f"Worker already absent: {worker_id}")
+        elif args.command == "gc":
+            config_dir, state_dir = paths()
+            pane = args.pane
+            if args.from_event:
+                if pane:
+                    raise ValueError("Pass either --pane or --from-event, not both.")
+                pane = parse_plugin_event_json(os.environ.get("HERDR_PLUGIN_EVENT_JSON"))
+            with StateLock(state_dir):
+                result = gc_collect_workers(
+                    state_dir=state_dir,
+                    config_dir=config_dir,
+                    pane_id=pane,
+                )
+            for warning in result["warnings"]:
+                print(warning, file=sys.stderr)
+            if result["removed"]:
+                print(f"Collected workers: {', '.join(result['removed'])}")
+            else:
+                print("No workers collected.")
+            try:
+                _, codex_home = load_config(config_dir)
+                swept = sweep_stale_codex_sessions(codex_home, state_dir=state_dir)
+                if swept:
+                    print(f"Swept Codex session homes: {', '.join(swept)}", file=sys.stderr)
+            except ValueError as exc:
+                print(f"Codex session sweep skipped: {exc}", file=sys.stderr)
         elif args.command == "fetch":
             config_dir, _ = paths()
             worker_id = resolve_fetch_worker(
