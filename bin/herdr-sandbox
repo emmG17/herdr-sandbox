@@ -995,9 +995,33 @@ def validate_open_context(worker_id):
         )
 
 
-def _read_regular_file_nofollow(path):
-    """Read a regular file without following symlinks (O_NOFOLLOW + fstat)."""
+def _refuse_symlink_components(path, trusted_root):
+    """Refuse when ``trusted_root`` or any path component under it is a symlink."""
     path = Path(path)
+    trusted_root = Path(trusted_root)
+    abs_root = trusted_root if trusted_root.is_absolute() else trusted_root.absolute()
+    abs_path = path if path.is_absolute() else path.absolute()
+    if abs_root.is_symlink():
+        raise ValueError(f"Trusted root must not be a symlink: {abs_root}")
+    try:
+        relative = abs_path.relative_to(abs_root)
+    except ValueError as exc:
+        raise ValueError(f"Path escapes trusted root {abs_root}: {abs_path}") from exc
+    cursor = abs_root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError(f"Symlink component is not allowed under {abs_root}: {cursor}")
+
+
+def _read_regular_file_nofollow(path, trusted_root):
+    """Read a regular file without following symlinks.
+
+    Refuses when ``trusted_root`` or any component under it on the way to
+    ``path`` is a symlink, then opens the final path with ``O_NOFOLLOW``.
+    """
+    path = Path(path)
+    _refuse_symlink_components(path, trusted_root)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
@@ -1013,16 +1037,16 @@ def _read_regular_file_nofollow(path):
             if not chunk:
                 break
             chunks.append(chunk)
-        return b"".join(chunks), info.st_mtime_ns
+        return b"".join(chunks)
     finally:
         os.close(fd)
 
 
-def _auth_snapshot(path):
+def _auth_snapshot(path, trusted_root):
     """Capture content of a regular auth file without following symlinks."""
     path = Path(path)
-    data, mtime_ns = _read_regular_file_nofollow(path)
-    return {"path": path, "data": data, "mtime_ns": mtime_ns}
+    data = _read_regular_file_nofollow(path, trusted_root)
+    return {"path": path, "data": data}
 
 
 def fresh_agent_home(agent_home, worker_id, profile):
@@ -1033,11 +1057,13 @@ def fresh_agent_home(agent_home, worker_id, profile):
     write-back.
     """
     agent_home = Path(agent_home)
+    if agent_home.is_symlink():
+        raise ValueError(f"{profile.name} home must not be a symlink: {agent_home}")
     snapshots = {}
     for name in profile.auth_files:
         auth_path = agent_home / name
         try:
-            snapshots[name] = _auth_snapshot(auth_path)
+            snapshots[name] = _auth_snapshot(auth_path, agent_home)
         except ValueError as exc:
             raise ValueError(f"{profile.name} authentication is missing in {agent_home}.") from exc
 
@@ -1052,7 +1078,7 @@ def fresh_agent_home(agent_home, worker_id, profile):
         for name, snap in snapshots.items():
             dest = session_home / name
             # Re-read with O_NOFOLLOW so a symlink swap between snapshot and copy is refused.
-            data, _mtime_ns = _read_regular_file_nofollow(snap["path"])
+            data = _read_regular_file_nofollow(snap["path"], agent_home)
             if data != snap["data"]:
                 raise ValueError(f"Auth file changed during session home setup: {snap['path']}")
             with open(dest, "wb") as out:
@@ -1067,12 +1093,11 @@ def fresh_agent_home(agent_home, worker_id, profile):
     return session_home, snapshots
 
 
-def _atomic_write_bytes(path, data, mode=0o600):
+def _atomic_write_bytes(path, data, trusted_root, mode=0o600):
     """Write bytes atomically (temp + fsync + rename) without following symlinks."""
     path = Path(path)
+    _refuse_symlink_components(path, trusted_root)
     parent = path.parent
-    if path.is_symlink() or parent.is_symlink():
-        raise ValueError(f"Refusing to write through a symlink: {path}")
     if path.exists() and not path.is_file():
         raise ValueError(f"Auth destination is not a regular file: {path}")
     fd, temp_path = tempfile.mkstemp(dir=parent, prefix=".tmp-auth-", suffix=".json")
@@ -1097,9 +1122,10 @@ def write_back_auth_files(agent_home, session_home, profile, launch_snapshots, s
 
     Under the state lock, copy each profile auth file from the session home only
     when it is valid JSON with the expected shape and its bytes differ from the
-    launch snapshot. Compare-and-swap: if the dedicated destination already
-    differs from the launch snapshot (another session advanced auth), skip the
-    write and log that fact. Never follows symlinks; final mode is 0600.
+    launch snapshot. Compare-and-swap is bytes-only: if the dedicated destination
+    already differs from the launch snapshot (another session advanced auth),
+    skip the write and log that fact. Never follows symlinks (including parent
+    components under the agent/session homes); final mode is 0600.
     """
     agent_home = Path(agent_home)
     session_home = Path(session_home)
@@ -1108,10 +1134,8 @@ def write_back_auth_files(agent_home, session_home, profile, launch_snapshots, s
         for name in profile.auth_files:
             src = session_home / name
             dest = agent_home / name
-            if dest.is_symlink():
-                continue
             try:
-                payload, _src_mtime_ns = _read_regular_file_nofollow(src)
+                payload = _read_regular_file_nofollow(src, session_home)
                 data = json.loads(payload.decode("utf-8"))
             except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
                 continue
@@ -1122,18 +1146,18 @@ def write_back_auth_files(agent_home, session_home, profile, launch_snapshots, s
                 continue
             if snap is not None and dest.exists():
                 try:
-                    current, current_mtime_ns = _read_regular_file_nofollow(dest)
+                    current = _read_regular_file_nofollow(dest, agent_home)
                 except (OSError, ValueError):
                     continue
-                # Destination advanced past this session's launch snapshot.
-                if current != snap["data"] or current_mtime_ns != snap["mtime_ns"]:
+                # Destination advanced past this session's launch snapshot (bytes only).
+                if current != snap["data"]:
                     print(
                         f"Auth write-back skipped for {name}: another session already advanced auth.",
                         file=sys.stderr,
                     )
                     continue
             try:
-                _atomic_write_bytes(dest, payload, mode=0o600)
+                _atomic_write_bytes(dest, payload, agent_home, mode=0o600)
             except (OSError, ValueError):
                 continue
             written.append(name)

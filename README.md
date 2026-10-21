@@ -250,10 +250,11 @@ block after the agent exits (including non-zero exits), then the per-launch
 session directory is removed. Only the profile auth file(s) are candidates.
 Write-back is atomic (temp file in the same directory, fsync, rename), runs
 under the state lock, keeps mode `0600`, and refuses symlinks. Under the lock
-it compare-and-swaps against the launch snapshot: the session file must be
-valid JSON with the expected shape and differ from the snapshot; if the
-dedicated destination already differs from that snapshot (bytes or mtime),
-another session advanced auth and the write is skipped with a log line.
+it compare-and-swaps against the launch snapshot using file bytes only: the
+session file must be valid JSON with the expected shape and differ from the
+snapshot; if the dedicated destination already differs from that snapshot,
+another session advanced auth and the write is skipped with a log line. A
+mtime-only change on the destination does not block a legitimate refresh.
 Unchanged or invalid session files are left alone. A hard kill (`SIGKILL`) can
 skip write-back and leave a session directory; `sweep_stale_agent_sessions`
 removes leftovers later. Because `--prompt` now uses the same per-launch home

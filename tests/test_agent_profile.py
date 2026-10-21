@@ -133,6 +133,45 @@ class AgentProfileTests(unittest.TestCase):
         self.assertEqual(json.loads((home / "auth.json").read_text())["tokens"]["access_token"], "T1")
         self.assertIn("already advanced auth", stderr.getvalue())
 
+    def test_mtime_only_change_does_not_block_legitimate_refresh(self):
+        """Same dest bytes with a newer mtime must not block a changed session payload."""
+        home = self.config / "codex"
+        session, snaps = plugin.fresh_agent_home(home, "W1", plugin.DEFAULT_PROFILE)
+        auth = home / "auth.json"
+        # Touch the dedicated auth file without changing bytes.
+        os.utime(auth, (auth.stat().st_atime + 100, auth.stat().st_mtime + 100))
+        self.assertEqual(auth.read_bytes(), snaps["auth.json"]["data"])
+        (session / "auth.json").write_text(json.dumps(REFRESHED_AUTH) + "\n")
+        written = plugin.write_back_auth_files(
+            home, session, plugin.DEFAULT_PROFILE, snaps, state_dir=self.state,
+        )
+        self.assertEqual(written, ["auth.json"])
+        self.assertEqual(json.loads(auth.read_text())["tokens"]["access_token"], "new")
+
+    def test_symlinked_agent_home_is_refused_for_reads_and_write_back(self):
+        """Replacing the dedicated home with a symlink must fail reads and write-back."""
+        home = self.config / "codex"
+        session, snaps = plugin.fresh_agent_home(home, "W1", plugin.DEFAULT_PROFILE)
+        (session / "auth.json").write_text(json.dumps(REFRESHED_AUTH) + "\n")
+
+        real_home = self.config / "codex-real"
+        home.rename(real_home)
+        home.symlink_to(real_home)
+
+        with self.assertRaisesRegex(ValueError, "symlink|Trusted root|authentication is missing"):
+            plugin.fresh_agent_home(home, "W2", plugin.DEFAULT_PROFILE)
+        with self.assertRaisesRegex(ValueError, "symlink|Trusted root"):
+            plugin._read_regular_file_nofollow(home / "auth.json", home)
+        # write-back must refuse rather than follow the symlinked home.
+        written = plugin.write_back_auth_files(
+            home, session, plugin.DEFAULT_PROFILE, snaps, state_dir=self.state,
+        )
+        self.assertEqual(written, [])
+        self.assertEqual(
+            json.loads((real_home / "auth.json").read_text())["tokens"]["access_token"],
+            "old",
+        )
+
     def test_locked_write_backs_leave_valid_auth_file(self):
         """Concurrent write-backs under the state lock leave a valid auth.json.
 
@@ -183,11 +222,11 @@ class AgentProfileTests(unittest.TestCase):
         # Swap in a symlink before the nofollow read.
         auth.unlink()
         auth.symlink_to("/tmp/evil-auth.json")
-        with self.assertRaisesRegex(ValueError, "symlink|regular file|Cannot open"):
-            plugin._read_regular_file_nofollow(auth)
+        with self.assertRaisesRegex(ValueError, r"(?i)symlink|regular file|Cannot open|not allowed"):
+            plugin._read_regular_file_nofollow(auth, home)
 
         # fresh_agent_home must refuse a symlinked auth path the same way.
-        with self.assertRaisesRegex(ValueError, "authentication is missing|symlink|Cannot open"):
+        with self.assertRaisesRegex(ValueError, r"(?i)authentication is missing|symlink|Cannot open|not allowed"):
             plugin.fresh_agent_home(home, "W1", plugin.DEFAULT_PROFILE)
 
         # write-back must refuse a session auth path swapped to a symlink.
@@ -316,14 +355,29 @@ class AgentProfileTests(unittest.TestCase):
                 [plugin.DEFAULT_PROFILE.interactive_bin, "-C/workspace"]
             )
 
-    def test_golden_argv_interactive_matches_main_shape_and_prompt_differs_only_in_home_src(self):
+    def test_ordered_podman_argv_for_interactive_and_prompt(self):
         worker = self.state / "workers" / "TEST-001"
-        (worker / "repo" / ".git").mkdir(parents=True)
+        repo = worker / "repo"
+        (repo / ".git").mkdir(parents=True)
         (worker / "worker.json").write_text(json.dumps({
             "id": "TEST-001", "status": "created", "network": "online",
         }))
         home = self.config / "codex"
         session, _snaps = plugin.fresh_agent_home(home, "TEST-001", plugin.DEFAULT_PROFILE)
+        image, _ = plugin.load_config(self.config, plugin.DEFAULT_PROFILE)
+        repo_s = str(repo.resolve())
+        session_s = str(session.resolve())
+
+        def normalize(argv):
+            out = []
+            for arg in argv:
+                out.append(
+                    arg.replace(repo_s, "<REPO>")
+                    .replace(session_s, "<SESSION>")
+                    .replace(f"herdr-TEST-001", "herdr-<ID>")
+                    .replace(image, "<IMAGE>")
+                )
+            return out
 
         interactive = plugin.open_command(
             "TEST-001",
@@ -332,37 +386,42 @@ class AgentProfileTests(unittest.TestCase):
             agent_home=session,
             profile=plugin.DEFAULT_PROFILE,
         )
+        expected_interactive = [
+            "podman", "run", "--rm", "-it", "--name", "herdr-<ID>",
+            "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+            "--pids-limit=1024", "--memory=8g", "--cpus=4",
+            "--env", "HOME=/tmp/home",
+            "--env", "CODEX_HOME=/codex",
+            "--env", "XDG_CACHE_HOME=/tmp/cache",
+            "--mount", "type=bind,src=<REPO>,dst=/workspace,rw",
+            "--mount", "type=bind,src=<SESSION>,dst=/codex,rw",
+            "--workdir", "/workspace",
+            "<IMAGE>",
+            "codex", "--cd", "/workspace", "--model", "gpt-5",
+        ]
+        self.assertEqual(normalize(interactive), expected_interactive)
+
         prompt = plugin.execute_command(
             "TEST-001",
             "do the task",
             agent_home=session,
             profile=plugin.DEFAULT_PROFILE,
         )
-
-        # Interactive matches the main launcher shape: hardened flags + forced --cd.
-        self.assertEqual(interactive[:4], ["podman", "run", "--rm", "-it"])
-        for required in (
+        expected_prompt = [
+            "podman", "run", "--rm", "--name", "herdr-<ID>",
             "--userns=keep-id", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
             "--pids-limit=1024", "--memory=8g", "--cpus=4",
-        ):
-            self.assertIn(required, interactive)
-        self.assertEqual(interactive[-5:], ["codex", "--cd", "/workspace", "--model", "gpt-5"])
-        self.assertIn(f"CODEX_HOME=/codex", interactive)
-
-        def home_src(command):
-            mount = next(arg for arg in command if arg.startswith("type=bind,src=") and ",dst=/codex," in arg)
-            return mount.split(",src=", 1)[1].split(",dst=", 1)[0]
-
-        # Both modes mount the same per-launch session home (src=). Prompt drops
-        # -it and swaps the trailing agent argv; HERDR_AGENT is host env only.
-        self.assertEqual(home_src(interactive), str(session.resolve()))
-        self.assertEqual(home_src(interactive), home_src(prompt))
-        self.assertNotIn("-it", prompt)
-        self.assertEqual(prompt[:3], ["podman", "run", "--rm"])
-        self.assertEqual(
-            prompt[-5:],
-            ["codex", "exec", "--sandbox", "danger-full-access", "do the task"],
-        )
+            "--env", "HOME=/tmp/home",
+            "--env", "CODEX_HOME=/codex",
+            "--env", "XDG_CACHE_HOME=/tmp/cache",
+            "--mount", "type=bind,src=<REPO>,dst=/workspace,rw",
+            "--mount", "type=bind,src=<SESSION>,dst=/codex,rw",
+            "--workdir", "/workspace",
+            "<IMAGE>",
+            "codex", "exec", "--sandbox", "danger-full-access", "do the task",
+        ]
+        self.assertEqual(normalize(prompt), expected_prompt)
+        # HERDR_AGENT is host env, not argv.
         self.assertNotIn("HERDR_AGENT=codex", interactive)
         self.assertNotIn("HERDR_AGENT=codex", prompt)
 
