@@ -20,11 +20,17 @@ hs login claude    # Claude Code run
 
 ### Claude login and host `~/.claude.json`
 
-`CLAUDE_CONFIG_DIR` (set by `hs login claude` to the plugin-owned home) relocates
-the `~/.claude` directory — including `.credentials.json` — but does **not**
-relocate the separate global `~/.claude.json` under the host home
-([Claude directory](https://code.claude.com/docs/en/claude-directory)). Before
-and after `hs login claude`, confirm the host file is untouched:
+`CLAUDE_CONFIG_DIR` relocates the `~/.claude` directory (including
+`.credentials.json`) but does **not** relocate the separate HOME-relative
+`~/.claude.json`
+([Claude directory](https://code.claude.com/docs/en/claude-directory)).
+**Primary control:** `hs login claude` sets `HOME` to a plugin-owned
+`0700` directory under the plugin state dir (`login-homes/claude`), so Claude
+cannot create or modify the real host `~/.claude.json`. That directory is not
+under the Claude agent home and is not copied or mounted into workers.
+
+**Regression check:** before and after login, confirm the host file is still
+untouched (should already be true because of HOME isolation):
 
 ```sh
 # Optional: create a sentinel if the file does not exist yet
@@ -32,10 +38,11 @@ test -f ~/.claude.json || printf '{}\n' > ~/.claude.json
 cp -a ~/.claude.json /tmp/claude-json-before-login
 sha256sum ~/.claude.json /tmp/claude-json-before-login
 hs login claude
+# Login output should mention HOME=.../login-homes/claude (isolated)
 sha256sum ~/.claude.json /tmp/claude-json-before-login
 cmp /tmp/claude-json-before-login ~/.claude.json
-# Expected: identical checksums / cmp silent success. If they differ, stop and
-# investigate; do not treat the host ~/.claude.json as plugin-owned state.
+# Expected: identical checksums / cmp silent success. If they differ, HOME
+# isolation failed — stop and investigate.
 ```
 
 Create a test repository with a sentinel file:

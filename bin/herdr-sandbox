@@ -107,6 +107,11 @@ class AgentProfile:
     # ``--env NAME`` with no value (inherits from the subprocess env). The key
     # value never appears on argv. Never written into the repo, image, or config.
     api_key_env: str | None = None
+    # When True, ``hs login`` sets HOME to a plugin-owned 0700 directory so the
+    # host CLI cannot create/modify HOME-relative globals under the real user
+    # home. The login HOME is a sibling under plugin state, not under the agent
+    # home (agent home can be bind-mounted wholesale).
+    login_isolate_home: bool = False
 
     def __post_init__(self):
         _validate_env_name(self.home_env_var, what=f"{self.name} home_env_var")
@@ -237,6 +242,8 @@ CODEX_PROFILE = _CodexAgentProfile(
     normal_user_home=".codex",
     noninteractive_prefix=("exec", "--sandbox", "danger-full-access"),
     image_npm_packages=("@openai/codex@0.163.0",),
+    # CODEX_HOME already redirects Codex state; leave host HOME unchanged.
+    login_isolate_home=False,
 )
 AGENT_PROFILES[CODEX_PROFILE.name] = CODEX_PROFILE
 DEFAULT_PROFILE = CODEX_PROFILE
@@ -289,6 +296,8 @@ CLAUDE_PROFILE = _ClaudeAgentProfile(
     image_npm_packages=("@anthropic-ai/claude-code@2.1.306",),
     banned_host_names=(".claude.json",),
     api_key_env="ANTHROPIC_API_KEY",
+    # CLAUDE_CONFIG_DIR relocates ~/.claude but not ~/.claude.json (HOME-relative).
+    login_isolate_home=True,
 )
 AGENT_PROFILES[CLAUDE_PROFILE.name] = CLAUDE_PROFILE
 # END AGENT PROFILE: claude
@@ -2308,8 +2317,9 @@ class PodmanSandboxRuntime:
     resource limits, workspace mount, tmp homes) are fixed here. A profile may
     only supply agent-specific env, home mount, and argv values — never network
     access, devices, capabilities, or extra mounts. Host env is never forwarded
-    implicitly; ``forwarded_env`` holds only explicit opt-in pairs (e.g. an
-    API key when ``[agent].forward_api_key = true``).
+    implicitly; ``forwarded_env_names`` are opt-in names emitted as
+    ``--env NAME`` with no value (e.g. an API key when
+    ``[agent].forward_api_key = true``) so secrets never appear on argv.
     """
 
     def __init__(
@@ -3958,14 +3968,46 @@ def hs_agent(profile, agent_args, prompt=None):
     return exit_code
 
 
+def ensure_login_home(state_dir, profile):
+    """Return a plugin-owned 0700 HOME for ``hs login`` when isolating.
+
+    Placed at ``<state_dir>/login-homes/<agent>``, a sibling of worker state —
+    not under the dedicated agent home. ``fresh_agent_home`` only copies
+    ``auth_files`` into a per-launch session, but non-fresh opens can bind-mount
+    the configured agent home wholesale at the profile mount point, so a login
+    HOME under agent_home would enter the container. Symlink components under
+    ``state_dir`` are refused.
+    """
+    state_dir = Path(state_dir)
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise ValueError(f"Plugin state directory is not a real directory: {state_dir}")
+    root = state_dir / "login-homes"
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        raise ValueError(f"Login home root is not a real directory: {root}")
+    root.mkdir(mode=0o700, exist_ok=True)
+    root.chmod(0o700)
+    login_home = root / profile.name
+    if login_home.exists() and (login_home.is_symlink() or not login_home.is_dir()):
+        raise ValueError(f"Login home is not a real directory: {login_home}")
+    login_home.mkdir(mode=0o700, exist_ok=True)
+    login_home.chmod(0o700)
+    _refuse_symlink_components(login_home, state_dir)
+    if login_home.resolve() in all_banned_host_paths():
+        raise ValueError(f"Login home resolves to a banned host path: {login_home}")
+    return login_home.resolve()
+
+
 def login_agent(agent_name):
     """Run the profile login with the home env pointed at the plugin-owned home.
 
     Refuses every registered agent's banned host paths (normal user homes and
     extras from banned_host_names), and never points login at the host home.
+    When ``profile.login_isolate_home`` is True, also sets HOME to a dedicated
+    plugin-owned directory under state (not under the agent home) so host-global
+    HOME-relative files cannot be written during login.
     """
     profile = get_profile(agent_name)
-    config_dir, _ = paths()
+    config_dir, state_dir = paths()
     try:
         load_config(config_dir, profile)
     except ValueError:
@@ -3982,7 +4024,12 @@ def login_agent(agent_name):
         raise ValueError(f"Invalid login command for {profile.name}.")
     env = os.environ.copy()
     env[profile.home_env_var] = str(agent_home)
-    print(f"Logging in {profile.name} with {profile.home_env_var}={agent_home}")
+    detail = f"{profile.home_env_var}={agent_home}"
+    if profile.login_isolate_home:
+        login_home = ensure_login_home(state_dir, profile)
+        env["HOME"] = str(login_home)
+        detail += f" HOME={login_home} (isolated)"
+    print(f"Logging in {profile.name} with {detail}")
     result = subprocess.run(list(profile.login_argv), env=env, check=False)
     return result.returncode
 

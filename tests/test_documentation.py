@@ -84,8 +84,10 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("hs claude --prompt", procedure)
         self.assertIn("hs login claude", procedure)
         self.assertIn("~/.claude.json", procedure)
-        self.assertIn("does **not**", procedure)
-        self.assertIn("relocate the separate global", procedure)
+        self.assertIn("does **not** relocate", procedure)
+        self.assertIn("login-homes/claude", procedure)
+        self.assertIn("Primary control", procedure)
+        self.assertIn("Regression check", procedure)
         self.assertIn("cmp /tmp/claude-json-before-login ~/.claude.json", procedure)
 
 
