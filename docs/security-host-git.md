@@ -19,32 +19,24 @@ repository or host, including indirectly.
 
 ### Fetch: temporary bare repo + verified bundle
 
-Alternatives considered:
-
-1. **Source-repo alternates + `repack -a -d`** (rejected). Mutates the user's
-   real repository, races on `objects/info/alternates`, can leave a permanent
-   dependency on an attacker-writable object store if interrupted, ignores
-   repack failures, and rewrites every pack on each fetch.
-2. **`git bundle` inside the worker container, then host `bundle verify` +
-   `fetch`** (sound, but couples every fetch to Podman/image availability).
-3. **Copy worker object files into a temporary bare repo we own, create a
-   bundle there, verify it, then `git fetch <bundle>` into the source repo**
-   (chosen). Host git never uses the worker clone as cwd/`-C`. The source repo
-   is untouched until the final verified bundle fetch. Failure or a crash
-   before that fetch leaves no alternates, no dangling `sandbox/<id>` ref, and
-   no dependency on the worker object store. Concurrent fetches use distinct
-   temp directories and git's own source-repo ref locking.
-
-Steps for `_safe_fetch_from_worker`:
-
-1. Read the worker tip from loose refs or `packed-refs` (no git; refuse
-   symlinks; confine paths under the worker `.git`).
+1. Read the worker tip SHA from loose or packed refs (no git; refuse symlinks;
+   confine paths under the worker `.git`).
 2. `git init --bare` in a temporary directory.
-3. Copy only object files from the worker (refuse symlinks; skip
-   `objects/info/alternates`).
-4. Write the branch tip in the temp repo and `git bundle create`.
-5. `git bundle verify`, then `git -C <source> fetch <bundle> <branch>:refs/heads/sandbox/<id>`.
-6. Delete the temporary directory.
+3. Copy **only** loose objects (`[0-9a-f]{2}/[0-9a-f]{38}`) and
+   `pack/pack-*.pack` files. Skip commit-graphs, multi-pack-indexes, bitmaps,
+   `.idx`/`.rev`, and `objects/info/*`.
+4. Regenerate pack indexes in the temp repo with `git index-pack`.
+5. Write the branch tip, `git bundle create`, then `git bundle verify`.
+6. `git -C <source> fetch` the bundle with `-c fetch.fsckObjects=true` and
+   `-c transfer.fsckObjects=true`.
+
+The source repository is untouched until step 6. Failure or a crash before that
+fetch leaves no alternates, no dangling `sandbox/<id>` ref, and no dependency
+on the worker object store. Concurrent fetches use distinct temp directories and
+git's own source-repo ref locking.
+
+Rejected alternatives: mutating the source repo via `objects/info/alternates`
+plus `repack -a -d`, and trusting worker-supplied pack indexes / commit-graphs.
 
 ### Ref and HEAD reads
 
@@ -54,20 +46,24 @@ They refuse symlinks and require every path to stay under the worker `.git`.
 
 ### Inspect / execute status, log, and diff
 
-Those need a live worktree view. They run via
-`_query_worker_git_in_container`: a short-lived Podman invocation that runs
-`git` inside the sandbox. Worker config may execute only inside the container.
-When Podman or the worker runtime is unavailable, the fields report
-`(unavailable: ...)` with an issue entry rather than silent placeholders.
+Those need a live worktree view. `_query_worker_git_snapshot` runs **one**
+short-lived Podman container per worker via `build_worker_git_query_command` /
+`PodmanSandboxRuntime.git_query_command`. That invocation:
+
+- has **no** `--name herdr-<id>` (cannot collide with a running session)
+- forces `--network=none`
+- mounts the workspace **read-only**
+- does **not** mount `/codex` or set `CODEX_HOME`
+- sets `GIT_OPTIONAL_LOCKS=0` and uses `git --no-optional-locks`
+- keeps `--userns=keep-id`, `--cap-drop=ALL`, `no-new-privileges`, `--read-only`,
+  and the configured pids/memory/cpu limits
+
+Status, log, and diff are collected in a single `sh -c` with the base commit
+passed as a positional argument (not interpolated). When Podman or the worker
+runtime is unavailable, fields report `(unavailable: ...)` with an issue entry.
 
 HEAD and branch for list/inspect still come from the file-based helpers so a
 missing container does not block identity reporting.
-
-### Deprecated helper
-
-`_git_read(repo, ...)` remains for non-worker paths but is marked deprecated for
-worker clones. Grep-style tests require `_git_reality` to use the safe helpers
-and container query instead.
 
 ## Tests
 
@@ -80,7 +76,12 @@ and container query instead.
   alternates
 - Simulated bundle-create failure leaving the source unchanged
 - Concurrent fetches of two workers
-- Audit that safe fetch does not use source-repo alternates/repack
+- Query command isolation (no session name, `--network=none`, no `/codex`,
+  workspace `ro`)
+- Auxiliary object metadata (commit-graph, MIDX, bitmap, info) not copied
+- Corrupt loose object: fetch fails, source unchanged
+- Audit that `_git_reality` calls `_query_worker_git_snapshot` once and that
+  `_git_read` is absent
 
 ## Usage
 
@@ -96,5 +97,5 @@ git diff main...sandbox/<id>
 
 The README safety section states that host-side git never uses a worker
 repository as cwd or `-C`. Worker state is read from confined ref files, via a
-verified bundle import into the source repo, or via git inside the sandbox
-container.
+verified bundle import into the source repo, or via one hardened git query
+container per worker.
