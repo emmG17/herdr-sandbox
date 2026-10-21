@@ -18,7 +18,7 @@ class DeveloperExperienceTests(unittest.TestCase):
         action_ids = [action["id"] for action in manifest["actions"]]
         self.assertIn("bootstrap", action_ids)
         self.assertIn("check", action_ids)
-        for removed in ("create", "open", "execute", "destroy"):
+        for removed in ("create", "open", "execute", "fetch", "rm"):
             self.assertNotIn(removed, action_ids)
         self.assertNotIn("start-codex", action_ids)
 
@@ -30,9 +30,8 @@ class DeveloperExperienceTests(unittest.TestCase):
         for action_id, hs_args in (
             ("list", ["ls"]),
             ("inspect", ["inspect"]),
-            ("fetch", ["fetch"]),
+            ("destroy", ["gc"]),
             ("gc", ["gc"]),
-            ("rm", ["rm"]),
         ):
             action = next(a for a in manifest["actions"] if a["id"] == action_id)
             self.assertEqual(action["command"], ["python3", "bin/hs", *hs_args])

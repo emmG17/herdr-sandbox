@@ -96,10 +96,18 @@ class DocumentationTests(unittest.TestCase):
             "STATUS=fetched",
             "hs inspect <id>",
             "thin wrappers over the same `hs` commands",
+            "herdr plugin config-dir",
+            "XDG_STATE_HOME",
+            "no `herdr plugin state-dir`",
+            "Each `hs <agent>` launch",
+            "HERDR_PLUGIN_CONTEXT_JSON",
         )
         for item in required:
             with self.subTest(item=item):
                 self.assertIn(item, readme)
+        self.assertNotIn("herdr plugin state-dir` to discover", readme)
+        self.assertNotIn("`fetch` → `hs fetch`", readme)
+        self.assertNotIn("`rm` → `hs rm`", readme)
 
         orch = readme.split("### Orchestrator agents on the host", 1)[1]
         # Stop before the next H2 so later examples cannot satisfy orchestrator rules.

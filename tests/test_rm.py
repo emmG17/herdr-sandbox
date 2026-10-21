@@ -165,13 +165,14 @@ class RmTests(unittest.TestCase):
         self.assertIn("[destroy]", message)
         self.assertNotIn("destroy_options", dir(plugin))
 
-    def test_manifest_exposes_rm_via_hs_not_destroy_action(self):
+    def test_manifest_maps_destroy_to_hs_gc_and_has_no_rm_action(self):
         with (SCRIPT.parent.parent / "herdr-plugin.toml").open("rb") as stream:
             manifest = tomllib.load(stream)
-        ids = {action["id"] for action in manifest["actions"]}
-        self.assertNotIn("destroy", ids)
-        rm = next(action for action in manifest["actions"] if action["id"] == "rm")
-        self.assertEqual(rm["command"], ["python3", "bin/hs", "rm"])
+        by_id = {action["id"]: action for action in manifest["actions"]}
+        self.assertNotIn("rm", by_id)
+        self.assertNotIn("fetch", by_id)
+        self.assertEqual(by_id["destroy"]["command"], ["python3", "bin/hs", "gc"])
+        self.assertEqual(by_id["gc"]["command"], ["python3", "bin/hs", "gc"])
 
     def test_direct_id_removes_worker(self):
         self.create_worker()

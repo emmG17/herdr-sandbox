@@ -82,6 +82,7 @@ class RuntimeIsolationTests(unittest.TestCase):
             "id": "TEST-001", "status": "created", "network": "online",
         }))
         self.configured_codex = (self.config / "codex").resolve()
+        self.configured_claude = (self.config / "claude").resolve()
         self.env = patch.dict(os.environ, {
             "HERDR_PLUGIN_CONFIG_DIR": str(self.config),
             "HERDR_PLUGIN_STATE_DIR": str(self.state),
@@ -326,31 +327,31 @@ class RuntimeIsolationTests(unittest.TestCase):
             popen.side_effect = fake_popen
             plugin.execute_worker("TEST-001", "prompt task")
 
-        # hs_agent interactive and --prompt
+        fetch_payload = {
+            "commit": "a" * 40,
+            "branch": "sandbox/TEST-001",
+            "commit_count": 0,
+            "log_oneline": "",
+            "changed_files": [],
+            "diff_stat": "",
+            "base_commit": "b" * 40,
+            "source_repo": "/tmp",
+            "worker_id": "TEST-001",
+        }
+        # hs_agent interactive and --prompt (Codex + Claude)
         with patch.object(plugin, "prepare_hs_worker", return_value=("TEST-001", self.state)), \
                 patch.object(plugin, "check", return_value=[]), \
                 patch.object(plugin.subprocess, "run", side_effect=capture_run), \
-                patch.object(plugin, "fetch_worker", return_value={
-                    "commit": "a" * 40,
-                    "branch": "sandbox/TEST-001",
-                    "commit_count": 0,
-                    "log_oneline": "",
-                    "changed_files": [],
-                    "diff_stat": "",
-                    "base_commit": "b" * 40,
-                    "source_repo": "/tmp",
-                    "worker_id": "TEST-001",
-                }), \
+                patch.object(plugin, "fetch_worker", return_value=fetch_payload), \
                 patch.object(plugin, "format_fetch_result", return_value="ok"):
             self.assertEqual(plugin.hs_agent(plugin.DEFAULT_PROFILE, []), 0)
+            self.assertEqual(plugin.hs_agent(plugin.CLAUDE_PROFILE, []), 0)
 
         with patch.object(plugin, "prepare_hs_worker", return_value=("TEST-001", self.state)), \
                 patch.object(plugin, "check", return_value=[]), \
                 patch.object(plugin.subprocess, "Popen") as popen, \
                 patch.object(plugin, "fetch_worker", return_value={
-                    "commit": "a" * 40,
-                    "branch": "sandbox/TEST-001",
-                    "commit_count": 0,
+                    **fetch_payload,
                     "git_snapshot": {
                         "status_porcelain": "", "log": "", "status_short": "",
                         "diff": "", "error": None,
@@ -366,6 +367,7 @@ class RuntimeIsolationTests(unittest.TestCase):
                 return proc
             popen.side_effect = fake_popen_prompt
             self.assertEqual(plugin.hs_agent(plugin.DEFAULT_PROFILE, [], prompt="task"), 0)
+            self.assertEqual(plugin.hs_agent(plugin.CLAUDE_PROFILE, [], prompt="task"), 0)
 
         # git query path builds podman argv without agent mounts
         runtime = plugin.podman_runtime("TEST-001", agent_home=session)
@@ -386,7 +388,9 @@ class RuntimeIsolationTests(unittest.TestCase):
                 for spec in agent_mounts:
                     src = Path(spec["src"]).resolve()
                     self.assertNotEqual(src, configured)
-                    self.assertTrue(src.is_relative_to((configured / "sessions").resolve()))
+                    self.assertNotEqual(src, self.configured_claude.resolve())
+                    home = configured if spec["dst"] == plugin.DEFAULT_PROFILE.mount_point else self.configured_claude
+                    self.assertTrue(src.is_relative_to((home / "sessions").resolve()))
 
 
 if __name__ == "__main__":

@@ -398,11 +398,12 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(seen["during_fetch"], plugin.DEFAULT_PROFILE.herdr_agent)
         self.assertNotIn("HERDR_AGENT", os.environ)
 
-    def test_manifest_exposes_fetch_action(self):
+    def test_manifest_has_no_fetch_action(self):
         with (SCRIPT.parent.parent / "herdr-plugin.toml").open("rb") as stream:
             manifest = tomllib.load(stream)
-        action = next(action for action in manifest["actions"] if action["id"] == "fetch")
-        self.assertEqual(action["command"], ["python3", "bin/hs", "fetch"])
+        ids = {action["id"] for action in manifest["actions"]}
+        self.assertNotIn("fetch", ids)
+        self.assertNotIn("rm", ids)
 
 
 if __name__ == "__main__":

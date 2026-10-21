@@ -179,11 +179,14 @@ for agents. There is no duplicate under `.agents/skills/` (that tree only
 holds Beads guidance).
 
 Herdr actions are thin wrappers over the same `hs` commands (`list` → `hs ls`,
-`inspect` → `hs inspect`, `fetch` → `hs fetch`, `gc` → `hs gc`, `rm` → `hs rm`).
-The `start-codex` / `start-claude` panes run `hs codex` / `hs claude`. Setup
-actions (`setup`, `bootstrap`, `build-image`, `check`) stay as direct script
-commands. `inspect` and `fetch` without an ID resolve the worker from the
-action's pane context (`HERDR_PANE_ID` plus the cwd source repo).
+`inspect` → `hs inspect`, `destroy` / `gc` → `hs gc`). The `start-codex` /
+`start-claude` panes run `hs codex` / `hs claude`. Setup actions (`setup`,
+`bootstrap`, `build-image`, `check`) stay as direct script commands. Menu
+`inspect` lists every worker for `workspace_cwd` from
+`HERDR_PLUGIN_CONTEXT_JSON` (actions run with the plugin directory as cwd).
+CLI `hs inspect` without an ID still uses `HERDR_PANE_ID` plus the process
+cwd. There is no menu `fetch` or `rm` action — use `hs fetch <id>` /
+`hs rm <id>` on the CLI (auto-fetch already runs when an agent exits).
 
 After keeping or discarding a result, remove the worker explicitly or let GC
 clean it up:
@@ -194,7 +197,7 @@ hs gc
 ```
 
 Closing a Herdr pane triggers a `pane.closed` plugin event that runs
-`hs gc --from-event` for that pane's fetched workers. Each `hs codex` launch
+`hs gc --from-event` for that pane's fetched workers. Each `hs <agent>` launch
 also runs a short opportunistic GC (non-blocking state lock, no
 fetch-before-GC, 2s budget). GC never deletes or rewrites refs in the
 source repository (including `sandbox/*` branches).
@@ -228,9 +231,11 @@ If `~/.local/bin` is not on your PATH, either:
 - Use the full path: `~/.local/bin/hs codex`
 - Call the plugin's `bin/hs` directly: `$(herdr plugin root dev.herdr.sandbox)/bin/hs codex`
 
-The shim uses `herdr plugin root`, `herdr plugin config-dir`, and `herdr plugin
-state-dir` to discover directories at runtime, so it works regardless of XDG
-overrides or custom Herdr base directories.
+The installed `~/.local/bin/hs` shim resolves the plugin root via
+`herdr plugin list --plugin dev.herdr.sandbox --json`, then runs the plugin's
+`bin/hs`. That script queries `herdr plugin config-dir <id>` and derives the
+state directory from `XDG_STATE_HOME` (or `~/.local/state/herdr/plugins/<id>`),
+because Herdr 0.9.x has no `herdr plugin state-dir` command.
 
 ## Herdr 0.9.0 integration limits
 
