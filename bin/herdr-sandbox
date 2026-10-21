@@ -1199,13 +1199,23 @@ def worker_source_repo(worker_id, state_dir=None):
 
 
 def validate_open_context(worker_id):
-    """Refuse an interactive launch from a different Herdr workspace."""
+    """Refuse an interactive launch from a different Herdr workspace.
+
+    ``herdr pane run`` sets ``HERDR_ENV=1`` and ``HERDR_PANE_ID`` without
+    ``HERDR_PLUGIN_CONTEXT_JSON`` (see docs/herdr-pane-lifecycle.md). Pane ID
+    alone is enough for worker identity, so that path is accepted. When
+    ``workspace_cwd`` is present, it must match the worker's source repo.
+    """
     workspace = context_repo_root()
     if workspace is None:
         if os.environ.get("HERDR_ENV") == "1":
+            pane_id = os.environ.get("HERDR_PANE_ID", "").strip()
+            if pane_id:
+                return
             raise ValueError(
                 "Herdr workspace context is missing; refusing to open worker. "
-                "Invoke this action from the worker's source workspace."
+                "Invoke this action from the worker's source workspace, or run "
+                "via herdr pane run so HERDR_PANE_ID is set."
             )
         return
     source = worker_source_repo(worker_id)
@@ -3826,11 +3836,46 @@ def _workers_for_pane_and_repo(pane_id, source_repo, state_dir=None):
     return matches
 
 
-def resolve_inspect_worker(worker_id=None, state_dir=None):
-    """Resolve the inspect target from an explicit ID or the current pane.
+def _workers_for_repo(source_repo, state_dir=None):
+    """Find all workers whose source_repo matches (any pane, any agent)."""
+    source_repo = Path(source_repo).expanduser().resolve()
+    workers_dir = state_workers_dir(state_dir)
+    if not workers_dir.is_dir() or workers_dir.is_symlink():
+        return []
+    matches = []
+    for entry in sorted(workers_dir.iterdir(), key=lambda path: path.name):
+        if not entry.is_dir() or entry.is_symlink() or not WORKER_ID_RE.fullmatch(entry.name):
+            continue
+        metadata_path = entry / "worker.json"
+        if not metadata_path.is_file():
+            continue
+        try:
+            with metadata_path.open() as stream:
+                metadata = json.load(stream)
+            if not isinstance(metadata, dict):
+                continue
+            recorded = metadata.get("source_repo")
+            if not isinstance(recorded, str) or not recorded:
+                continue
+            if Path(recorded).expanduser().resolve() != source_repo:
+                continue
+            matches.append(entry.name)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+    return matches
 
-    With no ID, match workers for (``HERDR_PANE_ID`` from the Herdr plugin env
-    — see https://herdr.dev/docs/plugins/ — plus the cwd repo, any agent).
+
+def inspect_from_plugin_action():
+    """True when this process is the Herdr menu ``inspect`` action (not CLI)."""
+    return os.environ.get("HERDR_PLUGIN_ACTION_ID", "").strip() == "inspect"
+
+
+def resolve_inspect_worker(worker_id=None, state_dir=None):
+    """Resolve the inspect target from an explicit ID or the current pane (CLI).
+
+    With no ID, match workers for (``HERDR_PANE_ID`` plus the process cwd repo,
+    any agent). Used by ``hs inspect`` on the CLI. The Herdr menu inspect action
+    uses ``inspect_action_workspace`` instead (workspace_cwd; lists all matches).
     Config table and sole-worker fallbacks are gone.
     """
     if worker_id:
@@ -3862,6 +3907,51 @@ def resolve_inspect_worker(worker_id=None, state_dir=None):
         f"Multiple workers match pane {pane_id} in {source}: {', '.join(matches)}. "
         "Pass an explicit worker ID."
     )
+
+
+def inspect_action_workspace(state_dir=None):
+    """List every worker for the focused workspace (Herdr menu inspect action).
+
+    Resolves the source repo from ``HERDR_PLUGIN_CONTEXT_JSON.workspace_cwd``
+    via ``context_repo_root()`` — not the process cwd (actions run with the
+    plugin directory as cwd). Never picks a single worker from the focused pane.
+    """
+    workspace = context_repo_root()
+    if workspace is None:
+        raise ValueError(
+            "Herdr workspace_cwd is missing from HERDR_PLUGIN_CONTEXT_JSON; "
+            "invoke the inspect action from a Git workspace."
+        )
+    worker_ids = _workers_for_repo(workspace, state_dir)
+    return [inspect_worker(worker_id, state_dir=state_dir) for worker_id in worker_ids]
+
+
+def format_action_inspect(records):
+    """Render menu inspect output: ID/PANE/STATUS/RESULT plus review git lines."""
+    if not records:
+        return "No sandbox workers found for this workspace."
+    columns = ("ID", "PANE", "STATUS", "RESULT")
+    rows = [columns]
+    for record in records:
+        rows.append((
+            record["id"],
+            _display(record.get("pane_id")),
+            record["status"],
+            _display(record.get("result_branch")),
+        ))
+    widths = [max(len(str(row[index])) for row in rows) for index in range(len(columns))]
+    lines = [
+        "  ".join(str(value).ljust(widths[index]) for index, value in enumerate(row)).rstrip()
+        for row in rows
+    ]
+    for record in records:
+        base = _review_base_ref(record)
+        source = record["source_repo"]
+        _, review_cmds, _, _ = _review_git_commands(source, base, record["id"])
+        lines.append("")
+        lines.append(f"Review ({record['id']}):")
+        lines.extend(review_cmds)
+    return "\n".join(lines)
 
 
 def _display(value, missing="-"):
@@ -4670,15 +4760,26 @@ def main():
                 print(format_workers(records))
         elif args.command == "inspect":
             _, state_dir = paths()
-            worker_id = resolve_inspect_worker(
-                args.worker_id or args.option_worker_id,
-                state_dir=state_dir,
-            )
-            record = inspect_worker(worker_id)
-            if args.json:
-                print(json.dumps(record, indent=2))
+            explicit_id = args.worker_id or args.option_worker_id
+            if explicit_id:
+                record = inspect_worker(explicit_id, state_dir=state_dir)
+                if args.json:
+                    print(json.dumps(record, indent=2))
+                else:
+                    print(format_worker(record))
+            elif inspect_from_plugin_action():
+                records = inspect_action_workspace(state_dir=state_dir)
+                if args.json:
+                    print(json.dumps(records, indent=2))
+                else:
+                    print(format_action_inspect(records))
             else:
-                print(format_worker(record))
+                worker_id = resolve_inspect_worker(None, state_dir=state_dir)
+                record = inspect_worker(worker_id, state_dir=state_dir)
+                if args.json:
+                    print(json.dumps(record, indent=2))
+                else:
+                    print(format_worker(record))
         elif args.command == "pane-open":
             command = build_herdr_pane_open_command(args.placement, args.target_pane, args.direction)
             return subprocess.run(command, check=False).returncode

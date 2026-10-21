@@ -37,27 +37,21 @@ command = ["python3", "bin/hs", "ls"]
 
 [[actions]]
 id = "inspect"
-title = "Sandbox: Inspect Worker"
-description = "Inspect a worker (hs inspect; defaults to this pane's worker)"
+title = "Sandbox: Inspect Workers"
+description = "List workers for the focused workspace (hs inspect; uses workspace_cwd from plugin context)"
 command = ["python3", "bin/hs", "inspect"]
 
 [[actions]]
-id = "fetch"
-title = "Sandbox: Fetch Worker for Review"
-description = "Fetch a worker tip into refs/heads/sandbox/<id> (hs fetch)"
-command = ["python3", "bin/hs", "fetch"]
+id = "destroy"
+title = "Sandbox: Garbage-Collect Workers"
+description = "Alias of hs gc: remove fetched workers whose panes are gone, or workers older than [gc].max_age"
+command = ["python3", "bin/hs", "gc"]
 
 [[actions]]
 id = "gc"
 title = "Sandbox: Garbage-Collect Workers"
 description = "Remove fetched workers whose panes are gone, or workers older than [gc].max_age (hs gc)"
 command = ["python3", "bin/hs", "gc"]
-
-[[actions]]
-id = "rm"
-title = "Sandbox: Remove Worker"
-description = "Stop and remove a worker container and its disposable state (hs rm)"
-command = ["python3", "bin/hs", "rm"]
 
 [[panes]]
 id = "start-codex"

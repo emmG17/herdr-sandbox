@@ -113,9 +113,13 @@ class PlainGitIntegrationTests(unittest.TestCase):
             manifest = tomllib.load(stream)
         ids = {action["id"] for action in manifest["actions"]}
         self.assertNotIn("cherry-pick", ids)
-        fetch = next(action for action in manifest["actions"] if action["id"] == "fetch")
-        self.assertEqual(fetch["command"], ["python3", "bin/hs", "fetch"])
-        self.assertIn("sandbox/<id>", fetch["description"])
+        ids = {action["id"] for action in manifest["actions"]}
+        self.assertNotIn("fetch", ids)
+        self.assertIn("inspect", ids)
+        self.assertEqual(
+            next(a for a in manifest["actions"] if a["id"] == "destroy")["command"],
+            ["python3", "bin/hs", "gc"],
+        )
 
 
 if __name__ == "__main__":
