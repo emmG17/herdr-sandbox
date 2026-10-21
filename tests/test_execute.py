@@ -82,7 +82,10 @@ class ExecuteWorkerTests(unittest.TestCase):
         return git("-C", self.worker_repo, "rev-parse", "HEAD")
 
     def test_execution_command_uses_codex_exec_without_tty(self):
-        command = plugin.execute_command("TEST-001", "write a file")
+        session, _snaps = plugin.fresh_agent_home(
+            self.config / "codex", "TEST-001", plugin.DEFAULT_PROFILE,
+        )
+        command = plugin.execute_command("TEST-001", "write a file", agent_home=session)
 
         self.assertEqual(command[:3], ["podman", "run", "--rm"])
         self.assertNotIn("-it", command)
@@ -94,10 +97,9 @@ class ExecuteWorkerTests(unittest.TestCase):
         ):
             self.assertIn(required, command)
         self.assertEqual(command[-5:], ["codex", "exec", "--sandbox", "danger-full-access", "write a file"])
-        # execute_command without agent_home mounts the configured dedicated home;
-        # execute_worker passes a per-launch session home instead.
         mount = next(arg for arg in command if arg.startswith("type=bind,src=") and ",dst=/codex," in arg)
-        self.assertIn(str((self.config / "codex").resolve()), mount)
+        self.assertIn(str(session.resolve()), mount)
+        self.assertTrue(session.is_relative_to((self.config / "codex" / "sessions").resolve()))
 
     def test_execute_streams_output_and_persists_result_and_log(self):
         worker_head = self._commit_worker_change("persisted.txt", "saved by Codex\n", "worker change")

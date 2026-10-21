@@ -245,14 +245,22 @@ plugin-owned `CODEX_HOME` that contains only `auth.json`. The session directory
 is removed when the agent exits, so history from another worker or workspace
 cannot be resumed.
 
-**Token refresh (option a):** if the agent refreshes credentials in the session
-home, `hs` writes back only the profile auth file(s) into the dedicated plugin
-home after the session. Write-back is atomic (temp file in the same directory,
-fsync, rename), runs under the state lock, keeps mode `0600`, refuses symlinks,
-and applies only when the file is valid JSON with the expected shape and is
-actually newer or different from the copy taken at launch. Invalid or unchanged
-files are left alone. Re-run `hs login <agent>` only if authentication is
-missing or write-back rejected a bad file.
+**Token refresh (option a):** write-back is always attempted in a `finally`
+block after the agent exits (including non-zero exits), then the per-launch
+session directory is removed. Only the profile auth file(s) are candidates.
+Write-back is atomic (temp file in the same directory, fsync, rename), runs
+under the state lock, keeps mode `0600`, and refuses symlinks. Under the lock
+it compare-and-swaps against the launch snapshot: the session file must be
+valid JSON with the expected shape and differ from the snapshot; if the
+dedicated destination already differs from that snapshot (bytes or mtime),
+another session advanced auth and the write is skipped with a log line.
+Unchanged or invalid session files are left alone. A hard kill (`SIGKILL`) can
+skip write-back and leave a session directory; `sweep_stale_agent_sessions`
+removes leftovers later. Because `--prompt` now uses the same per-launch home
+as interactive mode, only auth is preserved across runs—history and other
+session files under the dedicated home no longer accumulate. Re-run
+`hs login <agent>` only if authentication is missing or write-back rejected a
+bad file.
 
 For Herdr screen-based agent detection when Podman wraps the real CLI, `hs`
 sets `HERDR_AGENT` on the **host** pane/wrapper process (not only inside the
