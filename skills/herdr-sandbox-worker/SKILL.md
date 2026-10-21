@@ -1,15 +1,17 @@
 ---
 name: herdr-sandbox-worker
-description: Operates the Herdr Sandbox Workers plugin to have Codex work autonomously in an isolated disposable Git clone, then review and integrate the result with plain git. Use when a task should be delegated to a rootless-Podman sandbox worker, or when creating, running, inspecting, fetching, or destroying a `dev.herdr.sandbox` worker.
+description: Spawns sandboxed Codex or Claude Code workers through the Herdr Sandbox `hs` launcher, waits for them in Herdr panes, and reviews results on `sandbox/<id>` with plain git. Use when an orchestrator on the host should delegate work into a rootless-Podman worker instead of running a bare agent CLI in a pane.
 ---
 
 # Herdr Sandbox Worker
 
-Use `dev.herdr.sandbox` when the task benefits from an isolated Codex worker. Herdr is the control plane: it creates the clone, starts Codex, and exposes evidence for review. The worker only owns its disposable clone. Integration is ordinary git on `sandbox/<id>`.
+Use `dev.herdr.sandbox` when a task should run in an isolated Codex or Claude Code worker. Herdr is the control plane on the host. The worker only owns its disposable clone. Results land as `sandbox/<id>` branches; integration is ordinary git chosen by you or the user—never automatic.
+
+**Never** run a bare agent CLI (`codex`, `claude`) in a pane for delegated work. Always go through `hs` (`hs codex`, `hs claude`, or `hs <agent> --prompt "..."`). A bare CLI bypasses the sandbox.
 
 ## Preconditions
 
-Work from the target Herdr Git workspace. Confirm the host is Linux with rootless Podman, Herdr 0.9+, Git, Python 3.11+, and Codex CLI. The plugin runs as the ordinary user, never via `sudo`.
+Work from the target Herdr Git workspace. Confirm the host is Linux with rootless Podman, Herdr 0.9+, Git, Python 3.11+, and the Codex and/or Claude Code CLI for host-side login. The plugin runs as the ordinary user, never via `sudo`.
 
 Install or link the plugin if absent:
 
@@ -19,88 +21,91 @@ herdr plugin install emmG17/herdr-sandbox
 herdr plugin link /path/to/herdr-sandbox
 ```
 
-For a new installation, prepare and authenticate the plugin-owned Codex home. Never reuse or copy the normal Codex home.
+## One-time setup and login
 
 ```sh
 herdr plugin action invoke bootstrap --plugin dev.herdr.sandbox
-hs login codex
+hs login codex     # and/or:
+hs login claude
 herdr plugin action invoke check --plugin dev.herdr.sandbox
 ```
 
-`check` must succeed before a worker is created or run. If it reports that the image is missing, run `bootstrap` or `build-image`; if authentication is missing, repeat the dedicated-home login.
+`bootstrap` creates plugin-owned config/state, dedicated agent homes, the worker image, and an `hs` shim under `~/.local/bin` (ensure that directory is on `PATH`). `check` must succeed before spawning workers.
 
-## Autonomous work loop
+`hs login codex` runs device auth with `CODEX_HOME` pointed at the plugin-owned Codex home. `hs login claude` runs `claude auth login` with `CLAUDE_CONFIG_DIR` on the plugin-owned Claude home and sets `HOME` to an isolated directory under plugin state (`login-homes/claude`) so the host CLI cannot touch the real `~/.claude.json`. Never copy credentials from `~/.codex` or `~/.claude`.
 
-1. Create a worker from the current workspace. Record its ID; with one worker, later actions select it automatically.
+## Orchestrator loop
 
-   ```sh
-   herdr plugin action invoke create --plugin dev.herdr.sandbox
-   herdr plugin action invoke list --plugin dev.herdr.sandbox
-   ```
+Prefer a normal tiled pane (so `HERDR_PANE_ID` is set and the same pane can reuse one worker). Split a sibling if needed, keep focus, then spawn:
 
-2. Start Codex interactively to carry out the task, or use configured noninteractive execution. Give Codex a bounded task and require it to commit its completed change in the worker clone.
+```sh
+herdr pane split --current --direction right --cwd "$PWD" --no-focus
+# Read the new pane ID from the JSON response (.result.pane.pane_id), then:
+herdr pane run <pane> "hs claude"
+# or: herdr pane run <pane> "hs codex"
+herdr agent wait <pane> --until done
+```
 
-   ```sh
-   herdr plugin pane open --plugin dev.herdr.sandbox --entrypoint start-codex --placement overlay
-   # Noninteractive (same launcher path; [execute] config is ignored):
-   hs codex --prompt "Implement the requested change and run the relevant tests."
-   ```
+For non-interactive work (no TTY agent session), run the prompt form in the pane or from a shell that has the source repo as cwd:
 
-   Noninteractive output is streamed while Codex runs; stdin to the agent is
-   closed and the exit status propagates. Each invocation also persists
-   `runs/<run-id>/result.json` and `runs/<run-id>/output.log` below the worker
-   directory (including `result_branch` and `commit_count` from the source repo
-   after auto-fetch). `hs ls` / `hs inspect` show a compact summary of the
-   latest result. The plugin waits for the Codex child process, but does not
-   invent a Herdr 0.9.0 `--wait` or status extension.
+```sh
+herdr pane run <pane> "hs claude --prompt \"Implement the change and commit in the worker clone.\""
+# or: hs claude --prompt "..."
+# or: hs codex --prompt "..."
+herdr agent wait <pane> --until done
+```
 
-3. Inspect the worker before bringing anything back. Validate the commit, status, tests, and diff against the requested task.
+`hs <agent>` creates or reuses a worker for the current pane, launches the agent in the sandbox, and on agent exit auto-fetches the worker tip into `refs/heads/sandbox/<id>` in the source repo. `--prompt` closes agent stdin, streams output, persists `runs/<run-id>/result.json` and `output.log` under the worker directory, then auto-fetches the same way. The source tree must be clean (no uncommitted changes).
 
-   ```sh
-   herdr plugin action invoke inspect --plugin dev.herdr.sandbox
-   herdr plugin action invoke fetch --plugin dev.herdr.sandbox
-   ```
+### Popup-pane caveat
 
-   `fetch` force-updates `refs/heads/sandbox/<id>` in the source repository and
-   prints plain-git review and integration commands. It never merges into your
-   current branch.
+Plugin popup panes do not receive `HERDR_PANE_ID`. Without it, every `hs` launch creates a **new** worker; there is no per-pane reuse. Prefer `herdr pane split` / `herdr pane run` on ordinary tiled panes for orchestrated work.
 
-4. Integrate an approved result with ordinary git in the source checkout:
+## Read results
 
-   ```sh
-   git log main..sandbox/<id>
-   git diff main...sandbox/<id>
-   git merge sandbox/<id>    # or cherry-pick or rebase
-   ```
+In the **source** repository:
 
-5. After retaining or discarding the result, remove the worker or let GC clean it up:
+```sh
+hs ls
+hs inspect          # this pane's worker when HERDR_PANE_ID is set
+hs inspect <id>     # when the pane is ambiguous or unset
 
-   ```sh
-   hs rm <id>
-   hs gc
-   ```
+git log <base>..sandbox/<id>
+git diff <base>...sandbox/<id>
+```
 
-   Closing the Herdr pane also runs GC for that pane's fetched workers via the
-   `pane.closed` hook. `[destroy]` config is removed; `destroy --id` is only an
-   alias of `hs rm`.
+`hs ls` lists id, agent, source repo, pane, status, result branch (`sandbox/<id>` or `-`), and created time. `hs inspect` adds the latest run summary, container-side dirty status, and review commands that run in the source repo against `sandbox/<id>`.
 
-## Worker selection and configuration
+## Integrate with plain git
 
-With multiple workers, configure worker IDs in the plugin config at `$(herdr plugin config-dir dev.herdr.sandbox)/config.toml`: `[fetch]` or `[open]`. `[open].id` selects the worker for the interactive `start-codex` pane. Use `hs ls` / `hs inspect` to recover IDs and lifecycle state (`[inspect]` and `[execute]` are ignored). Set `[gc].max_age` (default `7d`) for age-based cleanup.
+Review first. Then integrate only what you or the user approve—merge, rebase, or apply selected commits. The plugin never merges into the current branch.
 
-Herdr 0.9.0 runs plugin actions in their invoking workspace and cannot let an
-action dynamically create or move its own pane. Use the manifest `start-codex`
-pane entrypoint for an interactive Herdr pane, and invoke it from the selected
-worker's source workspace. The plugin refuses a `workspace_cwd` mismatch. The
-Podman worker still mounts the selected clone at `/workspace`. Interactive and
-noninteractive (`hs codex --prompt`) sessions both use a temporary Codex home
-with only authentication; refreshed `auth.json` is written back atomically into
-the dedicated plugin home after the session.
+```sh
+git log main..sandbox/<id>
+git diff main...sandbox/<id>
+git merge sandbox/<id>
+```
 
-Set `[runtime].network = "offline"` only for self-contained tasks. Use the default `"online"` mode for model access or dependency installation. Customize project dependencies in the plugin-owned `image/Containerfile` and run `build-image`; the source repository and credentials are deliberately outside that build context.
+## Cleanup
+
+GC is mostly implicit: closing a Herdr pane runs GC for that pane's fetched workers (`pane.closed`), and each `hs <agent>` launch runs a short opportunistic GC. GC never deletes or rewrites `sandbox/*` (or other) refs in the source repo.
+
+Remove a worker explicitly when needed:
+
+```sh
+hs rm <id>
+hs gc
+```
 
 ## Safety boundary
 
-The worker has broad permissions *inside* its container, but only its clone at `/workspace` and the dedicated `/codex` home are mounted. It has no host home, normal Codex home, SSH/GPG/cloud credentials, source-repository write access, or container-engine socket.
+Rootless Podman is the isolation boundary (not a VM). Agent launches (`hs <agent>`, `hs <agent> --prompt`, and the `start-*` pane entrypoints) mount only:
 
-Do not treat isolation as a VM boundary: avoid untrusted or hostile workloads. Before relying on a new environment, run the repository's disposable-worker security test. If any access expected to be denied succeeds, preserve the worker, do not fetch or integrate it, and escalate the finding.
+- the worker clone at `/workspace` (read-write), and
+- a **per-launch session home** at `/codex` or `/claude` that contains only authentication artifacts copied from the dedicated plugin agent home.
+
+They do not mount the host home, normal `~/.codex` / `~/.claude` / `~/.claude.json`, SSH/GPG/cloud credentials, the source repository as writable, or Podman/Docker sockets. Capabilities are dropped, `no-new-privileges` is set, the container root is read-only, and `--userns=keep-id` is used. Host environment variables are never forwarded into the container implicitly.
+
+Caveat (tracked in issue #29): a non-fresh bash `open` (interactive shell into an existing worker) still bind-mounts the **whole** configured plugin agent home at `/codex` or `/claude`, not a session home. Prefer `hs <agent>` / `--prompt` for delegated work; do not treat a bash `open` session as auth-only.
+
+Do not use this for untrusted or hostile workloads. Before relying on a new environment, run the repository's disposable-worker security test. If any access expected to be denied succeeds, preserve the worker, do not fetch or integrate it, and escalate the finding.

@@ -71,10 +71,75 @@ class DocumentationTests(unittest.TestCase):
             "## Help, feedback, and changes",
             "https://github.com/emmG17/herdr-sandbox/issues",
             "emmanuel@emm-g.com",
+            "### Orchestrator agents on the host",
+            "herdr pane run <pane>",
+            "herdr agent wait <pane> --until done",
+            "skills/herdr-sandbox-worker/SKILL.md",
         )
         for item in required:
             with self.subTest(item=item):
                 self.assertIn(item, readme)
+
+    def test_skill_documents_hs_orchestrator_loop_without_legacy_actions(self):
+        skill_path = ROOT / "skills" / "herdr-sandbox-worker" / "SKILL.md"
+        self.assertTrue(skill_path.is_file())
+        skill = skill_path.read_text()
+
+        forbidden = (
+            "[open]",
+            "[execute]",
+            "[cherry_pick]",
+            "[destroy]",
+            "[fetch]",
+            "[inspect]",
+            "FETCH_HEAD",
+            "cherry-pick",
+            "cherry_pick",
+        )
+        for item in forbidden:
+            with self.subTest(forbidden=item):
+                self.assertNotIn(item, skill)
+
+        required = (
+            "hs login",
+            "hs login codex",
+            "hs login claude",
+            "login-homes/claude",
+            "herdr pane run <pane>",
+            "hs claude",
+            "hs codex",
+            "hs claude --prompt",
+            "hs codex --prompt",
+            "herdr agent wait <pane> --until done",
+            "hs ls",
+            "hs inspect",
+            "sandbox/<id>",
+            "git log <base>..sandbox/<id>",
+            "git diff <base>...sandbox/<id>",
+            "git merge sandbox/<id>",
+            "hs rm <id>",
+            "hs gc",
+            "HERDR_PANE_ID",
+            "Never",
+            "bare agent CLI",
+            "popup",
+            "Safety boundary",
+            "/workspace",
+            "/codex",
+            "/claude",
+            "per-launch session home",
+            "#29",
+            "description: Spawns sandboxed Codex or Claude Code workers",
+        )
+        for item in required:
+            with self.subTest(item=item):
+                self.assertIn(item, skill)
+
+        agents_copy = ROOT / ".agents" / "skills" / "herdr-sandbox-worker" / "SKILL.md"
+        self.assertFalse(
+            agents_copy.exists(),
+            "no duplicate skill under .agents/skills/; sync only if a copy is added later",
+        )
 
     def test_security_procedure_tests_disposable_workspace_deletion(self):
         procedure = (ROOT / "docs" / "manual-worker-security-test.md").read_text()

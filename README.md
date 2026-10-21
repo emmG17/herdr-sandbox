@@ -18,12 +18,15 @@ selected commits) after you review that branch.
 
 Agents use full in-container permissions (Codex: `danger-full-access`; Claude
 Code: `--dangerously-skip-permissions`). Rootless Podman is the security
-boundary: the runtime mounts only the worker repository at `/workspace` and a
-dedicated plugin agent home (`/codex` or `/claude`). It does not mount your
-normal `~/.codex`, `~/.claude`, `~/.claude.json`, host home, SSH/GPG/cloud
-credentials, or Podman/Docker sockets. It uses `--userns=keep-id`, drops
-capabilities, enables `no-new-privileges`, and has a read-only container root.
-Host environment variables are never forwarded into the container implicitly.
+boundary: agent launches (`hs <agent>`, `--prompt`, `start-*`) mount only the
+worker repository at `/workspace` and a per-launch session home at `/codex` or
+`/claude` (auth artifacts only). They do not mount your normal `~/.codex`,
+`~/.claude`, `~/.claude.json`, host home, SSH/GPG/cloud credentials, or
+Podman/Docker sockets. A non-fresh bash `open` still mounts the whole
+configured plugin agent home (issue #29). Isolation uses `--userns=keep-id`,
+drops capabilities, enables `no-new-privileges`, and a read-only container
+root. Host environment variables are never forwarded into the container
+implicitly.
 
 **Host-side Git operations**: The plugin never runs git commands with a worker  
 repository as cwd or `-C` target. Worker `.git/config` is attacker-controlled  
@@ -122,7 +125,7 @@ into `refs/heads/sandbox/<id>` and prints the branch name, commit count, and a
 short log. It works from any Herdr pane or plain shell without requiring
 action-specific environment variables.
 
-Review and integrate with plain git:
+Review and integrate with plain git (never automatic):
 
 ```sh
 git log main..sandbox/<id>
@@ -144,6 +147,29 @@ result branch (`sandbox/<id>` or `-`), and created time. It reads the state
 store and container status only—no per-worker git query. `hs inspect` adds the
 latest run result, container-side dirty status, and review commands that run in
 the **source** repo against `sandbox/<id>`.
+
+### Orchestrator agents on the host
+
+Host orchestrators should spawn sandboxed workers through `hs`, not bare
+`codex` / `claude` in a pane (that bypasses the sandbox). Prefer ordinary
+tiled panes so `HERDR_PANE_ID` is set and the pane can reuse one worker.
+Plugin popup panes lack `HERDR_PANE_ID`, so every launch gets a new worker.
+
+```sh
+herdr pane split --current --direction right --cwd "$PWD" --no-focus
+herdr pane run <pane> "hs claude"    # or: "hs codex" / "hs claude --prompt \"...\""
+herdr agent wait <pane> --until done
+# Then in the source repo:
+git log main..sandbox/<id>
+git diff main...sandbox/<id>
+hs ls
+hs inspect <id>
+hs rm <id>    # optional; GC also runs on pane close and at launch
+```
+
+The shipped skill `skills/herdr-sandbox-worker/SKILL.md` documents this loop
+for agents. There is no duplicate under `.agents/skills/` (that tree only
+holds Beads guidance).
 
 Alternatively, use the plugin actions:
 
