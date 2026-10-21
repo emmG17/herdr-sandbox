@@ -2527,6 +2527,9 @@ def _worker_record(worker_dir, *, detail=False):
                 )
             record["branch"] = actual_branch
             record["actual_branch"] = actual_branch
+    elif repo.is_symlink() or not repo.is_dir():
+        # List path: detect a missing clone without starting a git-query container.
+        record["issues"].append(f"Worker repository is missing: {repo}")
 
     _apply_container_status(record, worker_id)
     if any(issue.startswith("Worker repository") for issue in record["issues"]):
