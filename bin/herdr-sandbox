@@ -1546,6 +1546,12 @@ def _relative_symlink_stays_in_allowlist(allowlist_root, link_relpath, raw_targe
     ``os.path.normpath`` from the symlink's directory (fd-relative path), without
     following other symlinks — so pnpm links within ``node_modules`` keep
     working while escapes to ``../.env`` / ``../.git`` do not.
+
+    Lexical (not kernel) resolution is intentional: recreated links in the
+    worker resolve only inside the worker tree. A path that would follow an
+    intermediate symlink on the host (e.g. ``b -> .pnpm/...`` then
+    ``l -> b/../.env``) may dangle or stay worker-local under lexical
+    normalization, but it never reaches the host filesystem.
     """
     if not isinstance(raw_target, str) or not raw_target or os.path.isabs(raw_target):
         return False
@@ -1850,6 +1856,11 @@ def _walk_allowlist_fd(dir_fd, dst_dir, allowlist_root, rel_prefix, forbidden_in
     are reopened with ``O_RDONLY|O_DIRECTORY|O_NOFOLLOW`` (so a TOCTOU swap to a
     symlink targeting ``../.git`` fails closed). Nested ``.git`` names are skipped.
     Every opened fd is closed, including on error.
+
+    File errors during the walk fail soft: the entry is skipped with a stderr
+    line and the walk continues. By contrast, a top-level single-file reflink
+    failure in ``_copy_allowlisted_path_fd`` / ``reflink_file`` propagates to
+    the caller (the allowlist entry itself could not be copied).
     """
     dst_dir = Path(dst_dir)
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -3784,7 +3795,9 @@ def cwd_repo_root(state_dir=None):
     try:
         workers_dir = state_workers_dir(state_dir).resolve()
     except (OSError, ValueError, TypeError):
-        return root
+        # Fail closed: if we cannot prove the root is outside workers state,
+        # treat it as not a source repo so inspect requires an explicit ID.
+        return None
     try:
         if root == workers_dir or root.is_relative_to(workers_dir):
             return None
@@ -3947,10 +3960,16 @@ def format_action_inspect(records):
     for record in records:
         base = _review_base_ref(record)
         source = record["source_repo"]
-        _, review_cmds, _, _ = _review_git_commands(source, base, record["id"])
         lines.append("")
-        lines.append(f"Review ({record['id']}):")
-        lines.extend(review_cmds)
+        if _review_source_usable(source):
+            _, review_cmds, _, _ = _review_git_commands(source, base, record["id"])
+            lines.append(f"Review ({record['id']}):")
+            lines.extend(review_cmds)
+        else:
+            lines.append(
+                f"Review ({record['id']}): unavailable "
+                "(source repository missing from worker metadata)"
+            )
     return "\n".join(lines)
 
 
@@ -3996,11 +4015,15 @@ def format_workers(records):
     )
 
 
+def _review_source_usable(source):
+    """Return True when ``source`` is safe to embed in ``git -C`` review commands."""
+    return isinstance(source, str) and bool(source) and source != "-"
+
+
 def format_worker(record):
     result_branch = _display(record.get("result_branch"))
     base = _review_base_ref(record)
     source = record["source_repo"]
-    _, review_cmds, _, _ = _review_git_commands(source, base, record["id"])
     lines = [
         f"Worker: {record['id']}",
         f"Agent: {_display(record.get('agent'))}",
@@ -4032,10 +4055,16 @@ def format_worker(record):
         ])
     if record["issues"]:
         lines.extend(["Issues:"] + [f"- {issue}" for issue in record["issues"]])
+    lines.append("")
+    if _review_source_usable(source):
+        _, review_cmds, _, _ = _review_git_commands(source, base, record["id"])
+        lines.extend([
+            f"Review (run in source repo {source}):",
+            *review_cmds,
+        ])
+    else:
+        lines.append("Review: unavailable (source repository missing from worker metadata)")
     lines.extend([
-        "",
-        f"Review (run in source repo {source}):",
-        *review_cmds,
         "",
         "Git log:",
         record["git_log"] or "(no commits)",

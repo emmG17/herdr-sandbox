@@ -27,10 +27,11 @@ class DeveloperExperienceTests(unittest.TestCase):
         self.assertEqual(panes["start-codex"]["placement"], "overlay")
         self.assertEqual(panes["start-claude"]["command"], ["python3", "bin/hs", "claude"])
 
+        action_ids_set = set(action_ids)
+        self.assertNotIn("destroy", action_ids_set)
         for action_id, hs_args in (
             ("list", ["ls"]),
             ("inspect", ["inspect"]),
-            ("destroy", ["gc"]),
             ("gc", ["gc"]),
         ):
             action = next(a for a in manifest["actions"] if a["id"] == action_id)

@@ -113,6 +113,9 @@ host git against attacker-controlled config. Printed review commands always use
 - Corrupt loose object: fetch fails, source unchanged
 - Audit that `_git_reality` calls `_query_worker_git_snapshot` once and that
   `_git_read` is absent
+- Worker-cwd CLI regression: `hs inspect` with process cwd inside a malicious
+  worker clone returns exit 1 without running host git against worker config
+  (`test_inspect_cli_from_worker_cwd_does_not_execute_worker_config`)
 
 ## Usage
 

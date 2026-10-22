@@ -398,6 +398,55 @@ class WorkerInspectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plugin.inspect_worker("../escape")
 
+    def test_format_worker_skips_review_when_source_missing(self):
+        worker = self.create_worker()
+        metadata_path = worker / "worker.json"
+        metadata = json.loads(metadata_path.read_text())
+        del metadata["source_repo"]
+        metadata_path.write_text(json.dumps(metadata))
+        record = plugin.inspect_worker("TEST-001")
+        self.assertEqual(record["source_repo"], "-")
+        rendered = plugin.format_worker(record)
+        self.assertIn("Review: unavailable", rendered)
+        self.assertNotIn("git -C - ", rendered)
+        self.assertNotIn("git -C '-' ", rendered)
+
+    def test_cwd_repo_root_fail_closed_when_workers_dir_unresolvable(self):
+        from unittest.mock import MagicMock
+
+        broken = MagicMock()
+        broken.resolve.side_effect = OSError("cannot resolve workers dir")
+        with contextlib.chdir(self.source), \
+                patch.object(plugin, "state_workers_dir", return_value=broken):
+            self.assertIsNone(plugin.cwd_repo_root(state_dir=self.state))
+
+    def test_cwd_repo_root_accepts_gitfile_worktree(self):
+        worktree = Path(self.temp.name) / "linked-worktree"
+        git("-C", self.source, "worktree", "add", "-q", str(worktree), "HEAD")
+        git_entry = worktree / ".git"
+        self.assertTrue(git_entry.is_file(), "worktree .git should be a gitfile")
+        with contextlib.chdir(worktree):
+            self.assertEqual(plugin.cwd_repo_root(state_dir=self.state), worktree.resolve())
+
+    def test_cwd_repo_root_follows_symlinked_parents(self):
+        real_parent = Path(self.temp.name) / "real-parent"
+        real_parent.mkdir()
+        repo = real_parent / "project"
+        repo.mkdir()
+        git("init", "-q", repo)
+        git("-C", repo, "config", "user.name", "Test")
+        git("-C", repo, "config", "user.email", "test@example.invalid")
+        (repo / "file.txt").write_text("ok\n")
+        git("-C", repo, "add", "file.txt")
+        git("-C", repo, "commit", "-qm", "init")
+        link_parent = Path(self.temp.name) / "link-parent"
+        link_parent.symlink_to(real_parent)
+        nested = link_parent / "project" / "subdir"
+        nested.mkdir()
+        with contextlib.chdir(nested):
+            root = plugin.cwd_repo_root(state_dir=self.state)
+        self.assertEqual(root, repo.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()

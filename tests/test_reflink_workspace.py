@@ -249,6 +249,47 @@ class ReflinkHelpersTests(unittest.TestCase):
         notices = [line for line in stderr.getvalue().splitlines() if "skipping symlink" in line]
         self.assertGreaterEqual(len(notices), 2)
 
+    def test_lexical_symlink_via_intermediate_link_does_not_leak_env(self):
+        """b -> .pnpm/x/y/z and l -> b/../.env must not copy source .env bytes.
+
+        Lexical containment may keep or skip ``l`` (``b/../.env`` normalizes to
+        an in-entry ``.env`` name without following ``b``). Either way, the
+        walk only recreates symlink text — it must never materialize the
+        source-tree ``.env`` file bytes into the worker.
+        """
+        secret = "SECRET=lexical-escape-must-not-appear\n"
+        (self.source / ".env").write_text(secret)
+        mods = self.source / "node_modules"
+        target = mods / ".pnpm" / "x" / "y" / "z"
+        target.mkdir(parents=True)
+        (target / "pkg.js").write_text("pkg\n")
+        (mods / "b").symlink_to(".pnpm/x/y/z")
+        (mods / "l").symlink_to("b/../.env")
+
+        dest = self.root / "dest"
+        dest.mkdir()
+        with _patch_reflink_copy(), patch.object(plugin.sys, "stderr", io.StringIO()):
+            plugin.copy_allowlisted_untracked(self.source, dest, ["node_modules"])
+
+        self.assertTrue((dest / "node_modules" / "b").is_symlink())
+        self.assertFalse((dest / ".env").exists())
+        # Source .env must not appear as a regular file under the worker tree.
+        self.assertFalse((dest / "node_modules" / ".env").is_file())
+        leaked = []
+        for path in dest.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                text = path.read_text()
+            except OSError:
+                continue
+            if "lexical-escape-must-not-appear" in text:
+                leaked.append(path)
+        self.assertEqual(leaked, [])
+        # If lexical containment keeps l, it is only a symlink string — never followed.
+        if (dest / "node_modules" / "l").is_symlink():
+            self.assertEqual(os.readlink(dest / "node_modules" / "l"), "b/../.env")
+
     def test_hardlink_to_env_inside_node_modules_skipped(self):
         (self.source / ".env").write_text("SECRET=do-not-copy\n")
         mods = self.source / "node_modules" / "pkg"
