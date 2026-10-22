@@ -352,6 +352,38 @@ class ExecuteWorkerTests(unittest.TestCase):
         self.assertEqual(result["result_branch"], "sandbox/TEST-001")
         self.assertFalse(result["dirty"])
 
+    def test_execute_worker_fetch_ok_with_git_snapshot_error(self):
+        """Fetch can succeed while the post-fetch git snapshot still reports an error."""
+        snapshot = {
+            "status_porcelain": "",
+            "log": "",
+            "status_short": "",
+            "diff": "",
+            "error": "Podman is unavailable",
+        }
+        with patch.object(plugin, "check", return_value=[]), \
+                patch.object(plugin, "execute_command", return_value=[
+                    sys.executable, "-c", "print('ok', flush=True)",
+                ]), \
+                patch.object(plugin, "fetch_worker", return_value={
+                    "commit": "a" * 40,
+                    "branch": "sandbox/TEST-001",
+                    "commit_count": 1,
+                    "git_snapshot": snapshot,
+                }) as fetch, \
+                patch.object(plugin, "_query_worker_git_snapshot") as query, \
+                patch.object(plugin.sys, "stdout", new_callable=io.StringIO), \
+                patch.object(plugin.sys, "stderr", new_callable=io.StringIO):
+            result = plugin.execute_worker("TEST-001", "noop")
+
+        fetch.assert_called_once()
+        query.assert_not_called()
+        self.assertEqual(result["result_branch"], "sandbox/TEST-001")
+        self.assertEqual(result["head"], "a" * 40)
+        self.assertIsNone(result["dirty"])
+        self.assertIn("unavailable", result["git_status"])
+        self.assertIn("Podman is unavailable", result["git_status"])
+
     def test_hs_codex_prompt_rejects_extra_codex_args(self):
         stderr = io.StringIO()
         with patch.object(plugin, "prepare_hs_worker", return_value=("TEST-001", self.state)), \

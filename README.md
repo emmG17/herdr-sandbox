@@ -179,14 +179,15 @@ for agents. There is no duplicate under `.agents/skills/` (that tree only
 holds Beads guidance).
 
 Herdr actions are thin wrappers over the same `hs` commands (`list` → `hs ls`,
-`inspect` → `hs inspect`, `destroy` / `gc` → `hs gc`). The `start-codex` /
+`inspect` → `hs inspect`, `gc` → `hs gc`). The `start-codex` /
 `start-claude` panes run `hs codex` / `hs claude`. Setup actions (`setup`,
 `bootstrap`, `build-image`, `check`) stay as direct script commands. Menu
 `inspect` lists every worker for `workspace_cwd` from
 `HERDR_PLUGIN_CONTEXT_JSON` (actions run with the plugin directory as cwd).
 CLI `hs inspect` without an ID still uses `HERDR_PANE_ID` plus the process
-cwd. There is no menu `fetch` or `rm` action — use `hs fetch <id>` /
-`hs rm <id>` on the CLI (auto-fetch already runs when an agent exits).
+cwd. There is no menu `fetch`, `rm`, or `destroy` action — use `hs fetch <id>` /
+`hs rm <id>` on the CLI (auto-fetch already runs when an agent exits; CLI
+`destroy --id` remains an alias of `rm`).
 
 After keeping or discarding a result, remove the worker explicitly or let GC
 clean it up:
@@ -239,14 +240,16 @@ because Herdr 0.9.x has no `herdr plugin state-dir` command.
 
 ## Herdr 0.9.0 integration limits
 
-Herdr 0.9.0 runs `plugin action invoke` commands in the invoking workspace and
-does not let a plugin dynamically create or move an action pane. The plugin
-declares `start-codex` only as a managed `[[panes]]` entrypoint. Use `herdr
-plugin pane open ... --entrypoint start-codex`; its default placement is an
-overlay over the active pane. Open it from the worker's source workspace. If
-Herdr reports a different `workspace_cwd` than the selected worker's recorded
-source repository, the plugin refuses to launch instead of exposing that
-workspace's task.
+Herdr 0.9.0 runs `plugin action invoke` commands with the plugin directory as
+cwd (not the invoking workspace) and does not let a plugin dynamically create
+or move an action pane. Menu actions that need a source repo therefore read
+`workspace_cwd` from `HERDR_PLUGIN_CONTEXT_JSON`. The plugin declares
+`start-codex` only as a managed `[[panes]]` entrypoint. Use `herdr plugin pane
+open ... --entrypoint start-codex`; its default placement is an overlay over
+the active pane. Open it from the worker's source workspace. If Herdr reports
+a different `workspace_cwd` than the selected worker's recorded source
+repository, the plugin refuses to launch instead of exposing that workspace's
+task.
 
 ### Pane placement
 
@@ -435,12 +438,14 @@ hs claude --prompt "Implement the requested change and run the relevant tests."
 This reuses the interactive launcher path (generated worker ID, dirty-tree
 refusal, state store/lock, auto-fetch into `sandbox/<id>`). Codex stdout and
 stderr stream live; stdin to the agent is closed. The process exits with the
-agent's exit status. Every run also writes `runs/<run-id>/result.json` and
-`runs/<run-id>/output.log` under the worker directory. `result.json` keeps its
-existing keys and adds `result_branch` and `commit_count` (computed in the
-**source** repo against the fetched `sandbox/<id>` ref). `hs inspect` exposes
-the latest run; `hs ls` stays limited to the RFC columns. Legacy per-action
-tables in an old `config.toml` are ignored with a single deprecation notice.
+agent's exit status; a failed auto-fetch after a successful agent run exits
+`1` (a nonzero agent exit is preserved even when fetch fails). Every run also
+writes `runs/<run-id>/result.json` and `runs/<run-id>/output.log` under the
+worker directory. `result.json` keeps its existing keys and adds
+`result_branch` and `commit_count` (computed in the **source** repo against
+the fetched `sandbox/<id>` ref). `hs inspect` exposes the latest run; `hs ls`
+stays limited to the RFC columns. Legacy per-action config tables in an old
+`config.toml` are ignored with a single deprecation notice.
 
 ### One-off prompt and remove inputs
 

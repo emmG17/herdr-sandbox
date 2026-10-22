@@ -122,6 +122,52 @@ class ActionInspectTests(unittest.TestCase):
             self.assertEqual(plugin.main(), 0)
         self.assertEqual(inspect_worker.call_args.args[0], "PANE-001")
 
+    def test_action_id_inspect_does_not_change_hs_agent_or_other_commands(self):
+        """HERDR_PLUGIN_ACTION_ID=inspect must only affect the inspect command."""
+        self._write_worker("KEEP-001", "w1:p1")
+        action_env = {
+            "HERDR_PLUGIN_ACTION_ID": "inspect",
+            "HERDR_PLUGIN_CONFIG_DIR": str(self.config),
+            "HERDR_PLUGIN_STATE_DIR": str(self.state),
+            "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({
+                "workspace_cwd": str(self.source.resolve()),
+            }),
+        }
+        with patch.dict(os.environ, action_env, clear=False):
+            self.assertTrue(plugin.inspect_from_plugin_action())
+            with patch.object(plugin, "prepare_hs_worker", return_value=("KEEP-001", self.state)) as prepare, \
+                    patch.object(plugin, "open_worker", return_value=0) as opened, \
+                    patch.object(plugin, "fetch_worker", return_value={
+                        "commit": "a" * 40,
+                        "branch": "sandbox/KEEP-001",
+                        "commit_count": 0,
+                        "log_oneline": "",
+                        "changed_files": [],
+                        "diff_stat": "",
+                        "base_commit": "b" * 40,
+                        "source_repo": str(self.source),
+                        "worker_id": "KEEP-001",
+                    }), \
+                    patch("sys.stdout", new_callable=io.StringIO):
+                code = plugin.hs_agent(plugin.DEFAULT_PROFILE, [])
+            self.assertEqual(code, 0)
+            prepare.assert_called_once()
+            opened.assert_called_once()
+
+            with patch.object(plugin.sys, "argv", [str(SCRIPT), "ls"]), \
+                    patch.object(plugin, "list_workers", return_value=[]) as listed, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(plugin.main(), 0)
+            listed.assert_called_once()
+
+            with patch.object(plugin.sys, "argv", [str(SCRIPT), "inspect"]), \
+                    patch.object(plugin, "inspect_action_workspace", return_value=[]) as action_inspect, \
+                    patch.object(plugin, "resolve_inspect_worker") as resolve_cli, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(plugin.main(), 0)
+            action_inspect.assert_called_once()
+            resolve_cli.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

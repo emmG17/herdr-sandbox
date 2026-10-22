@@ -398,6 +398,58 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(seen["during_fetch"], plugin.DEFAULT_PROFILE.herdr_agent)
         self.assertNotIn("HERDR_AGENT", os.environ)
 
+    def test_hs_agent_clears_herdr_agent_when_fetch_fails(self):
+        plugin.create_worker("AUTO-FAIL", str(self.source))
+        os.environ.pop("HERDR_AGENT", None)
+        seen = {"during_fetch": None}
+
+        def fake_open(worker_id, command=None, fresh=False, profile=None):
+            return 0
+
+        def fake_fetch(worker_id, state_dir=None):
+            seen["during_fetch"] = os.environ.get("HERDR_AGENT")
+            raise ValueError("fetch refused")
+
+        with patch.object(plugin, "check_root"), \
+                patch.object(plugin, "resolve_source_repo_from_cwd", return_value=self.source), \
+                patch.object(plugin, "check_dirty_tree", return_value=False), \
+                patch.object(plugin, "ensure_image_exists"), \
+                patch.object(plugin, "find_reusable_worker", return_value=("AUTO-FAIL", None)), \
+                patch.object(plugin, "open_worker", side_effect=fake_open), \
+                patch.object(plugin, "fetch_worker", side_effect=fake_fetch), \
+                patch("sys.stdout", new_callable=io.StringIO), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            code = plugin.hs_agent(plugin.DEFAULT_PROFILE, [])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(seen["during_fetch"], plugin.DEFAULT_PROFILE.herdr_agent)
+        self.assertNotIn("HERDR_AGENT", os.environ)
+
+    def test_hs_agent_clears_herdr_agent_on_keyboard_interrupt(self):
+        plugin.create_worker("AUTO-INT", str(self.source))
+        os.environ.pop("HERDR_AGENT", None)
+        seen = {"during_open": None}
+
+        def fake_open(worker_id, command=None, fresh=False, profile=None):
+            seen["during_open"] = os.environ.get("HERDR_AGENT")
+            raise KeyboardInterrupt
+
+        with patch.object(plugin, "check_root"), \
+                patch.object(plugin, "resolve_source_repo_from_cwd", return_value=self.source), \
+                patch.object(plugin, "check_dirty_tree", return_value=False), \
+                patch.object(plugin, "ensure_image_exists"), \
+                patch.object(plugin, "find_reusable_worker", return_value=("AUTO-INT", None)), \
+                patch.object(plugin, "open_worker", side_effect=fake_open), \
+                patch.object(plugin, "fetch_worker") as fetch, \
+                patch("sys.stdout", new_callable=io.StringIO), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(KeyboardInterrupt):
+                plugin.hs_agent(plugin.DEFAULT_PROFILE, [])
+
+        fetch.assert_not_called()
+        self.assertEqual(seen["during_open"], plugin.DEFAULT_PROFILE.herdr_agent)
+        self.assertNotIn("HERDR_AGENT", os.environ)
+
     def test_manifest_has_no_fetch_action(self):
         with (SCRIPT.parent.parent / "herdr-plugin.toml").open("rb") as stream:
             manifest = tomllib.load(stream)

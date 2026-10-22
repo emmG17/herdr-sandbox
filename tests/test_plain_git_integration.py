@@ -115,9 +115,10 @@ class PlainGitIntegrationTests(unittest.TestCase):
         self.assertNotIn("cherry-pick", ids)
         ids = {action["id"] for action in manifest["actions"]}
         self.assertNotIn("fetch", ids)
+        self.assertNotIn("destroy", ids)
         self.assertIn("inspect", ids)
         self.assertEqual(
-            next(a for a in manifest["actions"] if a["id"] == "destroy")["command"],
+            next(a for a in manifest["actions"] if a["id"] == "gc")["command"],
             ["python3", "bin/hs", "gc"],
         )
 
